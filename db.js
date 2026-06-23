@@ -1,103 +1,105 @@
-const fs = require('fs');
+const initSqlJs = require('sql.js');
 const path = require('path');
 const crypto = require('crypto');
+const fs = require('fs');
 
-const DATA_PATH = path.join(__dirname, 'data.json');
-const MSGS_PATH = path.join(__dirname, 'messages.json');
-const LEGACY_PATH = path.join(__dirname, 'chat-data.json');
-
-let data = { rooms: [], messages: [], users: [] };
+const DB_PATH = path.join(__dirname, 'chat.db');
 
 function hashPassword(password) {
   return crypto.createHash('sha256').update(password).digest('hex');
 }
 
-function load() {
-  // Migración desde chat-data.json (una sola vez)
-  if (fs.existsSync(LEGACY_PATH) && !fs.existsSync(DATA_PATH)) {
-    try {
-      const legacy = JSON.parse(fs.readFileSync(LEGACY_PATH, 'utf8'));
-      data.rooms = legacy.rooms || [];
-      data.messages = legacy.messages || [];
-      data.users = legacy.users || [];
-      save();
-      fs.renameSync(LEGACY_PATH, LEGACY_PATH + '.bak');
-      console.log('[DB] chat-data.json migrado a data.json + messages.json');
-    } catch (e) {
-      console.error('[DB] Error migrando chat-data.json:', e.message);
-    }
-  }
+module.exports = (async () => {
+  const SQL = await initSqlJs();
 
-  // Cargar data.json (usuarios + salas)
-  if (fs.existsSync(DATA_PATH)) {
-    try {
-      const dataFile = JSON.parse(fs.readFileSync(DATA_PATH, 'utf8'));
-      data.rooms = dataFile.rooms || [];
-      data.users = dataFile.users || [];
-    } catch {
-      data.rooms = [];
-      data.users = [];
-    }
+  let db;
+  if (fs.existsSync(DB_PATH)) {
+    db = new SQL.Database(fs.readFileSync(DB_PATH));
   } else {
-    data.rooms = [];
-    data.users = [];
+    db = new SQL.Database();
   }
 
-  // Cargar messages.json (solo historial)
-  if (fs.existsSync(MSGS_PATH)) {
-    try {
-      data.messages = JSON.parse(fs.readFileSync(MSGS_PATH, 'utf8'));
-    } catch {
-      data.messages = [];
-    }
-  } else {
-    data.messages = [];
-  }
+  db.run('CREATE TABLE IF NOT EXISTS users (username TEXT PRIMARY KEY, password TEXT NOT NULL, display_name TEXT, avatar TEXT, role TEXT DEFAULT \'user\', location TEXT, created_at TEXT)');
+  db.run('CREATE TABLE IF NOT EXISTS rooms (name TEXT PRIMARY KEY, created_by TEXT NOT NULL, created_at TEXT, password TEXT, temporary INTEGER DEFAULT 0)');
+  db.run('CREATE TABLE IF NOT EXISTS messages (id REAL PRIMARY KEY, room_name TEXT, sender TEXT NOT NULL, display_name TEXT, avatar TEXT, content TEXT DEFAULT \'\', file_name TEXT, file_url TEXT, file_size INTEGER, file_mimetype TEXT, reply TEXT, reactions TEXT DEFAULT \'{}\', created_at TEXT, recipient TEXT, type TEXT DEFAULT \'room\')');
+  db.run('CREATE INDEX IF NOT EXISTS idx_messages_room ON messages(room_name)');
+  db.run('CREATE INDEX IF NOT EXISTS idx_messages_recipient ON messages(recipient)');
+  db.run('CREATE INDEX IF NOT EXISTS idx_messages_sender ON messages(sender)');
+  db.run('CREATE TABLE IF NOT EXISTS consent_log (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT NOT NULL, terms_version TEXT NOT NULL, accepted_at TEXT NOT NULL, ip_address TEXT)');
 
-  if (!Array.isArray(data.messages)) data.messages = [];
+  const now = new Date().toISOString();
+  db.run('INSERT OR IGNORE INTO users (username, password, display_name, role, created_at) VALUES (?, ?, ?, ?, ?)', ['admin', hashPassword('admin'), 'admin', 'admin', now]);
+  db.run('INSERT OR IGNORE INTO consent_log (username, terms_version, accepted_at, ip_address) VALUES (?, ?, ?, ?)', ['admin', '1.0', now, '127.0.0.1']);
+  db.run('INSERT OR IGNORE INTO rooms (name, created_by, created_at, password, temporary) VALUES (?, ?, ?, ?, ?)', ['general', 'sistema', now, null, 0]);
 
-  // Asegurar campo role en todos los usuarios
-  data.users.forEach(u => {
-    if (!u.role) u.role = 'user';
+  const selectAll = (sql) => {
+    const result = db.exec(sql);
+    if (!result.length) return [];
+    const { columns, values } = result[0];
+    return values.map(row => {
+      const obj = {};
+      columns.forEach((col, i) => { obj[col] = row[i]; });
+      return obj;
+    });
+  };
+
+  const mapUser = (r) => ({ username: r.username, password: r.password, displayName: r.display_name, avatar: r.avatar, role: r.role, location: r.location, created_at: r.created_at });
+  const mapRoom = (r) => ({ name: r.name, created_by: r.created_by, created_at: r.created_at, password: r.password, temporary: !!r.temporary });
+  const mapMessage = (m) => ({
+    id: m.id, room_name: m.room_name, sender: m.sender, displayName: m.display_name, avatar: m.avatar,
+    content: m.content,
+    file: m.file_url ? { url: m.file_url, name: m.file_name, size: m.file_size, type: m.file_mimetype } : null,
+    reply: m.reply ? JSON.parse(m.reply) : null,
+    reactions: JSON.parse(m.reactions), created_at: m.created_at, recipient: m.recipient, type: m.type
   });
 
-  // Asegurar sala general
-  const general = data.rooms.find(r => r.name === 'general');
-  if (!general) {
-    data.rooms.push({
-      name: 'general',
-      created_by: 'sistema',
-      created_at: new Date().toISOString(),
-      password: null,
-      temporary: false
-    });
-  } else {
-    if (general.password === undefined) general.password = null;
-    if (general.temporary === undefined) general.temporary = false;
-  }
+  let data = {
+    users: selectAll('SELECT * FROM users ORDER BY username').map(mapUser),
+    rooms: selectAll('SELECT * FROM rooms ORDER BY name').map(mapRoom),
+    messages: selectAll('SELECT * FROM messages ORDER BY created_at').map(mapMessage)
+  };
 
-  // Asegurar que admin tenga role admin
-  const adminUser = data.users.find(u => u.username === 'admin');
-  if (adminUser) adminUser.role = 'admin';
+  const persist = () => {
+    fs.writeFileSync(DB_PATH, Buffer.from(db.export()));
+  };
 
-  // Asegurar usuario admin por defecto si no hay usuarios
-  if (data.users.length === 0) {
-    data.users.push({
-      username: 'admin',
-      password: hashPassword('admin'),
-      role: 'admin',
-      created_at: new Date().toISOString()
-    });
-  }
+  persist();
 
-  save();
-}
+  const save = () => {
+    db.run('DELETE FROM users');
+    db.run('DELETE FROM rooms');
+    db.run('DELETE FROM messages');
 
-function save() {
-  fs.writeFileSync(DATA_PATH, JSON.stringify({ users: data.users, rooms: data.rooms }, null, 2));
-  fs.writeFileSync(MSGS_PATH, JSON.stringify(data.messages, null, 2));
-}
+    const insUser = db.prepare('INSERT INTO users (username, password, display_name, avatar, role, location, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)');
+    const insRoom = db.prepare('INSERT INTO rooms (name, created_by, created_at, password, temporary) VALUES (?, ?, ?, ?, ?)');
+    const insMsg = db.prepare('INSERT INTO messages (id, room_name, sender, display_name, avatar, content, file_name, file_url, file_size, file_mimetype, reply, reactions, created_at, recipient, type) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)');
 
-load();
+    for (const u of data.users) {
+      insUser.run([u.username, u.password, u.displayName || null, u.avatar || null, u.role || 'user', u.location || null, u.created_at || null]);
+    }
+    for (const r of data.rooms) {
+      insRoom.run([r.name, r.created_by, r.created_at || null, r.password || null, r.temporary ? 1 : 0]);
+    }
+    for (const m of data.messages) {
+      insMsg.run([m.id, m.room_name || null, m.sender, m.displayName || null, m.avatar || null,
+        m.content || '', m.file?.name || null, m.file?.url || null, m.file?.size || null, m.file?.type || null,
+        m.reply ? JSON.stringify(m.reply) : null,
+        JSON.stringify(m.reactions || {}),
+        m.created_at || null, m.recipient || null, m.type || 'room'
+      ]);
+    }
 
-module.exports = { data, save, hashPassword };
+    insUser.free();
+    insRoom.free();
+    insMsg.free();
+
+    persist();
+  };
+
+  const saveConsent = (username, termsVersion, acceptedAt, ipAddress) => {
+    db.run('INSERT INTO consent_log (username, terms_version, accepted_at, ip_address) VALUES (?, ?, ?, ?)', [username, termsVersion, acceptedAt, ipAddress || null]);
+    persist();
+  };
+
+  return { data, save, hashPassword, saveConsent };
+})();

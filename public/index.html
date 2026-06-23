@@ -20,9 +20,9 @@
         <a id="cert-download-btn" class="cert-btn" href="/api/cert" download>
           <i class="fas fa-download"></i> Descargar certificado
         </a>
-        <button id="cert-instruct-btn" class="cert-btn cert-btn-secondary" title="Instrucciones">
-          <i class="fas fa-question-circle"></i>
-        </button>
+    <button id="cert-instruct-btn" class="cert-btn cert-btn-secondary">
+      <i class="fas fa-book"></i> Cómo instalarlo
+    </button>
         <button id="cert-dismiss-btn" class="cert-btn cert-btn-dismiss">
           <i class="fas fa-check-circle"></i> Ya instalé el certificado
         </button>
@@ -69,6 +69,11 @@
         </button>
       </div>
       <p id="login-error" class="login-error"></p>
+      <div class="login-footer">
+        <a href="/privacidad.html" target="_blank" class="login-privacy-link">
+          <i class="fas fa-shield-alt"></i> Política de Privacidad
+        </a>
+      </div>
     </div>
   </div>
 
@@ -164,6 +169,83 @@
     </div>
   </div>
 
+  <div id="terms-modal-overlay" class="hidden">
+    <div id="terms-modal" class="modal-box terms-modal-box">
+      <div class="modal-header">
+        <h3><i class="fas fa-file-contract"></i> Términos y Condiciones</h3>
+      </div>
+      <div class="modal-body terms-modal-body">
+        <div class="terms-content">
+          <h4>1. Identificación del Responsable</h4>
+          <p><strong>CORMUDESI</strong>, Unidad de Informática, es el responsable del tratamiento de los datos personales recopilados en este sistema de chat interno.</p>
+
+          <h4>2. Datos Personales Recopilados</h4>
+          <p>Para el funcionamiento del sistema se recopilan los siguientes datos:</p>
+          <ul>
+            <li>Nombre de usuario y contraseña (almacenada con hash SHA-256)</li>
+            <li>Nombre visible (display name), configurable por el usuario</li>
+            <li>Avatar (imagen opcional subida por el usuario)</li>
+            <li>Ubicación (informada voluntariamente para alertas)</li>
+            <li>Contenido de los mensajes enviados en salas y privados</li>
+            <li>Archivos adjuntos (imágenes, audio, documentos)</li>
+          </ul>
+
+          <h4>3. Finalidad del Tratamiento</h4>
+          <p>Los datos son tratados exclusivamente para la <strong>comunicación interna entre funcionarios y/o colaboradores de CORMUDESI</strong>, incluyendo mensajería en tiempo real, notificaciones de alerta y coordinación operativa.</p>
+
+          <h4>4. Base Legal</h4>
+          <p>El tratamiento se fundamenta en el <strong>consentimiento del titular</strong>, otorgado libre, informado, específico e inequívoco conforme al <strong>Artículo 12 de la Ley N° 21.719</strong> sobre Protección de Datos Personales.</p>
+
+          <h4>5. Destinatarios de los Datos</h4>
+          <p>Los datos son accesibles únicamente por otros usuarios del sistema interno de CORMUDESI. No se ceden ni comunican datos a terceros fuera de la organización.</p>
+
+          <h4>6. Plazo de Conservación</h4>
+          <p>Los datos se conservan mientras la cuenta del usuario esté activa. Al eliminar la cuenta, los datos personales asociados son suprimidos. El historial de mensajes se conserva para la continuidad del servicio.</p>
+
+          <h4>7. Derechos del Titular (ARCOP)</h4>
+          <p>Conforme a la Ley N° 21.719, el titular puede ejercer los derechos de <strong>Acceso, Rectificación, Cancelación (Supresión), Oposición y Portabilidad</strong> contactando a la Unidad de Informática de CORMUDESI.</p>
+
+          <h4>8. Medidas de Seguridad</h4>
+          <p>CORMUDESI implementa las siguientes medidas conforme a la <strong>Ley N° 21.663</strong> (Marco de Ciberseguridad):</p>
+          <ul>
+            <li>Conexión cifrada mediante HTTPS con certificado SSL/TLS</li>
+            <li>Contraseñas almacenadas con hash SHA-256</li>
+            <li>Almacenamiento local en servidor interno de la red LAN</li>
+            <li>Registro de acceso y trazabilidad de eventos</li>
+          </ul>
+
+          <h4>9. Menores de Edad</h4>
+          <p>El sistema está dirigido exclusivamente a funcionarios y colaboradores de CORMUDESI. <strong>Se prohíbe el registro de menores de 14 años.</strong> Para adolescentes entre 14 y 18 años, se requiere autorización del representante legal.</p>
+
+          <h4>10. Uso Aceptable</h4>
+          <p>El usuario se compromete a no compartir contenido ilegal, ofensivo o discriminatorio, no utilizar el sistema para fines distintos a la comunicación interna, no intentar acceder a cuentas de otros usuarios, y reportar cualquier incidente de seguridad a la Unidad de Informática.</p>
+
+          <h4>11. Reporte de Incidentes</h4>
+          <p>Ante cualquier incidente de ciberseguridad, el usuario debe reportarlo inmediatamente a la Unidad de Informática, quien gestionará la notificación ante la <strong>Agencia Nacional de Ciberseguridad (ANCI)</strong> conforme al Artículo 9 de la Ley N° 21.663.</p>
+
+          <h4>12. Vigencia y Actualizaciones</h4>
+          <p>Estos términos pueden ser actualizados. Los usuarios serán notificados de cambios significativos y deberán aceptar la nueva versión para continuar usando el sistema.</p>
+
+          <p class="terms-legal-refs">Marco legal: Ley N° 21.719 sobre Protección de Datos Personales (vigente desde diciembre 2026) · Ley N° 21.663 Marco de Ciberseguridad · Ley N° 19.628 sobre Protección de la Vida Privada · Constitución Política de Chile, Art. 19 N° 4.</p>
+        </div>
+        <div class="terms-checkbox-area">
+          <label class="terms-checkbox-label">
+            <input type="checkbox" id="terms-accept-checkbox" />
+            <span>He leído y acepto los <strong>Términos y Condiciones</strong> y la <strong>Política de Privacidad</strong> del Chat CORMUDESI.</span>
+          </label>
+          <p class="terms-privacy-link">
+            Ver <a href="/privacidad.html" target="_blank">Política de Privacidad</a>
+          </p>
+        </div>
+        <p id="terms-error" class="login-error"></p>
+      </div>
+      <div class="modal-footer">
+        <button id="terms-cancel-btn" class="btn-secondary">Cancelar</button>
+        <button id="terms-accept-btn" class="btn-primary" disabled>Aceptar</button>
+      </div>
+    </div>
+  </div>
+
   <div id="chat-screen" class="hidden">
     <header id="chat-header">
       <div class="header-left">
@@ -198,6 +280,11 @@
         </button>
       </div>
     </header>
+    <div id="privacy-banner" class="privacy-banner hidden">
+      <i class="fas fa-shield-alt"></i>
+      <span>Al usar este chat aceptas nuestros <a href="/privacidad.html" target="_blank">Términos y Condiciones</a></span>
+      <button id="privacy-banner-close" class="btn-icon"><i class="fas fa-times"></i></button>
+    </div>
 
     <div id="main-container">
       <aside id="sidebar-rooms">

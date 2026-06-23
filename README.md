@@ -1,6 +1,6 @@
 # Chat CORMUDESI
 
-Sistema de chat interno para redes LAN. Basado en Node.js + Express + Socket.IO con almacenamiento en JSON.
+Sistema de chat interno para redes LAN. Basado en Node.js + Express + Socket.IO con almacenamiento en SQLite.
 
 ## Requisitos
 
@@ -13,8 +13,8 @@ Sistema de chat interno para redes LAN. Basado en Node.js + Express + Socket.IO 
 
 ```bash
 # 1. Clonar el repositorio en el servidor
-git clone <url-del-repo>
-cd chat-cormudesi
+git clone https://github.com/NelsonAraya/chat.git
+cd chat
 
 # 2. Instalar dependencias
 npm install
@@ -118,12 +118,21 @@ Windows + R → "wf.msc" → Reglas de entrada → Nueva regla → Puerto
 
 ## Botón de Alerta
 
-El chat incluye un botón de alerta (pánico) en la barra lateral izquierda.
+El chat incluye un sistema de alerta (pánico) que notifica a todos los usuarios conectados.
 
-- **Activarlo:** Haz clic en el botón rojo **Botón Alerta**
-- **Qué hace:** Todos los usuarios conectados reciben un modal + sonido indicando quién solicita asistencia y su ubicación
+### Formas de activar la alerta
+
+| Método | Cómo | Dónde funciona |
+|--------|------|----------------|
+| **Botón rojo** | Haz clic en **Botón Alerta** en la barra lateral izquierda | En cualquier momento |
+| **Triple clic rápido** | 3 clics ≤ 800ms en el área del chat (evitando botones, inputs y modales) | Con el chat abierto |
+| **Comando** | Escribe `Ctrl+Shift+E` (Emergencia) en cualquier parte del chat | Con el chat abierto y activo |
+
+- **Qué hace al activarse:** Todos los usuarios conectados reciben un modal + sonido indicando quién solicita asistencia y su ubicación
 - **Ubicación:** Haz clic en el ícono 📍 en el header para asignar tu ubicación actual (ej: "Oficina 302, Edificio Central")
 - Si no has configurado ubicación se mostrará como "Indeterminada"
+- **Cooldown:** 30 segundos entre activaciones para evitar spam
+- **Feedback visual:** Al activarse por triple clic aparece un borde rojo que parpadea y se desvanece
 - El sonido de alerta se puede personalizar reemplazando `public/sounds/alerta.mp3`
 
 ## Panel de Administración
@@ -163,32 +172,73 @@ Las salas temporales se eliminan automáticamente al quedar vacías.
 - Al hacer clic en una sala o al volver a la pestaña del navegador, los contadores se reinician
 - Los mensajes privados también muestran badge 🔴 en la pestaña **Privados**
 
+## Cumplimiento Legal (Chile)
+
+El sistema cumple con la normativa chilena vigente:
+
+- **Ley N° 21.719** — Sobre Protección de Datos Personales (vigente desde diciembre 2026)
+- **Ley N° 21.663** — Marco de Ciberseguridad e Infraestructura Crítica de la Información
+- **Ley N° 19.628** — Sobre Protección de la Vida Privada
+
+### Términos y Condiciones
+
+Al registrarse, el usuario debe aceptar los Términos y Condiciones mediante un modal con scroll que incluye:
+
+1. Identificación del responsable (CORMUDESI, Unidad de Informática)
+2. Datos personales recopilados
+3. Finalidad del tratamiento
+4. Base legal (consentimiento — Art. 12 Ley 21.719)
+5. Destinatarios de los datos
+6. Plazo de conservación
+7. Derechos ARCOP (Acceso, Rectificación, Cancelación, Oposición, Portabilidad)
+8. Medidas de seguridad (conforme a Ley 21.663)
+9. Menores de edad
+10. Uso aceptable
+11. Reporte de incidentes
+12. Vigencia y actualizaciones
+
+El checkbox de aceptación **no viene premarcado** y el botón **Aceptar** se habilita solo al marcar la casilla.
+
+### Política de Privacidad
+
+Disponible en `/privacidad.html` con enlace desde:
+- Footer del formulario de login
+- Banner en el header del chat
+- Modal de Términos y Condiciones
+
+### Registro de Consentimiento
+
+Cada aceptación de TyC queda registrada en la base de datos con:
+- Usuario
+- Versión de los términos aceptados
+- Fecha y hora
+- Dirección IP del usuario
+
 ## Persistencia de datos
 
-- Los usuarios y salas se guardan en `data.json` (permanente)
-- El historial de mensajes se guarda en `messages.json` (se puede borrar para limpiar el historial sin perder usuarios)
+- **SQLite** (`chat.db`): base de datos única que contiene usuarios, salas, mensajes y registro de consentimiento
 - Los archivos adjuntos se guardan en `uploads/`
 - El certificado SSL se guarda en `certs/` (se genera automáticamente al iniciar con la IP actual)
-- Si eliminas `data.json` o `messages.json` se regeneran automáticamente al reiniciar
+- Si eliminas `chat.db` se regenera automáticamente al reiniciar con los datos por defecto (usuario `admin` y sala `general`)
 
 ## Estructura del proyecto
 
 ```
 chat-cormudesi/
 ├── index.js              # Servidor (HTTP redirige a HTTPS)
-├── db.js                 # Persistencia JSON separada + hash de contraseñas
+├── db.js                 # Persistencia SQLite (sql.js) + hash de contraseñas
 ├── socket-handler.js     # Eventos de Socket.IO
-├── data.json             # Usuarios y salas (permanente)
-├── messages.json         # Historial de mensajes (descartable)
+├── chat.db               # Base de datos SQLite (se crea al iniciar)
 ├── package.json
 ├── certs/                # Certificado SSL (se genera al iniciar con la IP actual)
 ├── uploads/              # Archivos adjuntos (se crea al iniciar)
 ├── public/
 │   ├── sounds/
 │   │   └── alerta.mp3    # Sonido del botón de alerta
-│   ├── index.html        # Interfaz de usuario
+│   ├── index.html        # Interfaz de usuario + modal de Términos y Condiciones
 │   ├── styles.css        # Estilos
 │   ├── app.js            # Lógica del cliente
+│   ├── privacidad.html   # Política de Privacidad (Ley 21.719 y 21.663)
 │   └── img/
 │       ├── logo.png      # Logo de CORMUDESI
 │       ├── cert-01-download.png

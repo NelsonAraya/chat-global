@@ -576,6 +576,75 @@ registerConfirm.addEventListener('keydown', (e) => {
   if (e.key === 'Enter') registerBtn.click();
 });
 
+const TERMS_VERSION = '1.0';
+let pendingRegistration = null;
+
+const termsOverlay = $('terms-modal-overlay');
+const termsAcceptCheckbox = $('terms-accept-checkbox');
+const termsAcceptBtn = $('terms-accept-btn');
+const termsCancelBtn = $('terms-cancel-btn');
+const termsError = $('terms-error');
+
+function openTermsModal() {
+  termsAcceptCheckbox.checked = false;
+  termsAcceptBtn.disabled = true;
+  termsError.textContent = '';
+  termsOverlay.classList.remove('hidden');
+  termsAcceptCheckbox.focus();
+}
+
+function closeTermsModal() {
+  termsOverlay.classList.add('hidden');
+  pendingRegistration = null;
+  registerBtn.disabled = false;
+  registerBtn.innerHTML = '<i class="fas fa-user-plus"></i> Crear cuenta';
+}
+
+termsAcceptCheckbox.addEventListener('change', function() {
+  termsAcceptBtn.disabled = !this.checked;
+});
+
+termsCancelBtn.addEventListener('click', closeTermsModal);
+termsOverlay.addEventListener('click', function(e) {
+  if (e.target === termsOverlay) closeTermsModal();
+});
+
+termsAcceptBtn.addEventListener('click', function() {
+  if (!pendingRegistration) return;
+  const regUsername = pendingRegistration.username;
+  const regPassword = pendingRegistration.password;
+
+  termsAcceptBtn.disabled = true;
+  termsAcceptBtn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Registrando...';
+
+  socket.emit('register', {
+    username: regUsername,
+    password: regPassword,
+    terms_version: TERMS_VERSION
+  }, (res) => {
+    termsAcceptBtn.disabled = false;
+    termsAcceptBtn.innerHTML = '<i class="fas fa-check"></i> Aceptar';
+    pendingRegistration = null;
+
+    if (!res.ok) {
+      termsError.textContent = res.error;
+      return;
+    }
+
+    closeTermsModal();
+    registerUsername.value = '';
+    registerPassword.value = '';
+    registerConfirm.value = '';
+    document.querySelectorAll('.login-tab').forEach(t => t.classList.remove('active'));
+    document.querySelector('[data-form="login"]').classList.add('active');
+    document.querySelectorAll('.login-form-box').forEach(f => f.classList.add('hidden'));
+    $('login-form').classList.remove('hidden');
+    loginUsername.value = regUsername;
+    loginPassword.focus();
+    loginError.textContent = 'Cuenta creada. Ahora ingresa.';
+  });
+});
+
 registerBtn.addEventListener('click', () => {
   const username = registerUsername.value.trim();
   const password = registerPassword.value;
@@ -585,26 +654,11 @@ registerBtn.addEventListener('click', () => {
   if (!password || password.length < 3) { loginError.textContent = 'Minimo 3 caracteres'; return; }
   if (password !== confirm) { loginError.textContent = 'No coinciden'; return; }
 
+  pendingRegistration = { username, password };
   registerBtn.disabled = true;
-  registerBtn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Registrando...';
-
-  socket.emit('register', { username, password }, (res) => {
-    registerBtn.disabled = false;
-    registerBtn.innerHTML = '<i class="fas fa-user-plus"></i> Crear cuenta';
-    loginError.textContent = res.ok ? 'Cuenta creada. Ahora ingresa.' : res.error;
-
-    if (res.ok) {
-      registerUsername.value = '';
-      registerPassword.value = '';
-      registerConfirm.value = '';
-      document.querySelectorAll('.login-tab').forEach(t => t.classList.remove('active'));
-      document.querySelector('[data-form="login"]').classList.add('active');
-      document.querySelectorAll('.login-form-box').forEach(f => f.classList.add('hidden'));
-      $('login-form').classList.remove('hidden');
-      loginUsername.value = username;
-      loginPassword.focus();
-    }
-  });
+  registerBtn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Verificando...';
+  loginError.textContent = '';
+  openTermsModal();
 });
 
 function openNameModal() {
@@ -751,6 +805,45 @@ panicModalOk.addEventListener('click', closePanicModal);
 panicModalClose.addEventListener('click', closePanicModal);
 panicModalOverlay.addEventListener('click', function(e) {
   if (e.target === panicModalOverlay) closePanicModal();
+});
+
+// Triple clic rápido en zona gris del chat para activar alerta
+var panicClickTimes = [];
+var PANIC_CLICK_WINDOW = 800;
+var PANIC_COOLDOWN_MS = 30000;
+var panicLastTrigger = 0;
+
+document.addEventListener('click', function(e) {
+  if (!currentUser) return;
+  if (Date.now() - panicLastTrigger < PANIC_COOLDOWN_MS) return;
+
+  var tag = e.target.tagName;
+  if (tag === 'BUTTON' || tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || tag === 'A') return;
+
+  var el = e.target;
+  while (el) {
+    if (el.id === 'sidebar-rooms' || el.id === 'chat-header' || el.classList.contains('modal-overlay') || el.classList.contains('modal-box')) return;
+    el = el.parentElement;
+  }
+
+  panicClickTimes.push(Date.now());
+  panicClickTimes = panicClickTimes.filter(function(t) { return Date.now() - t <= PANIC_CLICK_WINDOW; });
+
+  if (panicClickTimes.length >= 3) {
+    panicClickTimes = [];
+    panicLastTrigger = Date.now();
+
+    var flash = document.createElement('div');
+    flash.style.cssText = 'position:fixed;inset:0;border:6px solid #ef4444;border-radius:0;pointer-events:none;z-index:1999;animation:fadeOut 0.6s forwards;';
+    document.body.appendChild(flash);
+    setTimeout(function() { flash.remove(); }, 700);
+
+    panicModalMessage.textContent = 'Has enviado una alerta de asistencia';
+    panicModalLocation.innerHTML = 'Ubicación: <strong>' + escapeHtml(currentLocation || 'Indeterminada') + '</strong>';
+    panicModalTime.textContent = formatTime(new Date().toISOString());
+    panicModalOverlay.classList.remove('hidden');
+    socket.emit('panic-alert');
+  }
 });
 
 editLocationBtn.addEventListener('click', function() {
@@ -1854,9 +1947,22 @@ certModalOverlay.addEventListener('click', function(e) {
   if (e.target === certModalOverlay) closeCertModal();
 });
 
+// Privacy banner
+const privacyBanner = $('privacy-banner');
+const privacyBannerClose = $('privacy-banner-close');
+
+if (privacyBannerClose) {
+  privacyBannerClose.addEventListener('click', function() {
+    privacyBanner.classList.add('hidden');
+  });
+}
+
 document.addEventListener('DOMContentLoaded', function() {
   showCertBannerIfNeeded();
   if (!tryAutoLogin()) {
     loginUsername.focus();
+  }
+  if (privacyBanner) {
+    privacyBanner.classList.remove('hidden');
   }
 });

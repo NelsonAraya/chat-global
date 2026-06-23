@@ -2,7 +2,8 @@ const fs = require('fs');
 const path = require('path');
 
 module.exports = (io, db) => {
-  const { data, save, hashPassword } = db;
+  const { data, save, hashPassword, saveConsent } = db;
+  const TERMS_VERSION = '1.0';
   const users = new Map();
   const roomUsers = new Map();
   const roomUnreads = {};
@@ -112,7 +113,7 @@ module.exports = (io, db) => {
 
   io.on('connection', (socket) => {
     socket.on('register', (data_, callback) => {
-      const { username, password } = data_ || {};
+      const { username, password, terms_version } = data_ || {};
       if (!username || !username.trim()) {
         return callback?.({ ok: false, error: 'Nombre de usuario requerido' });
       }
@@ -126,6 +127,9 @@ module.exports = (io, db) => {
       if (data.users.find(u => u.username === name)) {
         return callback?.({ ok: false, error: 'Ese usuario ya existe' });
       }
+      if (!terms_version) {
+        return callback?.({ ok: false, error: 'Debes aceptar los Términos y Condiciones' });
+      }
       data.users.push({
         username: name,
         password: hashPassword(password),
@@ -133,6 +137,7 @@ module.exports = (io, db) => {
         avatar: null,
         created_at: new Date().toISOString()
       });
+      saveConsent(name, terms_version, new Date().toISOString(), socket.handshake.address);
       save();
       callback?.({ ok: true });
     });

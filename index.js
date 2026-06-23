@@ -50,7 +50,7 @@ app.get('/api/cert', (req, res) => {
   }
 });
 
-const db = require('./db');
+const dbPromise = require('./db');
 
 const HTTP_PORT = process.env.HTTP_PORT || 3000;
 const HTTPS_PORT = process.env.HTTPS_PORT || 3443;
@@ -67,7 +67,9 @@ const getLocalIP = () => {
   return 'localhost';
 };
 
-const start = () => {
+const start = async () => {
+  const db = await dbPromise;
+
   const CERTS_DIR = path.join(__dirname, 'certs');
   const KEY_PATH = path.join(CERTS_DIR, 'key.pem');
   const CERT_PATH = path.join(CERTS_DIR, 'cert.pem');
