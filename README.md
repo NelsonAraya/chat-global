@@ -14,8 +14,8 @@ Sistema de chat interno para redes LAN. Basado en Node.js + Express + Socket.IO 
 
 ```bash
 # 1. Clonar el repositorio en el servidor
-git clone https://github.com/NelsonAraya/chat.git
-cd chat
+git clone https://github.com/NelsonAraya/chat-global.git
+cd chat-global
 
 # 2. Instalar dependencias
 npm install
@@ -142,7 +142,9 @@ Al iniciar el servidor por primera vez se crea automáticamente:
 - **Contraseña:** `admin`
 - **Rol:** Administrador
 
-Cambia la contraseña del admin después del primer ingreso. Usa el panel Admin (⚙) para crear usuarios y gestionar salas.
+Cambia la contraseña del admin después del primer ingreso. Usa el panel Admin (ícono ⚙ en la barra lateral) para crear departamentos, aprobar usuarios nuevos y gestionar salas.
+
+> **Importante:** cualquier persona puede crear una cuenta desde "Crear cuenta" (solo pide usuario y contraseña), pero **no puede entrar al chat hasta que un administrador la apruebe** desde el panel Admin → Usuarios. Ver [Aprobación de cuentas nuevas](#aprobación-de-cuentas-nuevas).
 
 ## Puertos personalizados
 
@@ -172,7 +174,7 @@ Windows + R → "wf.msc" → Reglas de entrada → Nueva regla → Puerto
 
 ## Botón de Alerta
 
-El chat incluye un sistema de alerta (pánico) que notifica a todos los usuarios conectados.
+El chat incluye un sistema de alerta (pánico) para pedir asistencia.
 
 ### Formas de activar la alerta
 
@@ -182,42 +184,95 @@ El chat incluye un sistema de alerta (pánico) que notifica a todos los usuarios
 | **Triple clic rápido** | 3 clics ≤ 800ms en el área del chat (evitando botones, inputs y modales) | Con el chat abierto |
 | **Comando** | Escribe `Ctrl+Shift+E` (Emergencia) en cualquier parte del chat | Con el chat abierto y activo |
 
-- **Qué hace al activarse:** Todos los usuarios conectados reciben un modal + sonido indicando quién solicita asistencia y su ubicación
-- **Ubicación:** Haz clic en el ícono 📍 en el header para asignar tu ubicación actual (ej: "Oficina 302, Edificio Central")
-- Si no has configurado ubicación se mostrará como "Indeterminada"
-- **Cooldown:** 30 segundos entre activaciones para evitar spam
-- **Feedback visual:** Al activarse por triple clic aparece un borde rojo que parpadea y se desvanece
-- El sonido de alerta se puede personalizar reemplazando `public/sounds/alerta.mp3`
+### Quién la recibe
+
+La alerta **no le llega a todo el mundo** — queda acotada a quien tiene algo que ver:
+
+- Los usuarios conectados del **mismo departamento/centro** que la persona que la activó.
+- Todos los **administradores** conectados, sin importar su departamento (para que TI tenga visibilidad centralizada).
+- Si quien activa la alerta no tiene departamento asignado, le llega a todos los conectados.
+
+Cada receptor ve un modal + sonido indicando quién solicita asistencia, su departamento y su ubicación.
+
+### Otros detalles
+
+- **Ubicación:** Haz clic en el ícono 📍 en el header para asignar tu ubicación actual (ej: "Oficina 302, Edificio Central"). Si no la configuraste, se muestra como "Indeterminada".
+- **Cooldown:** 30 segundos entre activaciones (solo para el triple clic) para evitar spam.
+- **Feedback visual:** Al activarse por triple clic aparece un borde rojo que parpadea y se desvanece.
+- El sonido de alerta se puede personalizar reemplazando `public/sounds/alerta.mp3`.
+- **Correo de notificación:** además de la alerta en pantalla, el sistema puede mandar un correo (ver [Correo del Botón de Alerta](#correo-del-botón-de-alerta) más arriba) — es opcional, se activa solo si configuras el SMTP en `.env`.
+- **Historial:** cada activación queda guardada de forma permanente (quién, departamento, ubicación, fecha y hora) — visible en el panel Admin → pestaña **Alertas**.
 
 ## Panel de Administración
 
-Los usuarios con rol **admin** ven una tercera pestaña ⚙ en la barra lateral con las siguientes capacidades:
+Los usuarios con rol **admin** ven un ícono ⚙ adicional en la barra lateral. Al entrar, el panel ocupa toda el área principal del chat (no un sidebar angosto) y se organiza en sub-pestañas: **Resumen**, **Departamentos**, **Usuarios**, **Salas** y **Alertas**.
 
-### Estadísticas
+### Resumen
 
-Cuatro tarjetas en la parte superior del panel con:
-- **Usuarios:** total de cuentas registradas
-- **Conectados:** usuarios online en este momento
-- **Mensajes:** total de mensajes enviados
-- **Salas:** total de salas creadas
+Tarjetas con totales: usuarios registrados, conectados ahora, mensajes enviados y salas creadas.
 
-### Gestión de usuarios
+### Departamentos
 
-Al hacer clic en ✏ junto a un usuario se abre un modal para:
-- Cambiar nombre visible
-- Cambiar rol (Usuario / Administrador)
-- **Resetear contraseña** (campo opcional — si se deja vacío no se modifica)
-- **Eliminar usuario** (botón rojo con confirmación)
+Crear, buscar y eliminar departamentos/centros (ver [Departamentos y Centros](#departamentos-y-centros)). Al crear uno se genera automáticamente su sala general. Solo se puede eliminar un departamento si no tiene usuarios asignados.
+
+### Usuarios
+
+- **Solicitudes de registro pendientes:** aparece arriba de todo si hay cuentas nuevas esperando aprobación, con botones para aceptar ✓ o rechazar ✗ cada una (ver [Aprobación de cuentas nuevas](#aprobación-de-cuentas-nuevas)).
+- **Lista de usuarios:** buscador por nombre, y al hacer clic en ✏ junto a un usuario se abre un modal para:
+  - Cambiar nombre visible
+  - Cambiar rol (Usuario / Administrador)
+  - **Asignar uno o varios departamentos** (checkboxes — un usuario puede pertenecer a más de uno)
+  - **Resetear contraseña** (campo opcional — si se deja vacío no se modifica)
+  - **Eliminar usuario** (botón rojo con confirmación)
 
 > Reglas de seguridad: un admin no puede eliminarse a sí mismo, no puede eliminar al usuario `admin`, y no puede cambiar su propia contraseña desde este panel (debe usar el modal de cambio de contraseña normal).
 
-### Gestión de salas
+### Salas
 
-Cada sala fija (no temporal, excepto `#general`) tiene dos botones:
+Buscador por nombre. Cada sala fija (no temporal, excepto `#general`) tiene dos botones:
 - 🔒/🔓 — Asignar o quitar contraseña de la sala
 - 🗑 — Eliminar la sala (solo salas no temporales, excepto `#general`)
 
-Las salas temporales se eliminan automáticamente al quedar vacías.
+Las salas temporales se eliminan automáticamente al quedar vacías. Al crear una sala fija, el admin elige a qué departamento pertenece (o "Global" para que la vean todos — ver [Departamentos y Centros](#departamentos-y-centros)).
+
+### Alertas
+
+Historial completo de activaciones del botón de pánico, del más reciente al más antiguo: quién la activó, su departamento, su ubicación y la fecha/hora exacta. Carga de a 50 registros con un botón "Cargar más". El registro es permanente — queda ahí aunque después se elimine la cuenta del usuario.
+
+## Aprobación de cuentas nuevas
+
+Desde que se agregó este flujo, **crear una cuenta ya no da acceso inmediato al chat**:
+
+1. Cualquiera puede registrarse desde "Crear cuenta" — solo pide usuario y contraseña (el departamento ya no se elige en el registro).
+2. La cuenta queda en estado **pendiente**. Si intenta entrar antes de ser aprobada, ve el mensaje "Tu cuenta está pendiente de aprobación por un administrador."
+3. Si hay un administrador conectado en ese momento, le llega una notificación en vivo (sonido + aviso) y un contador en el ícono de Admin.
+4. El administrador entra a **Admin → Usuarios** y acepta ✓ o rechaza ✗ la solicitud.
+   - **Aceptada:** el usuario ya puede entrar al chat. El admin le asigna su(s) departamento(s) desde el mismo panel (editar usuario → checkboxes de departamentos).
+   - **Rechazada:** el usuario no puede entrar ("Tu solicitud de cuenta fue rechazada. Contacta a un administrador."). La cuenta queda marcada como rechazada (no se borra sola); el admin puede eliminarla del todo si quiere.
+
+Las cuentas que ya existían antes de este cambio no se vieron afectadas — quedaron activas automáticamente.
+
+## Departamentos y Centros
+
+Pensado para instituciones con varios centros (ej: distintos CESFAM) que comparten un mismo servidor de chat, pero donde cada uno necesita su propio espacio separado.
+
+- **Salas por departamento:** cada sala pertenece a un departamento específico (solo la ven sus usuarios + los admins) o es **"Global"** (la ve todo el mundo, sin importar su departamento — se identifica con una etiqueta azul "Global" en la sala y en la barra superior). `#general` es global por defecto.
+- **Alerta acotada por departamento:** ver [Botón de Alerta](#botón-de-alerta).
+- **Directorio de usuarios acotado:** en "Conectados" solo ves a la gente de tu mismo departamento (más los administradores, que son visibles para todos).
+- **Un usuario puede pertenecer a varios departamentos.** El administrador se los asigna desde Admin → Usuarios.
+  - Si solo tiene uno, entra directo a ese contexto al iniciar sesión.
+  - Si tiene varios, al iniciar sesión se le pide elegir con cuál entrar.
+  - Ya conectado, si tiene más de uno asignado, le aparece un botón ⇄ junto a su nombre en el header para **cambiar de departamento activo** sin cerrar sesión — se le actualizan sus salas, su directorio de usuarios y el alcance de sus alertas al instante.
+- Las cuentas sin ningún departamento asignado solo ven las salas globales y solo pueden ver/ser vistas por los administradores.
+
+## Sistema de Amigos
+
+Pensado para mantener contacto directo con alguien de otro departamento al que normalmente no verías en tu directorio.
+
+- Pestaña **Amigos** en la barra lateral, con botón **"Agregar amigo"** que abre un buscador — encuentra a cualquier usuario registrado por nombre de usuario o nombre visible, sin importar su departamento.
+- Agregar a alguien manda una **solicitud**; la otra persona la ve en su pestaña Amigos y la acepta o rechaza. Si ambos se agregan mutuamente antes de responder, queda aceptado automático.
+- La lista de amigos muestra, para cada uno, si está conectado (con su departamento activo) o desconectado — todo en tiempo real.
+- Click en un amigo abre el chat privado directo con él. También se puede quitar a alguien de la lista cuando se quiera.
 
 ## Notificaciones no leídas
 
@@ -225,6 +280,10 @@ Las salas temporales se eliminan automáticamente al quedar vacías.
 - La pestaña **Salas** suma todos los no leídos en un badge general
 - Al hacer clic en una sala o al volver a la pestaña del navegador, los contadores se reinician
 - Los mensajes privados también muestran badge 🔴 en la pestaña **Privados**
+
+## Historial de mensajes
+
+Al entrar a una sala o abrir un privado se cargan solo los últimos 50 mensajes (no la conversación completa). Al subir el scroll hasta el tope se piden automáticamente los 50 anteriores, manteniendo la posición sin saltar — igual que WhatsApp o Slack. Cuando llegas al principio real de la conversación aparece el aviso "Inicio de la conversación". Esto evita que una sala con mucho historial sea lenta de cargar.
 
 ## Cumplimiento Legal (Chile)
 
@@ -270,7 +329,7 @@ Cada aceptación de TyC queda registrada en la base de datos con:
 
 ## Persistencia de datos
 
-- **MySQL**: base de datos (ver "Configuración de MySQL" arriba) con las tablas `users`, `rooms`, `messages`, `departments` y `consent_log`. Cada acción (mensaje, reacción, cambio de nombre, etc.) escribe solo la fila que cambió — no se reescribe la base completa en cada operación.
+- **MySQL**: base de datos (ver "Configuración de MySQL" arriba) con las tablas `users`, `rooms`, `messages`, `departments`, `friends`, `alerts` y `consent_log`. Cada acción (mensaje, reacción, cambio de nombre, etc.) escribe solo la fila que cambió — no se reescribe la base completa en cada operación.
 - Los archivos adjuntos se guardan en `uploads/`
 - El certificado SSL se guarda en `certs/` (se genera automáticamente al iniciar con la IP actual)
 - Si la base de datos está vacía, se crea automáticamente con los datos por defecto (usuario `admin` y sala `general`) al iniciar
@@ -284,7 +343,7 @@ chat-cormudesi/
 ├── socket-handler.js     # Eventos de Socket.IO
 ├── mailer.js             # Envío de correo para el botón de alerta (nodemailer)
 ├── migrate-to-mysql.js   # Migración única desde una instalación anterior con SQLite
-├── .env                  # Configuración de MySQL (no se sube a git)
+├── .env                  # Configuración de MySQL y correo (no se sube a git)
 ├── .env.example          # Plantilla de .env
 ├── package.json
 ├── certs/                # Certificado SSL (se genera al iniciar con la IP actual)
