@@ -1,5 +1,6 @@
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 const { sendPanicAlertEmail } = require('./mailer');
 
 module.exports = (io, db) => {
@@ -17,6 +18,7 @@ module.exports = (io, db) => {
   const users = new Map();
   const roomUsers = new Map();
   const roomUnreads = {};
+  const uploadTokens = new Map(); // token -> socket.id, solo usuarios autenticados pueden subir archivos
 
   const getOnlineUsers = (roomName) => {
     const sockets = roomUsers.get(roomName);
@@ -273,7 +275,9 @@ module.exports = (io, db) => {
   const finalizeLogin = (socket, userRecord, department, callback) => {
     const role = userRecord.role || 'user';
     const assignedDepartments = userRecord.departments || [];
-    users.set(socket.id, { username: userRecord.username, currentRoom: null, displayName: userRecord.displayName || userRecord.username, avatar: userRecord.avatar || null, location: userRecord.location || '', role, department, departments: assignedDepartments });
+    const uploadToken = crypto.randomUUID();
+    uploadTokens.set(uploadToken, socket.id);
+    users.set(socket.id, { username: userRecord.username, currentRoom: null, displayName: userRecord.displayName || userRecord.username, avatar: userRecord.avatar || null, location: userRecord.location || '', role, department, departments: assignedDepartments, uploadToken });
     socket.username = userRecord.username;
     socket.displayName = userRecord.displayName || userRecord.username;
     socket.avatar = userRecord.avatar || null;
@@ -293,7 +297,8 @@ module.exports = (io, db) => {
       role,
       department,
       departmentDisplayName: deptRecord?.displayName || department,
-      departments: departmentOptions(assignedDepartments)
+      departments: departmentOptions(assignedDepartments),
+      uploadToken
     });
   };
 
@@ -605,6 +610,17 @@ module.exports = (io, db) => {
 
       const msg = data.messages.find(m => m.id === messageId);
       if (!msg) return callback?.({ ok: false, error: 'Mensaje no encontrado' });
+
+      if (msg.room_name) {
+        const room = data.rooms.find(r => r.name === msg.room_name);
+        if (!room || !canViewRoom(room, user.department, user.role)) {
+          return callback?.({ ok: false, error: 'No tienes acceso a este mensaje' });
+        }
+      } else if (msg.recipient) {
+        if (user.username !== msg.sender && user.username !== msg.recipient) {
+          return callback?.({ ok: false, error: 'No tienes acceso a este mensaje' });
+        }
+      }
 
       if (!msg.reactions) msg.reactions = {};
 
@@ -1211,6 +1227,7 @@ module.exports = (io, db) => {
           if (roomUnreads[delUsername]) {
             delete roomUnreads[delUsername];
           }
+          if (u.uploadToken) uploadTokens.delete(u.uploadToken);
           io.to(sid).emit('force-disconnect', { reason: 'Tu cuenta ha sido eliminada por un administrador' });
           users.delete(sid);
           break;
@@ -1408,6 +1425,9 @@ module.exports = (io, db) => {
 
       const { room, with: withUser, beforeId } = data_ || {};
       if (room) {
+        if (room !== user.currentRoom) {
+          return callback?.({ messages: [], hasMore: false });
+        }
         const page = getRoomHistory(room, beforeId);
         return callback?.({ messages: page.messages, hasMore: page.hasMore });
       }
@@ -1422,6 +1442,7 @@ module.exports = (io, db) => {
       const user = users.get(socket.id);
       if (!user) return;
 
+      if (user.uploadToken) uploadTokens.delete(user.uploadToken);
       const oldRoom = user.currentRoom;
 
       for (const [roomName, sockets] of roomUsers) {
@@ -1450,4 +1471,8 @@ module.exports = (io, db) => {
       }
     });
   });
+
+  return {
+    isValidUploadToken: (token) => uploadTokens.has(token)
+  };
 };

@@ -29,9 +29,16 @@ const upload = multer({
   limits: { fileSize: 10 * 1024 * 1024 }
 });
 
+let socketHandlers = null;
+
 app.post('/api/upload', upload.single('file'), (req, res) => {
   if (!req.file) {
     return res.status(400).json({ error: 'No se recibió archivo' });
+  }
+  const token = req.body?.token;
+  if (!token || !socketHandlers || !socketHandlers.isValidUploadToken(token)) {
+    try { fs.unlinkSync(req.file.path); } catch {}
+    return res.status(401).json({ error: 'No autorizado' });
   }
   res.json({
     url: '/uploads/' + req.file.filename,
@@ -143,7 +150,7 @@ const start = async () => {
   const io = new Server();
   io.attach(httpsServer);
 
-  require('./socket-handler')(io, db);
+  socketHandlers = require('./socket-handler')(io, db);
 
   // Servidor HTTP: solo redirige a HTTPS
   const httpServer = http.createServer((req, res) => {

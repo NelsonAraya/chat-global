@@ -1,6 +1,7 @@
 ﻿const socket = io();
 
 let currentUser = null;
+let currentUploadToken = null;
 let currentDisplayName = null;
 let currentAvatar = null;
 let currentLocation = '';
@@ -412,6 +413,7 @@ fileInput.addEventListener('change', function() {
 
   var formData = new FormData();
   formData.append('file', file);
+  formData.append('token', currentUploadToken || '');
 
   fetch('/api/upload', { method: 'POST', body: formData })
     .then(function(res) { return res.json(); })
@@ -476,6 +478,7 @@ function startRecording() {
 
       var formData = new FormData();
       formData.append('file', blob, 'audio_' + Date.now() + '.webm');
+      formData.append('token', currentUploadToken || '');
       fetch('/api/upload', { method: 'POST', body: formData })
         .then(function(res) { return res.json(); })
         .then(function(data) {
@@ -580,6 +583,7 @@ document.querySelectorAll('.login-tab').forEach(tab => {
 function completeLogin(username, res, opts) {
   opts = opts || {};
   currentUser = username.toLowerCase();
+  currentUploadToken = res.uploadToken || null;
   currentDisplayName = res.displayName || username;
   currentAvatar = res.avatar || null;
   currentLocation = res.location || '';
@@ -843,6 +847,7 @@ avatarInput.addEventListener('change', function() {
   }
   var formData = new FormData();
   formData.append('file', file);
+  formData.append('token', currentUploadToken || '');
   fetch('/api/upload', { method: 'POST', body: formData })
     .then(function(res) { return res.json(); })
     .then(function(data) {
