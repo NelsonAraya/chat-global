@@ -1,11 +1,12 @@
 # Chat CORMUDESI
 
-Sistema de chat interno para redes LAN. Basado en Node.js + Express + Socket.IO con almacenamiento en SQLite.
+Sistema de chat interno para redes LAN. Basado en Node.js + Express + Socket.IO con almacenamiento en MySQL.
 
 ## Requisitos
 
 - Node.js v18 o superior
 - npm (incluido con Node.js)
+- **MySQL** (o MariaDB) corriendo y accesible desde el servidor
 - Red LAN con cable o WiFi
 - Puertos **3000** y **3443** abiertos en el firewall del servidor
 
@@ -19,9 +20,46 @@ cd chat
 # 2. Instalar dependencias
 npm install
 
-# 3. Iniciar el servidor
+# 3. Configurar la conexión a MySQL (variables de entorno, ver abajo)
+
+# 4. Iniciar el servidor
 npm start
 ```
+
+## Configuración de MySQL
+
+El servidor crea automáticamente la base de datos y las tablas la primera vez que arranca (el usuario de MySQL que uses necesita permiso para crear bases de datos). La configuración va en un archivo **`.env`** en la raíz del proyecto (no se sube a git, cada servidor tiene el suyo):
+
+```bash
+# 1. Copia la plantilla
+cp .env.example .env
+
+# 2. Edita .env con los datos de tu MySQL
+```
+
+Variables disponibles (si no se define alguna, usa el valor por defecto):
+
+| Variable | Default | Descripción |
+|---|---|---|
+| `DB_HOST` | `localhost` | Host del servidor MySQL |
+| `DB_PORT` | `3306` | Puerto de MySQL |
+| `DB_USER` | `root` | Usuario de MySQL |
+| `DB_PASSWORD` | *(vacío)* | Contraseña de MySQL |
+| `DB_NAME` | `chat_cormudesi` | Nombre de la base de datos |
+| `HTTP_PORT` | `3000` | Puerto HTTP (opcional) |
+| `HTTPS_PORT` | `3443` | Puerto HTTPS (opcional) |
+
+Con `.env` configurado, `npm start` ya levanta el servidor conectado a esa base — no hace falta pasar nada por línea de comandos.
+
+### Migrar desde una instalación anterior (SQLite)
+
+Si vienes de una versión anterior que usaba `chat.db` (SQLite), migra tus datos una sola vez antes de iniciar el servidor con MySQL:
+
+```bash
+npm run migrate
+```
+
+Lee `chat.db`, crea la base de datos y las tablas en MySQL, y copia usuarios, salas, mensajes, departamentos y el registro de consentimiento (TyC). `chat.db` no se modifica ni se borra — queda como respaldo. Se puede ejecutar más de una vez sin duplicar datos.
 
 ## Acceder desde la LAN
 
@@ -114,6 +152,7 @@ Windows + R → "wf.msc" → Reglas de entrada → Nueva regla → Puerto
 |---|---|
 | `npm start` | Inicia el servidor |
 | `npm run dev` | Inicia con reinicio automático al editar código |
+| `npm run migrate` | Migra datos de una instalación anterior con SQLite hacia MySQL (una sola vez) |
 | `Ctrl + C` | Detiene el servidor |
 
 ## Botón de Alerta
@@ -216,19 +255,21 @@ Cada aceptación de TyC queda registrada en la base de datos con:
 
 ## Persistencia de datos
 
-- **SQLite** (`chat.db`): base de datos única que contiene usuarios, salas, mensajes y registro de consentimiento
+- **MySQL**: base de datos (ver "Configuración de MySQL" arriba) con las tablas `users`, `rooms`, `messages`, `departments` y `consent_log`. Cada acción (mensaje, reacción, cambio de nombre, etc.) escribe solo la fila que cambió — no se reescribe la base completa en cada operación.
 - Los archivos adjuntos se guardan en `uploads/`
 - El certificado SSL se guarda en `certs/` (se genera automáticamente al iniciar con la IP actual)
-- Si eliminas `chat.db` se regenera automáticamente al reiniciar con los datos por defecto (usuario `admin` y sala `general`)
+- Si la base de datos está vacía, se crea automáticamente con los datos por defecto (usuario `admin` y sala `general`) al iniciar
 
 ## Estructura del proyecto
 
 ```
 chat-cormudesi/
 ├── index.js              # Servidor (HTTP redirige a HTTPS)
-├── db.js                 # Persistencia SQLite (sql.js) + hash de contraseñas
+├── db.js                 # Persistencia MySQL (mysql2) + hash de contraseñas
 ├── socket-handler.js     # Eventos de Socket.IO
-├── chat.db               # Base de datos SQLite (se crea al iniciar)
+├── migrate-to-mysql.js   # Migración única desde una instalación anterior con SQLite
+├── .env                  # Configuración de MySQL (no se sube a git)
+├── .env.example          # Plantilla de .env
 ├── package.json
 ├── certs/                # Certificado SSL (se genera al iniciar con la IP actual)
 ├── uploads/              # Archivos adjuntos (se crea al iniciar)

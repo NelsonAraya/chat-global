@@ -2,7 +2,14 @@ const fs = require('fs');
 const path = require('path');
 
 module.exports = (io, db) => {
-  const { data, save, hashPassword, saveConsent } = db;
+  const {
+    data, hashPassword,
+    saveUser, deleteUser,
+    saveRoom, deleteRoom,
+    saveMessage, updateMessageReactions, deleteMessagesByRoom,
+    saveDepartment, deleteDepartment,
+    saveConsent
+  } = db;
   const TERMS_VERSION = '1.0';
   const users = new Map();
   const roomUsers = new Map();
@@ -22,15 +29,29 @@ module.exports = (io, db) => {
     return !sockets || sockets.size === 0;
   };
 
-  const getAllRooms = () => data.rooms.map(r => ({
-    name: r.name,
-    hasPassword: !!r.password,
-    temporary: !!r.temporary
-  }));
+  // Un usuario "target" (dept propio) es visible para un visor admin, para cualquiera si target es admin,
+  // o solo para quienes comparten su mismo departamento.
+  const canViewUser = (target, viewerDept, viewerRole) => {
+    if (viewerRole === 'admin') return true;
+    if (target.role === 'admin') return true;
+    return !!target.department && target.department === viewerDept;
+  };
 
-  const getAllUsers = () => {
+  // Una sala sin departamento es global (visible por todos). Si tiene departamento, solo
+  // la ven los admins y los usuarios de ese mismo departamento.
+  const canViewRoom = (room, viewerDept, viewerRole) => {
+    if (viewerRole === 'admin') return true;
+    return !room.department || room.department === viewerDept;
+  };
+
+  const getAllRooms = (viewerDept, viewerRole) => data.rooms
+    .filter(r => canViewRoom(r, viewerDept, viewerRole))
+    .map(r => ({ name: r.name, hasPassword: !!r.password, temporary: !!r.temporary, department: r.department || null }));
+
+  const getAllUsers = (viewerDept, viewerRole) => {
     const seen = new Map();
     for (const [, u] of users) {
+      if (!canViewUser(u, viewerDept, viewerRole)) continue;
       if (!seen.has(u.username)) {
         seen.set(u.username, { username: u.username, displayName: u.displayName || u.username, avatar: u.avatar || null });
       }
@@ -38,20 +59,62 @@ module.exports = (io, db) => {
     return Array.from(seen.values());
   };
 
-  const getRoomHistory = (roomName) => {
-    return data.messages
-      .filter(m => m.room_name === roomName && !m.recipient)
-      .map(m => ({ ...m, type: 'room' }));
+  // La lista de "todos los usuarios" es distinta para cada visor (según su departamento),
+  // así que se envía personalizada en vez de un io.emit único.
+  const broadcastAllUsers = () => {
+    for (const [sid, u] of users) {
+      io.to(sid).emit('all-users', { users: getAllUsers(u.department, u.role) });
+    }
   };
 
-  const getPrivateHistory = (userA, userB) => {
-    return data.messages
-      .filter(m =>
-        m.recipient &&
-        ((m.sender === userA && m.recipient === userB) ||
-         (m.sender === userB && m.recipient === userA))
-      )
-      .map(m => ({ ...m, type: 'private' }));
+  const emitToViewersOf = (targetUserLike, event, payload) => {
+    for (const [sid, u] of users) {
+      if (canViewUser(targetUserLike, u.department, u.role)) {
+        io.to(sid).emit(event, payload);
+      }
+    }
+  };
+
+  const emitToViewersOfRoom = (room, event, payload) => {
+    for (const [sid, u] of users) {
+      if (canViewRoom(room, u.department, u.role)) {
+        io.to(sid).emit(event, payload);
+      }
+    }
+  };
+
+  const HISTORY_PAGE_SIZE = 50;
+
+  // Devuelve una página de mensajes: los HISTORY_PAGE_SIZE anteriores a `beforeId`
+  // (o los más recientes si no se pasa beforeId), en orden cronológico, junto con
+  // si quedan más mensajes más viejos por cargar.
+  const paginate = (msgs, beforeId) => {
+    let endIdx = msgs.length;
+    if (beforeId !== undefined && beforeId !== null) {
+      const idx = msgs.findIndex(m => m.id === beforeId);
+      if (idx !== -1) endIdx = idx;
+    }
+    const startIdx = Math.max(0, endIdx - HISTORY_PAGE_SIZE);
+    return {
+      messages: msgs.slice(startIdx, endIdx),
+      hasMore: startIdx > 0
+    };
+  };
+
+  const getRoomHistory = (roomName, beforeId) => {
+    const msgs = data.messages.filter(m => m.room_name === roomName && !m.recipient);
+    const page = paginate(msgs, beforeId);
+    return { messages: page.messages.map(m => ({ ...m, type: 'room' })), hasMore: page.hasMore };
+  };
+
+  const getPrivateHistory = (userA, userB, beforeId) => {
+    const msgs = data.messages.filter(m =>
+      m.recipient &&
+      ((m.sender === userA && m.recipient === userB) ||
+       (m.sender === userB && m.recipient === userA))
+    );
+    const page = paginate(msgs, beforeId);
+    return { messages: page.messages.map(m => ({ ...m, type: 'private' })), hasMore: page.hasMore };
   };
 
   const getConversations = (username) => {
@@ -86,7 +149,7 @@ module.exports = (io, db) => {
     return conversations;
   };
 
-  const cleanupTemporaryRoom = (roomName) => {
+  const cleanupTemporaryRoom = async (roomName) => {
     const room = data.rooms.find(r => r.name === roomName);
     if (!room || !room.temporary) return false;
     if (!isRoomEmpty(roomName)) return false;
@@ -105,15 +168,46 @@ module.exports = (io, db) => {
       data.rooms.splice(idx, 1);
     }
     data.messages = data.messages.filter(m => m.room_name !== roomName);
-    save();
-    io.emit('room-deleted', { name: roomName });
+    await deleteRoom(roomName);
+    await deleteMessagesByRoom(roomName);
+    emitToViewersOfRoom(room, 'room-deleted', { name: roomName });
     roomUsers.delete(roomName);
     return true;
   };
 
+  const departmentOptions = (names) => names.map(n => {
+    const rec = data.departments.find(d => d.name === n);
+    return { name: n, displayName: rec?.displayName || n };
+  });
+
+  const finalizeLogin = (socket, userRecord, department, callback) => {
+    const role = userRecord.role || 'user';
+    const assignedDepartments = userRecord.departments || [];
+    users.set(socket.id, { username: userRecord.username, currentRoom: null, displayName: userRecord.displayName || userRecord.username, avatar: userRecord.avatar || null, location: userRecord.location || '', role, department, departments: assignedDepartments });
+    socket.username = userRecord.username;
+    socket.displayName = userRecord.displayName || userRecord.username;
+    socket.avatar = userRecord.avatar || null;
+    socket.location = userRecord.location || '';
+    socket.department = department;
+    socket.pendingUser = null;
+    broadcastAllUsers();
+    const deptRecord = department ? data.departments.find(d => d.name === department) : null;
+    callback?.({
+      ok: true,
+      rooms: getAllRooms(department, role),
+      displayName: userRecord.displayName || userRecord.username,
+      avatar: userRecord.avatar || null,
+      location: userRecord.location || '',
+      role,
+      department,
+      departmentDisplayName: deptRecord?.displayName || department,
+      departments: departmentOptions(assignedDepartments)
+    });
+  };
+
   io.on('connection', (socket) => {
-    socket.on('register', (data_, callback) => {
-      const { username, password, terms_version } = data_ || {};
+    socket.on('register', async (data_, callback) => {
+      const { username, password, terms_version, department } = data_ || {};
       if (!username || !username.trim()) {
         return callback?.({ ok: false, error: 'Nombre de usuario requerido' });
       }
@@ -130,20 +224,43 @@ module.exports = (io, db) => {
       if (!terms_version) {
         return callback?.({ ok: false, error: 'Debes aceptar los Términos y Condiciones' });
       }
-      data.users.push({
+
+      let userDepartments = [];
+      if (data.departments.length > 0) {
+        if (!department) return callback?.({ ok: false, error: 'Selecciona tu departamento/centro' });
+        if (!data.departments.find(d => d.name === department)) {
+          return callback?.({ ok: false, error: 'Departamento no válido' });
+        }
+        userDepartments = [department];
+      }
+
+      const newUser = {
         username: name,
         password: hashPassword(password),
         displayName: name,
         avatar: null,
+        departments: userDepartments,
         created_at: new Date().toISOString()
-      });
-      saveConsent(name, terms_version, new Date().toISOString(), socket.handshake.address);
-      save();
+      };
+      data.users.push(newUser);
+      try {
+        await saveUser(newUser);
+        await saveConsent(name, terms_version, new Date().toISOString(), socket.handshake.address);
+      } catch (err) {
+        console.error('register error:', err);
+        data.users = data.users.filter(u => u !== newUser);
+        return callback?.({ ok: false, error: 'Error al guardar en la base de datos' });
+      }
       callback?.({ ok: true });
     });
 
+    socket.on('get-departments', (callback) => {
+      callback?.(data.departments.map(d => ({ name: d.name, displayName: d.displayName })));
+    });
+
     socket.on('get-all-users', (callback) => {
-      callback?.(getAllUsers());
+      const user = users.get(socket.id);
+      callback?.(getAllUsers(user?.department, user?.role));
     });
 
     socket.on('login', (data_, callback) => {
@@ -168,21 +285,65 @@ module.exports = (io, db) => {
         }
       }
 
-      const role = userRecord.role || 'user';
-      users.set(socket.id, { username: name, currentRoom: null, displayName: userRecord.displayName || name, avatar: userRecord.avatar || null, location: userRecord.location || '', role });
-      socket.username = name;
-      socket.displayName = userRecord.displayName || name;
-      socket.avatar = userRecord.avatar || null;
-      socket.location = userRecord.location || '';
-      io.emit('all-users', { users: getAllUsers() });
-      callback?.({
-        ok: true,
-        rooms: getAllRooms(),
-        displayName: userRecord.displayName || name,
-        avatar: userRecord.avatar || null,
-        location: userRecord.location || '',
-        role
+      const assignedDepartments = userRecord.departments || [];
+      if (assignedDepartments.length > 1) {
+        socket.pendingUser = { username: name };
+        return callback?.({
+          ok: true,
+          requireDepartment: true,
+          departments: departmentOptions(assignedDepartments)
+        });
+      }
+
+      finalizeLogin(socket, userRecord, assignedDepartments[0] || null, callback);
+    });
+
+    socket.on('select-department', (data_, callback) => {
+      if (!socket.pendingUser) return callback?.({ ok: false, error: 'No hay una sesión pendiente' });
+
+      const { department } = data_ || {};
+      const userRecord = data.users.find(u => u.username === socket.pendingUser.username);
+      if (!userRecord) return callback?.({ ok: false, error: 'Usuario no encontrado' });
+
+      const assignedDepartments = userRecord.departments || [];
+      if (!department || !assignedDepartments.includes(department)) {
+        return callback?.({ ok: false, error: 'Departamento no válido' });
+      }
+      for (const [, u] of users) {
+        if (u.username === userRecord.username) {
+          return callback?.({ ok: false, error: 'Ese usuario ya está conectado' });
+        }
+      }
+
+      finalizeLogin(socket, userRecord, department, callback);
+    });
+
+    socket.on('switch-department', (data_, callback) => {
+      const user = users.get(socket.id);
+      if (!user) return callback?.({ ok: false, error: 'No autenticado' });
+
+      const { department } = data_ || {};
+      if (!department || !(user.departments || []).includes(department)) {
+        return callback?.({ ok: false, error: 'No tienes acceso a ese departamento' });
+      }
+      if (department === user.department) {
+        return callback?.({ ok: false, error: 'Ya estás en ese departamento' });
+      }
+
+      user.department = department;
+      socket.department = department;
+      broadcastAllUsers();
+
+      const deptRecord = data.departments.find(d => d.name === department);
+      io.to(socket.id).emit('profile-updated', {
+        role: user.role,
+        department: user.department,
+        departmentDisplayName: deptRecord?.displayName || department,
+        departments: departmentOptions(user.departments || []),
+        rooms: getAllRooms(user.department, user.role)
       });
+
+      callback?.({ ok: true });
     });
 
     socket.on('join-room', (data_, callback) => {
@@ -196,6 +357,10 @@ module.exports = (io, db) => {
 
       const room = data.rooms.find(r => r.name === roomName);
       if (!room) return callback?.({ ok: false, error: 'La sala no existe' });
+
+      if (!canViewRoom(room, user.department, user.role)) {
+        return callback?.({ ok: false, error: 'No tienes acceso a esta sala' });
+      }
 
       if (room.password) {
         if (!password) {
@@ -217,12 +382,11 @@ module.exports = (io, db) => {
           } else {
             io.to(user.currentRoom).emit('users-update', {
               room: user.currentRoom,
-              users: getOnlineUsers(user.currentRoom),
-              allUsers: getAllUsers()
+              users: getOnlineUsers(user.currentRoom)
             });
           }
           if (wasEmpty) {
-            cleanupTemporaryRoom(user.currentRoom);
+            cleanupTemporaryRoom(user.currentRoom).catch(err => console.error('cleanupTemporaryRoom error:', err));
           }
         }
       }
@@ -237,8 +401,7 @@ module.exports = (io, db) => {
 
       io.to(roomName).emit('users-update', {
         room: roomName,
-        users: getOnlineUsers(roomName),
-        allUsers: getAllUsers()
+        users: getOnlineUsers(roomName)
       });
 
       if (roomUnreads[user.username]) {
@@ -246,12 +409,15 @@ module.exports = (io, db) => {
       }
       io.to(socket.id).emit('room-unread-update', { room: roomName, count: 0 });
 
+      const historyPage = getRoomHistory(roomName);
       callback?.({
         ok: true,
-        history: getRoomHistory(roomName),
+        history: historyPage.messages,
+        hasMoreHistory: historyPage.hasMore,
         room: roomName,
         hasPassword: !!room.password,
-        temporary: !!room.temporary
+        temporary: !!room.temporary,
+        users: getOnlineUsers(roomName)
       });
     });
 
@@ -279,9 +445,8 @@ module.exports = (io, db) => {
       };
 
       data.messages.push(msg);
-      save();
-
       io.to(user.currentRoom).emit('room-message', msg);
+      saveMessage(msg).catch(err => console.error('saveMessage error:', err));
 
       for (const [sid, u] of users) {
         if (u.currentRoom !== user.currentRoom) {
@@ -319,7 +484,7 @@ module.exports = (io, db) => {
       };
 
       data.messages.push(msg);
-      save();
+      saveMessage(msg).catch(err => console.error('saveMessage error:', err));
 
       for (const [sid, u] of users) {
         if (u.username === recipient) {
@@ -378,7 +543,7 @@ module.exports = (io, db) => {
         msg.reactions[emoji].push(user.username);
       }
 
-      save();
+      updateMessageReactions(msg.id, msg.reactions).catch(err => console.error('updateMessageReactions error:', err));
 
       // Broadcast the update to everyone who can see the message
       if (msg.room_name) {
@@ -406,16 +571,15 @@ module.exports = (io, db) => {
       const record = data.users.find(u => u.username === user.username);
       if (record) {
         record.displayName = displayName;
-        save();
+        saveUser(record).catch(err => console.error('saveUser error:', err));
       }
       socket.displayName = displayName;
-      io.emit('all-users', { users: getAllUsers() });
-      io.emit('display-name-updated', { username: user.username, displayName });
+      broadcastAllUsers();
+      emitToViewersOf(user, 'display-name-updated', { username: user.username, displayName });
       if (user.currentRoom) {
         io.to(user.currentRoom).emit('users-update', {
           room: user.currentRoom,
-          users: getOnlineUsers(user.currentRoom),
-          allUsers: getAllUsers()
+          users: getOnlineUsers(user.currentRoom)
         });
       }
       callback?.({ ok: true, displayName });
@@ -430,22 +594,21 @@ module.exports = (io, db) => {
       const record = data.users.find(u => u.username === user.username);
       if (record) {
         record.avatar = avatar;
-        save();
+        saveUser(record).catch(err => console.error('saveUser error:', err));
       }
       socket.avatar = avatar;
-      io.emit('all-users', { users: getAllUsers() });
-      io.emit('avatar-updated', { username: user.username, avatar });
+      broadcastAllUsers();
+      emitToViewersOf(user, 'avatar-updated', { username: user.username, avatar });
       if (user.currentRoom) {
         io.to(user.currentRoom).emit('users-update', {
           room: user.currentRoom,
-          users: getOnlineUsers(user.currentRoom),
-          allUsers: getAllUsers()
+          users: getOnlineUsers(user.currentRoom)
         });
       }
       callback?.({ ok: true, avatar });
     });
 
-    socket.on('change-password', (data_, callback) => {
+    socket.on('change-password', async (data_, callback) => {
       const user = users.get(socket.id);
       if (!user) return callback?.({ ok: false, error: 'No autenticado' });
 
@@ -457,12 +620,19 @@ module.exports = (io, db) => {
       if (!record) return callback?.({ ok: false, error: 'Usuario no encontrado' });
       if (record.password !== hashPassword(currentPassword)) return callback?.({ ok: false, error: 'Contraseña actual incorrecta' });
 
+      const previousPassword = record.password;
       record.password = hashPassword(newPassword);
-      save();
+      try {
+        await saveUser(record);
+      } catch (err) {
+        console.error('saveUser error:', err);
+        record.password = previousPassword;
+        return callback?.({ ok: false, error: 'Error al guardar en la base de datos' });
+      }
       callback?.({ ok: true });
     });
 
-    socket.on('create-room', (data_, callback) => {
+    socket.on('create-room', async (data_, callback) => {
       const user = users.get(socket.id);
       if (!user) return;
 
@@ -484,25 +654,48 @@ module.exports = (io, db) => {
         return callback?.({ ok: false, error: 'Solo administradores pueden crear salas fijas' });
       }
 
-      data.rooms.push({
+      let department;
+      if (user.role === 'admin') {
+        department = data_?.department || null;
+        if (department && !data.departments.find(d => d.name === department)) {
+          return callback?.({ ok: false, error: 'Departamento no válido' });
+        }
+      } else {
+        if (!user.department) {
+          return callback?.({ ok: false, error: 'Tu cuenta no tiene un departamento/centro asignado. Contacta al administrador.' });
+        }
+        department = user.department;
+      }
+
+      const newRoom = {
         name,
         created_by: user.username,
         created_at: new Date().toISOString(),
         password: password ? hashPassword(password) : null,
-        temporary
-      });
-      save();
+        temporary,
+        department
+      };
+      data.rooms.push(newRoom);
+      try {
+        await saveRoom(newRoom);
+      } catch (err) {
+        console.error('saveRoom error:', err);
+        data.rooms = data.rooms.filter(r => r !== newRoom);
+        return callback?.({ ok: false, error: 'Error al guardar en la base de datos' });
+      }
 
-      io.emit('room-created', {
+      emitToViewersOfRoom(newRoom, 'room-created', {
         name,
         hasPassword: !!password,
-        temporary
+        temporary,
+        department
       });
       callback?.({ ok: true, name });
     });
 
     socket.on('get-rooms', (callback) => {
-      callback?.(getAllRooms());
+      const user = users.get(socket.id);
+      callback?.(getAllRooms(user?.department, user?.role));
     });
 
     socket.on('get-conversations', (callback) => {
@@ -524,15 +717,16 @@ module.exports = (io, db) => {
         username: u.username,
         displayName: u.displayName || u.username,
         role: u.role || 'user',
+        departments: u.departments || [],
         created_at: u.created_at
       })));
     });
 
-    socket.on('update-user', (data_, callback) => {
+    socket.on('update-user', async (data_, callback) => {
       const user = users.get(socket.id);
       if (!user || user.role !== 'admin') return callback?.({ ok: false, error: 'No autorizado' });
 
-      const { username, displayName, role } = data_ || {};
+      const { username, displayName, role, departments } = data_ || {};
       if (!username) return callback?.({ ok: false, error: 'Usuario requerido' });
 
       const target = data.users.find(u => u.username === username);
@@ -540,14 +734,50 @@ module.exports = (io, db) => {
 
       if (displayName !== undefined) target.displayName = displayName;
       if (role !== undefined && (role === 'admin' || role === 'user')) target.role = role;
-      save();
+      if (departments !== undefined) {
+        const deptList = Array.isArray(departments) ? departments.filter(Boolean) : [];
+        for (const d of deptList) {
+          if (!data.departments.find(x => x.name === d)) {
+            return callback?.({ ok: false, error: 'Departamento no válido: ' + d });
+          }
+        }
+        target.departments = deptList;
+      }
+      try {
+        await saveUser(target);
+      } catch (err) {
+        console.error('saveUser error:', err);
+        return callback?.({ ok: false, error: 'Error al guardar en la base de datos' });
+      }
 
-      io.emit('display-name-updated', { username, displayName: target.displayName || username });
+      for (const [sid, u] of users) {
+        if (u.username === username) {
+          if (role !== undefined) u.role = target.role;
+          if (departments !== undefined) {
+            u.departments = target.departments;
+            if (u.department && !u.departments.includes(u.department)) {
+              u.department = u.departments[0] || null;
+            }
+          }
+          const deptRecord = u.department ? data.departments.find(d => d.name === u.department) : null;
+          io.to(sid).emit('profile-updated', {
+            role: u.role,
+            department: u.department,
+            departmentDisplayName: deptRecord?.displayName || u.department,
+            departments: departmentOptions(u.departments || []),
+            rooms: getAllRooms(u.department, u.role)
+          });
+          break;
+        }
+      }
+
+      broadcastAllUsers();
+      emitToViewersOf({ role: target.role, department: (target.departments && target.departments[0]) || null }, 'display-name-updated', { username, displayName: target.displayName || username });
 
       callback?.({ ok: true });
     });
 
-    socket.on('delete-room', (data_, callback) => {
+    socket.on('delete-room', async (data_, callback) => {
       const user = users.get(socket.id);
       if (!user || user.role !== 'admin') return callback?.({ ok: false, error: 'No autorizado' });
 
@@ -558,15 +788,22 @@ module.exports = (io, db) => {
       if (idx === -1) return callback?.({ ok: false, error: 'Sala no existe' });
       if (roomName === 'general') return callback?.({ ok: false, error: 'No puedes eliminar la sala general' });
 
+      const room = data.rooms[idx];
       data.rooms.splice(idx, 1);
       data.messages = data.messages.filter(m => m.room_name !== roomName);
-      save();
+      try {
+        await deleteRoom(roomName);
+        await deleteMessagesByRoom(roomName);
+      } catch (err) {
+        console.error('delete-room error:', err);
+        return callback?.({ ok: false, error: 'Error al guardar en la base de datos' });
+      }
 
-      io.emit('room-deleted', { name: roomName });
+      emitToViewersOfRoom(room, 'room-deleted', { name: roomName });
       callback?.({ ok: true });
     });
 
-    socket.on('admin-set-room-password', (data_, callback) => {
+    socket.on('admin-set-room-password', async (data_, callback) => {
       const user = users.get(socket.id);
       if (!user || user.role !== 'admin') return callback?.({ ok: false, error: 'No autorizado' });
 
@@ -578,24 +815,37 @@ module.exports = (io, db) => {
       if (!room) return callback?.({ ok: false, error: 'Sala no existe' });
 
       room.password = password ? hashPassword(password) : null;
-      save();
+      try {
+        await saveRoom(room);
+      } catch (err) {
+        console.error('saveRoom error:', err);
+        return callback?.({ ok: false, error: 'Error al guardar en la base de datos' });
+      }
 
-      io.emit('room-password-changed', { name, hasPassword: !!room.password });
+      emitToViewersOfRoom(room, 'room-password-changed', { name, hasPassword: !!room.password });
       callback?.({ ok: true });
     });
 
     socket.on('get-stats', (callback) => {
       const user = users.get(socket.id);
       if (!user || user.role !== 'admin') return;
+      const byDepartment = data.departments.map(d => ({
+        name: d.name,
+        displayName: d.displayName,
+        users: data.users.filter(u => (u.departments || []).includes(d.name)).length,
+        online: Array.from(users.values()).filter(u => u.department === d.name).length,
+        rooms: data.rooms.filter(r => r.department === d.name).length
+      }));
       callback({
         totalUsers: data.users.length,
         connectedUsers: users.size,
         totalMessages: data.messages.length,
-        totalRooms: data.rooms.length
+        totalRooms: data.rooms.length,
+        departments: byDepartment
       });
     });
 
-    socket.on('admin-reset-password', (data_, callback) => {
+    socket.on('admin-reset-password', async (data_, callback) => {
       const user = users.get(socket.id);
       if (!user || user.role !== 'admin') return callback?.({ ok: false, error: 'No autorizado' });
 
@@ -608,11 +858,16 @@ module.exports = (io, db) => {
       if (!target) return callback?.({ ok: false, error: 'Usuario no encontrado' });
 
       target.password = hashPassword(newPassword);
-      save();
+      try {
+        await saveUser(target);
+      } catch (err) {
+        console.error('saveUser error:', err);
+        return callback?.({ ok: false, error: 'Error al guardar en la base de datos' });
+      }
       callback?.({ ok: true });
     });
 
-    socket.on('admin-delete-user', (data_, callback) => {
+    socket.on('admin-delete-user', async (data_, callback) => {
       const user = users.get(socket.id);
       if (!user || user.role !== 'admin') return callback?.({ ok: false, error: 'No autorizado' });
 
@@ -625,7 +880,12 @@ module.exports = (io, db) => {
       if (idx === -1) return callback?.({ ok: false, error: 'Usuario no encontrado' });
 
       data.users.splice(idx, 1);
-      save();
+      try {
+        await deleteUser(delUsername);
+      } catch (err) {
+        console.error('deleteUser error:', err);
+        return callback?.({ ok: false, error: 'Error al guardar en la base de datos' });
+      }
 
       for (const [sid, u] of users) {
         if (u.username === delUsername) {
@@ -645,7 +905,106 @@ module.exports = (io, db) => {
         }
       }
 
-      io.emit('all-users', { users: getAllUsers() });
+      broadcastAllUsers();
+      callback?.({ ok: true });
+    });
+
+    socket.on('admin-create-department', async (data_, callback) => {
+      const user = users.get(socket.id);
+      if (!user || user.role !== 'admin') return callback?.({ ok: false, error: 'No autorizado' });
+
+      const name = data_?.name?.trim()?.toLowerCase()?.replace(/\s+/g, '-');
+      const displayName = data_?.displayName?.trim() || name;
+      if (!name) return callback?.({ ok: false, error: 'Nombre requerido' });
+      if (!/^[a-z0-9-áéíóúüñ]+$/.test(name)) {
+        return callback?.({ ok: false, error: 'Solo letras, números y guiones' });
+      }
+      if (data.departments.find(d => d.name === name)) {
+        return callback?.({ ok: false, error: 'Ese departamento ya existe' });
+      }
+
+      const newDept = { name, displayName, created_at: new Date().toISOString() };
+      data.departments.push(newDept);
+
+      let roomName = 'general-' + name;
+      if (data.rooms.find(r => r.name === roomName)) {
+        roomName = roomName + '-' + Date.now();
+      }
+      const defaultRoom = {
+        name: roomName,
+        created_by: user.username,
+        created_at: new Date().toISOString(),
+        password: null,
+        temporary: false,
+        department: name
+      };
+      data.rooms.push(defaultRoom);
+
+      try {
+        await saveDepartment(newDept);
+        await saveRoom(defaultRoom);
+      } catch (err) {
+        console.error('admin-create-department error:', err);
+        data.departments = data.departments.filter(d => d !== newDept);
+        data.rooms = data.rooms.filter(r => r !== defaultRoom);
+        return callback?.({ ok: false, error: 'Error al guardar en la base de datos' });
+      }
+
+      io.emit('department-created', { name, displayName });
+      emitToViewersOfRoom(defaultRoom, 'room-created', {
+        name: roomName,
+        hasPassword: false,
+        temporary: false,
+        department: name
+      });
+
+      callback?.({ ok: true, name, displayName, defaultRoom: roomName });
+    });
+
+    socket.on('admin-delete-department', async (data_, callback) => {
+      const user = users.get(socket.id);
+      if (!user || user.role !== 'admin') return callback?.({ ok: false, error: 'No autorizado' });
+
+      const name = data_?.name;
+      if (!name) return callback?.({ ok: false, error: 'Nombre requerido' });
+
+      const idx = data.departments.findIndex(d => d.name === name);
+      if (idx === -1) return callback?.({ ok: false, error: 'Departamento no existe' });
+
+      const usersAssigned = data.users.filter(u => (u.departments || []).includes(name)).length;
+      if (usersAssigned > 0) {
+        return callback?.({ ok: false, error: `Hay ${usersAssigned} usuario(s) asignados a este departamento. Reasígnalos antes de eliminarlo.` });
+      }
+
+      const deptRooms = data.rooms.filter(r => r.department === name);
+      for (const room of deptRooms) {
+        const roomMessages = data.messages.filter(m => m.room_name === room.name);
+        for (const m of roomMessages) {
+          if (m.file?.url && m.file.url.startsWith('/uploads/')) {
+            const filename = path.basename(m.file.url);
+            const filePath = path.join(__dirname, 'uploads', filename);
+            try { fs.unlinkSync(filePath); } catch {}
+          }
+        }
+        data.messages = data.messages.filter(m => m.room_name !== room.name);
+        emitToViewersOfRoom(room, 'room-deleted', { name: room.name });
+        roomUsers.delete(room.name);
+      }
+      data.rooms = data.rooms.filter(r => r.department !== name);
+      data.departments.splice(idx, 1);
+
+      try {
+        for (const room of deptRooms) {
+          await deleteMessagesByRoom(room.name);
+          await deleteRoom(room.name);
+        }
+        await deleteDepartment(name);
+      } catch (err) {
+        console.error('admin-delete-department error:', err);
+        return callback?.({ ok: false, error: 'Error al guardar en la base de datos' });
+      }
+
+      io.emit('department-deleted', { name });
       callback?.({ ok: true });
     });
 
@@ -653,12 +1012,25 @@ module.exports = (io, db) => {
       const user = users.get(socket.id);
       if (!user) return;
 
-      socket.broadcast.emit('panic-alert', {
+      const deptRecord = user.department ? data.departments.find(d => d.name === user.department) : null;
+      const payload = {
         username: user.username,
         displayName: user.displayName || user.username,
         location: user.location || '',
+        department: user.department || null,
+        departmentDisplayName: deptRecord?.displayName || user.department || null,
         timestamp: new Date().toISOString()
-      });
+      };
+
+      for (const [sid, u] of users) {
+        if (sid === socket.id) continue;
+        const sameDept = !!(user.department && u.department === user.department);
+        const senderIsGlobal = !user.department;
+        const recipientIsAdmin = u.role === 'admin';
+        if (sameDept || senderIsGlobal || recipientIsAdmin) {
+          io.to(sid).emit('panic-alert', payload);
+        }
+      }
     });
 
     socket.on('update-location', (data_, callback) => {
@@ -674,7 +1046,7 @@ module.exports = (io, db) => {
       const record = data.users.find(u => u.username === user.username);
       if (record) {
         record.location = location || null;
-        save();
+        saveUser(record).catch(err => console.error('saveUser error:', err));
       }
       callback?.({ ok: true, location });
     });
@@ -686,7 +1058,24 @@ module.exports = (io, db) => {
       const other = data_?.with;
       if (!other) return;
 
-      callback?.(getPrivateHistory(user.username, other));
+      const page = getPrivateHistory(user.username, other);
+      callback?.({ history: page.messages, hasMoreHistory: page.hasMore });
+    });
+
+    socket.on('get-more-messages', (data_, callback) => {
+      const user = users.get(socket.id);
+      if (!user) return callback?.({ messages: [], hasMore: false });
+
+      const { room, with: withUser, beforeId } = data_ || {};
+      if (room) {
+        const page = getRoomHistory(room, beforeId);
+        return callback?.({ messages: page.messages, hasMore: page.hasMore });
+      }
+      if (withUser) {
+        const page = getPrivateHistory(user.username, withUser, beforeId);
+        return callback?.({ messages: page.messages, hasMore: page.hasMore });
+      }
+      callback?.({ messages: [], hasMore: false });
     });
 
     socket.on('disconnect', () => {
@@ -703,8 +1092,7 @@ module.exports = (io, db) => {
           } else {
             io.to(roomName).emit('users-update', {
               room: roomName,
-              users: getOnlineUsers(roomName),
-              allUsers: getAllUsers()
+              users: getOnlineUsers(roomName)
             });
           }
         }
@@ -714,10 +1102,10 @@ module.exports = (io, db) => {
         delete roomUnreads[user.username];
       }
       users.delete(socket.id);
-      io.emit('all-users', { users: getAllUsers() });
+      broadcastAllUsers();
 
       if (oldRoom) {
-        cleanupTemporaryRoom(oldRoom);
+        cleanupTemporaryRoom(oldRoom).catch(err => console.error('cleanupTemporaryRoom error:', err));
       }
     });
   });

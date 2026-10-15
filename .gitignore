@@ -1,9 +1,12 @@
 node_modules/
+.env
 chat-data.json
 chat-data.json.bak
 data.json
 messages.json
 chat.db
+chat.db.bak
+server.log
 uploads/*
 !uploads/.gitkeep
 certs/*

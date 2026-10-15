@@ -15,8 +15,12 @@ let pendingPasswordRoom = null;
 let sidebarTab = 'rooms';
 let roomPasswords = {};
 let currentRole = 'user';
+let currentDepartment = null;
+let currentDepartmentDisplayName = null;
 let pendingFile = null;
 let replyingTo = null;
+let departments = [];
+let myDepartments = [];
 
 const $ = (id) => document.getElementById(id);
 
@@ -31,9 +35,12 @@ const loginError = $('login-error');
 const registerUsername = $('register-username');
 const registerPassword = $('register-password');
 const registerConfirm = $('register-confirm');
+const registerDepartmentGroup = $('register-department-group');
+const registerDepartment = $('register-department');
 const registerBtn = $('register-btn');
 
 const displayName = $('display-name');
+const headerDepartment = $('header-department');
 const headerAvatar = $('header-avatar');
 const editNameBtn = $('edit-name-btn');
 const nameModalOverlay = $('name-modal-overlay');
@@ -62,10 +69,19 @@ const allUsersList = $('all-users-list');
 const adminTab = $('admin-tab');
 const adminUsersList = $('admin-users-list');
 const adminRoomsList = $('admin-rooms-list');
+const adminDepartmentsList = $('admin-departments-list');
+const createDeptBtn = $('create-dept-btn');
+const createDeptModalOverlay = $('create-dept-modal-overlay');
+const createDeptDisplayname = $('create-dept-displayname');
+const createDeptError = $('create-dept-error');
+const createDeptConfirm = $('create-dept-confirm');
+const createDeptCancel = $('create-dept-cancel');
+const createDeptClose = $('create-dept-modal-close');
 const adminEditOverlay = $('admin-edit-user-overlay');
 const adminEditUsernameDisplay = $('admin-edit-username-display');
 const adminEditDisplayname = $('admin-edit-displayname');
 const adminEditRole = $('admin-edit-role');
+const adminEditDepartments = $('admin-edit-departments');
 const adminEditError = $('admin-edit-error');
 const adminEditConfirm = $('admin-edit-confirm');
 const adminEditCancel = $('admin-edit-cancel');
@@ -107,6 +123,8 @@ const createModalInput = $('create-modal-input');
 const createModalPassword = $('create-modal-password');
 const createModalTemporary = $('create-modal-temporary');
 const createModalInfo = $('create-modal-info');
+const createModalDeptGroup = $('create-modal-dept-group');
+const createModalDepartment = $('create-modal-department');
 const createModalConfirm = $('create-modal-confirm');
 const createModalCancel = $('create-modal-cancel');
 const createModalClose = $('create-modal-close');
@@ -160,6 +178,13 @@ const locationModalClear = $('location-modal-clear');
 const locationModalClose = $('location-modal-close');
 const locationModalError = $('location-modal-error');
 const locationModalStatus = $('location-modal-status');
+const switchDeptBtn = $('switch-dept-btn');
+const departmentSelectOverlay = $('department-select-overlay');
+const departmentSelectTitle = $('department-select-title');
+const departmentSelectIntro = $('department-select-intro');
+const departmentSelectList = $('department-select-list');
+const departmentSelectError = $('department-select-error');
+const departmentSelectClose = $('department-select-close');
 
 var panicAudio = new Audio('/sounds/alerta.mp3');
 panicAudio.preload = 'auto';
@@ -211,6 +236,64 @@ function getAvatarHtml(username, avatarUrl, size) {
   var initial = username.charAt(0).toUpperCase();
   return '<span class="avatar avatar-' + size + ' avatar-initial" style="background:' + color + '">' + initial + '</span>';
 }
+
+function updateHeaderDepartment() {
+  if (currentDepartmentDisplayName) {
+    headerDepartment.textContent = currentDepartmentDisplayName;
+    headerDepartment.classList.remove('hidden');
+    panicBtn.title = 'La alerta solo la verán los usuarios de ' + currentDepartmentDisplayName + ' y los administradores';
+  } else {
+    headerDepartment.classList.add('hidden');
+    panicBtn.title = 'La alerta se enviará a todos los usuarios conectados';
+  }
+  switchDeptBtn.classList.toggle('hidden', myDepartments.length <= 1);
+}
+
+function openDepartmentSelect(mode, deptList, onPick) {
+  departmentSelectError.textContent = '';
+  if (mode === 'login') {
+    departmentSelectTitle.innerHTML = '<i class="fas fa-building"></i> Selecciona tu departamento';
+    departmentSelectIntro.textContent = 'Tu cuenta tiene acceso a varios departamentos/centros. Elige con cuál quieres ingresar ahora.';
+    departmentSelectClose.classList.add('hidden');
+  } else {
+    departmentSelectTitle.innerHTML = '<i class="fas fa-right-left"></i> Cambiar de departamento';
+    departmentSelectIntro.textContent = 'Selecciona el departamento/centro al que quieres cambiarte.';
+    departmentSelectClose.classList.remove('hidden');
+  }
+  departmentSelectList.innerHTML = (deptList || []).map(function(d) {
+    return '<button type="button" class="department-select-item" data-dept="' + escapeHtml(d.name) + '"><i class="fas fa-building"></i> ' + escapeHtml(d.displayName || d.name) + '</button>';
+  }).join('');
+  departmentSelectList.querySelectorAll('.department-select-item').forEach(function(btn) {
+    btn.addEventListener('click', function() {
+      departmentSelectError.textContent = '';
+      btn.disabled = true;
+      onPick(btn.dataset.dept, function(err) {
+        btn.disabled = false;
+        departmentSelectError.textContent = err || 'Error';
+      });
+    });
+  });
+  departmentSelectOverlay.classList.remove('hidden');
+}
+
+function closeDepartmentSelect() {
+  departmentSelectOverlay.classList.add('hidden');
+}
+
+departmentSelectClose.addEventListener('click', closeDepartmentSelect);
+departmentSelectOverlay.addEventListener('click', function(e) {
+  if (e.target === departmentSelectOverlay && !departmentSelectClose.classList.contains('hidden')) closeDepartmentSelect();
+});
+
+switchDeptBtn.addEventListener('click', function() {
+  openDepartmentSelect('switch', myDepartments, function(dept, onError) {
+    socket.emit('switch-department', { department: dept }, function(res) {
+      if (!res.ok) { onError(res.error); return; }
+      closeDepartmentSelect();
+      showToast('Cambiaste de departamento');
+    });
+  });
+});
 
 function updateHeaderAvatar() {
   if (currentAvatar) {
@@ -456,6 +539,23 @@ document.addEventListener('keydown', function(e) {
   }
 });
 
+function loadDepartments(callback) {
+  socket.emit('get-departments', function(list) {
+    departments = list || [];
+    if (departments.length > 0) {
+      registerDepartmentGroup.classList.remove('hidden');
+      registerDepartment.innerHTML = '<option value="">Selecciona tu departamento/centro...</option>' +
+        departments.map(function(d) {
+          return '<option value="' + escapeHtml(d.name) + '">' + escapeHtml(d.displayName || d.name) + '</option>';
+        }).join('');
+    } else {
+      registerDepartmentGroup.classList.add('hidden');
+      registerDepartment.innerHTML = '';
+    }
+    if (callback) callback(departments);
+  });
+}
+
 document.querySelectorAll('.login-tab').forEach(tab => {
   tab.addEventListener('click', () => {
     document.querySelectorAll('.login-tab').forEach(t => t.classList.remove('active'));
@@ -466,6 +566,39 @@ document.querySelectorAll('.login-tab').forEach(tab => {
     loginError.textContent = '';
   });
 });
+
+function completeLogin(username, res, opts) {
+  opts = opts || {};
+  currentUser = username.toLowerCase();
+  currentDisplayName = res.displayName || username;
+  currentAvatar = res.avatar || null;
+  currentLocation = res.location || '';
+  currentRole = res.role || 'user';
+  currentDepartment = res.department || null;
+  currentDepartmentDisplayName = res.departmentDisplayName || null;
+  myDepartments = res.departments || [];
+  rooms = res.rooms || [];
+  loginScreen.classList.add('hidden');
+  chatScreen.classList.remove('hidden');
+  displayName.textContent = currentDisplayName;
+  updateHeaderDepartment();
+  updateHeaderAvatar();
+  if (currentRole === 'admin') {
+    adminTab.classList.remove('hidden');
+  } else {
+    adminTab.classList.add('hidden');
+  }
+  if (opts.password) {
+    localStorage.setItem('chat_user', currentUser);
+    localStorage.setItem('chat_pass', opts.password);
+  }
+  initializeChat();
+  socket.emit('get-room-unreads', function(counts) {
+    roomUnreadCounts = counts || {};
+    renderRooms();
+    updateRoomTotalBadge();
+  });
+}
 
 function doLogin(username, password, callback) {
   loginBtn.disabled = true;
@@ -484,27 +617,19 @@ function doLogin(username, password, callback) {
       return;
     }
 
-    currentUser = username.toLowerCase();
-    currentDisplayName = res.displayName || username;
-    currentAvatar = res.avatar || null;
-    currentLocation = res.location || '';
-    currentRole = res.role || 'user';
-    rooms = res.rooms || [];
-    loginScreen.classList.add('hidden');
-    chatScreen.classList.remove('hidden');
-    displayName.textContent = currentDisplayName;
-    updateHeaderAvatar();
-    if (currentRole === 'admin') {
-      adminTab.classList.remove('hidden');
+    if (res.requireDepartment) {
+      openDepartmentSelect('login', res.departments, function(dept, onError) {
+        socket.emit('select-department', { department: dept }, function(res2) {
+          if (!res2.ok) { onError(res2.error); return; }
+          completeLogin(username, res2, { password: password });
+          closeDepartmentSelect();
+          callback?.({ ok: true });
+        });
+      });
+      return;
     }
-    localStorage.setItem('chat_user', username.toLowerCase());
-    localStorage.setItem('chat_pass', password);
-    initializeChat();
-    socket.emit('get-room-unreads', function(counts) {
-      roomUnreadCounts = counts || {};
-      renderRooms();
-      updateRoomTotalBadge();
-    });
+
+    completeLogin(username, res, { password: password });
     callback?.({ ok: true });
   });
 }
@@ -524,25 +649,21 @@ function tryAutoLogin() {
         loginUsername.focus();
         return;
       }
-      currentUser = savedUser;
-      currentDisplayName = res.displayName || savedUser;
-      currentAvatar = res.avatar || null;
-      currentLocation = res.location || '';
-      currentRole = res.role || 'user';
-      rooms = res.rooms || [];
-      loginScreen.classList.add('hidden');
-      chatScreen.classList.remove('hidden');
-      displayName.textContent = currentDisplayName;
-      updateHeaderAvatar();
-      if (currentRole === 'admin') {
-        adminTab.classList.remove('hidden');
+
+      if (res.requireDepartment) {
+        loginBtn.disabled = false;
+        loginBtn.innerHTML = '<i class="fas fa-arrow-right"></i> Ingresar';
+        openDepartmentSelect('login', res.departments, function(dept, onError) {
+          socket.emit('select-department', { department: dept }, function(res2) {
+            if (!res2.ok) { onError(res2.error); return; }
+            completeLogin(savedUser, res2);
+            closeDepartmentSelect();
+          });
+        });
+        return;
       }
-      initializeChat();
-      socket.emit('get-room-unreads', function(counts) {
-        roomUnreadCounts = counts || {};
-        renderRooms();
-        updateRoomTotalBadge();
-      });
+
+      completeLogin(savedUser, res);
     });
     return true;
   }
@@ -613,6 +734,7 @@ termsAcceptBtn.addEventListener('click', function() {
   if (!pendingRegistration) return;
   const regUsername = pendingRegistration.username;
   const regPassword = pendingRegistration.password;
+  const regDepartment = pendingRegistration.department;
 
   termsAcceptBtn.disabled = true;
   termsAcceptBtn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Registrando...';
@@ -620,6 +742,7 @@ termsAcceptBtn.addEventListener('click', function() {
   socket.emit('register', {
     username: regUsername,
     password: regPassword,
+    department: regDepartment,
     terms_version: TERMS_VERSION
   }, (res) => {
     termsAcceptBtn.disabled = false;
@@ -635,6 +758,7 @@ termsAcceptBtn.addEventListener('click', function() {
     registerUsername.value = '';
     registerPassword.value = '';
     registerConfirm.value = '';
+    registerDepartment.value = '';
     document.querySelectorAll('.login-tab').forEach(t => t.classList.remove('active'));
     document.querySelector('[data-form="login"]').classList.add('active');
     document.querySelectorAll('.login-form-box').forEach(f => f.classList.add('hidden'));
@@ -649,12 +773,14 @@ registerBtn.addEventListener('click', () => {
   const username = registerUsername.value.trim();
   const password = registerPassword.value;
   const confirm = registerConfirm.value;
+  const department = registerDepartment.value || null;
 
   if (!username) { loginError.textContent = 'Ingresa un usuario'; return; }
   if (!password || password.length < 3) { loginError.textContent = 'Minimo 3 caracteres'; return; }
   if (password !== confirm) { loginError.textContent = 'No coinciden'; return; }
+  if (departments.length > 0 && !department) { loginError.textContent = 'Selecciona tu departamento/centro'; return; }
 
-  pendingRegistration = { username, password };
+  pendingRegistration = { username, password, department };
   registerBtn.disabled = true;
   registerBtn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Verificando...';
   loginError.textContent = '';
@@ -946,7 +1072,9 @@ function playPanicSound() {
 }
 
 function showPanicModal(data) {
-  panicModalMessage.textContent = 'El usuario ' + (data.displayName || data.username) + ' está pidiendo asistencia';
+  var who = data.displayName || data.username;
+  if (data.departmentDisplayName) who += ' (' + data.departmentDisplayName + ')';
+  panicModalMessage.textContent = 'El usuario ' + who + ' está pidiendo asistencia';
   var loc = data.location && data.location.trim() ? data.location : 'Indeterminada';
   panicModalLocation.innerHTML = 'Ubicación: <strong>' + escapeHtml(loc) + '</strong>';
   panicModalTime.textContent = formatTime(data.timestamp);
@@ -976,16 +1104,65 @@ function initializeChat() {
   joinRoom({ name: defaultRoom });
 }
 
+const adminView = $('admin-view');
+const chatTopbar = $('chat-topbar');
+const messagesContainer = $('messages-container');
+const messageInputArea = $('message-input-area');
+const sidebarUsers = $('sidebar-users');
+
+function showAdminView() {
+  document.querySelectorAll('.sidebar-panel').forEach(p => p.classList.add('hidden'));
+  chatTopbar.classList.add('hidden');
+  messagesContainer.classList.add('hidden');
+  messageInputArea.classList.add('hidden');
+  sidebarUsers.classList.add('hidden');
+  adminView.classList.remove('hidden');
+  renderAdminPanel();
+  onActionCloseDrawers();
+}
+
+function hideAdminView() {
+  adminView.classList.add('hidden');
+  chatTopbar.classList.remove('hidden');
+  messagesContainer.classList.remove('hidden');
+  messageInputArea.classList.remove('hidden');
+  sidebarUsers.classList.remove('hidden');
+}
+
 document.querySelectorAll('.sidebar-tab').forEach(tab => {
   tab.addEventListener('click', () => {
     document.querySelectorAll('.sidebar-tab').forEach(t => t.classList.remove('active'));
     tab.classList.add('active');
     sidebarTab = tab.dataset.panel;
-    document.querySelectorAll('.sidebar-panel').forEach(p => p.classList.add('hidden'));
-    $(sidebarTab + '-panel').classList.remove('hidden');
-    if (sidebarTab === 'admin') renderAdminPanel();
+    if (sidebarTab === 'admin') {
+      showAdminView();
+    } else {
+      hideAdminView();
+      document.querySelectorAll('.sidebar-panel').forEach(p => p.classList.add('hidden'));
+      $(sidebarTab + '-panel').classList.remove('hidden');
+    }
   });
 });
+
+document.querySelectorAll('.admin-subtab').forEach(function(btn) {
+  btn.addEventListener('click', function() {
+    document.querySelectorAll('.admin-subtab').forEach(function(b) { b.classList.remove('active'); });
+    btn.classList.add('active');
+    document.querySelectorAll('.admin-subtab-panel').forEach(function(p) { p.classList.add('hidden'); });
+    $('admin-subtab-' + btn.dataset.adminTab).classList.remove('hidden');
+  });
+});
+
+function filterAdminList(listEl, query) {
+  var q = query.trim().toLowerCase();
+  Array.from(listEl.children).forEach(function(row) {
+    row.classList.toggle('hidden', !!q && row.textContent.toLowerCase().indexOf(q) === -1);
+  });
+}
+
+$('admin-dept-search').addEventListener('input', function() { filterAdminList(adminDepartmentsList, this.value); });
+$('admin-users-search').addEventListener('input', function() { filterAdminList(adminUsersList, this.value); });
+$('admin-rooms-search').addEventListener('input', function() { filterAdminList(adminRoomsList, this.value); });
 
 function renderRooms() {
   roomsList.innerHTML = rooms.map(function(r) {
@@ -1011,6 +1188,31 @@ function renderRooms() {
   });
 }
 
+function departmentLabel(name) {
+  if (!name) return 'Global';
+  var found = departments.find(function(d) { return d.name === name; });
+  return found ? (found.displayName || found.name) : name;
+}
+
+function userDepartmentsLabel(names) {
+  if (!names || names.length === 0) return 'Sin asignar';
+  return names.map(function(n) {
+    var found = departments.find(function(d) { return d.name === n; });
+    return found ? (found.displayName || found.name) : n;
+  }).join(', ');
+}
+
+function renderDepartmentCheckboxes(containerEl, selectedNames) {
+  if (departments.length === 0) {
+    containerEl.innerHTML = '<div class="admin-edit-dept-empty">No hay departamentos creados aún.</div>';
+    return;
+  }
+  containerEl.innerHTML = departments.map(function(d) {
+    var checked = selectedNames.indexOf(d.name) !== -1 ? ' checked' : '';
+    return '<label><input type="checkbox" value="' + escapeHtml(d.name) + '"' + checked + ' /> ' + escapeHtml(d.displayName || d.name) + '</label>';
+  }).join('');
+}
+
 function renderAdminPanel() {
   socket.emit('get-stats', function(stats) {
     if (stats) {
@@ -1019,6 +1221,32 @@ function renderAdminPanel() {
       adminStatMsgs.textContent = stats.totalMessages;
       adminStatRooms.textContent = stats.totalRooms;
     }
+
+    adminDepartmentsList.innerHTML = departments.map(function(d) {
+      var depStats = stats && stats.departments ? stats.departments.find(function(s) { return s.name === d.name; }) : null;
+      var meta = depStats ? (depStats.users + ' usuarios · ' + depStats.online + ' conectados · ' + depStats.rooms + ' salas') : '';
+      return '<div class="admin-room-item">' +
+        '<div class="admin-room-info">' +
+          '<span class="admin-room-name">' + escapeHtml(d.displayName || d.name) + '</span>' +
+          '<span class="admin-room-meta">' + meta + '</span>' +
+        '</div>' +
+        '<div class="admin-room-actions">' +
+          '<button class="admin-dept-delete-btn btn-icon" data-dept="' + escapeHtml(d.name) + '" title="Eliminar departamento"><i class="fas fa-trash"></i></button>' +
+        '</div>' +
+      '</div>';
+    }).join('') || '<div class="admin-table-empty">Sin departamentos. Crea uno con el botón "Crear departamento".</div>';
+
+    adminDepartmentsList.querySelectorAll('.admin-dept-delete-btn').forEach(function(btn) {
+      btn.addEventListener('click', function() {
+        var name = btn.dataset.dept;
+        if (!confirm('¿Eliminar el departamento "' + departmentLabel(name) + '"?\nSolo se puede eliminar si no tiene usuarios asignados; sus salas y mensajes se borrarán.')) return;
+        socket.emit('admin-delete-department', { name: name }, function(res) {
+          if (!res.ok) { showToast(res.error); return; }
+          showToast('Departamento eliminado');
+          renderAdminPanel();
+        });
+      });
+    });
   });
 
   socket.emit('get-all-registered-users', function(users) {
@@ -1027,9 +1255,9 @@ function renderAdminPanel() {
       return '<div class="admin-user-item">' +
         '<div class="admin-user-info">' +
           '<div class="admin-user-name">' + escapeHtml(u.displayName || u.username) + '</div>' +
-          '<div class="admin-user-username">@' + escapeHtml(u.username) + '  <span class="admin-user-role' + (isAdmin ? ' admin-role-badge' : '') + '">' + (isAdmin ? 'Admin' : 'User') + '</span></div>' +
+          '<div class="admin-user-username">@' + escapeHtml(u.username) + '  <span class="admin-user-role' + (isAdmin ? ' admin-role-badge' : '') + '">' + (isAdmin ? 'Admin' : 'User') + '</span> <span class="admin-user-role">' + escapeHtml(userDepartmentsLabel(u.departments)) + '</span></div>' +
         '</div>' +
-        '<button class="admin-user-edit-btn btn-icon" data-username="' + escapeHtml(u.username) + '" data-displayname="' + escapeHtml(u.displayName || u.username) + '" data-role="' + u.role + '" title="Editar usuario"><i class="fas fa-pen"></i></button>' +
+        '<button class="admin-user-edit-btn btn-icon" data-username="' + escapeHtml(u.username) + '" data-displayname="' + escapeHtml(u.displayName || u.username) + '" data-role="' + u.role + '" data-departments="' + escapeHtml((u.departments || []).join(',')) + '" title="Editar usuario"><i class="fas fa-pen"></i></button>' +
       '</div>';
     }).join('');
 
@@ -1038,6 +1266,8 @@ function renderAdminPanel() {
         adminEditUsernameDisplay.textContent = btn.dataset.username;
         adminEditDisplayname.value = btn.dataset.displayname;
         adminEditRole.value = btn.dataset.role;
+        var selectedDepts = btn.dataset.departments ? btn.dataset.departments.split(',') : [];
+        renderDepartmentCheckboxes(adminEditDepartments, selectedDepts);
         adminEditPassword.value = '';
         adminEditPasswordConfirm.value = '';
         adminEditDeleteBtn.disabled = false;
@@ -1060,7 +1290,7 @@ function renderAdminPanel() {
     return '<div class="admin-room-item">' +
       '<div class="admin-room-info">' +
         '<span class="admin-room-name">#' + escapeHtml(r.name) + '</span>' +
-        '<span class="admin-room-meta">' + (r.temporary ? 'Temporal' : 'Fija') + (r.hasPassword ? ' · 🔒' : '') + '</span>' +
+        '<span class="admin-room-meta">' + (r.temporary ? 'Temporal' : 'Fija') + (r.hasPassword ? ' · 🔒' : '') + ' · ' + escapeHtml(departmentLabel(r.department)) + '</span>' +
       '</div>' +
       '<div class="admin-room-actions">' + actions + '</div>' +
     '</div>';
@@ -1129,8 +1359,9 @@ function joinRoom(data) {
     backToRoomBtn.classList.add('hidden');
     welcomeRoom.textContent = name;
     renderRooms();
+    renderUsers(res.users || []);
 
-    renderMessages(res.history);
+    renderMessages(res.history, res.hasMoreHistory);
     messageInput.placeholder = 'Escribe en #' + name + '...';
     messageInput.focus();
     onActionCloseDrawers();
@@ -1147,10 +1378,16 @@ $('create-room-btn').addEventListener('click', function() {
     createModalTemporary.checked = true;
     createModalTemporary.disabled = true;
     createModalInfo.classList.remove('hidden');
+    createModalDeptGroup.classList.add('hidden');
   } else {
     createModalTemporary.checked = false;
     createModalTemporary.disabled = false;
     createModalInfo.classList.add('hidden');
+    createModalDepartment.innerHTML = '<option value="">Global (todos los departamentos)</option>' +
+      departments.map(function(d) {
+        return '<option value="' + escapeHtml(d.name) + '">' + escapeHtml(d.displayName || d.name) + '</option>';
+      }).join('');
+    createModalDeptGroup.classList.remove('hidden');
   }
   createModalInput.focus();
 });
@@ -1182,7 +1419,8 @@ createModalConfirm.addEventListener('click', function() {
   socket.emit('create-room', {
     name: name,
     password: createModalPassword.value || null,
-    temporary: createModalTemporary.checked
+    temporary: createModalTemporary.checked,
+    department: currentRole === 'admin' ? (createModalDepartment.value || null) : undefined
   }, function(res) {
     createModalConfirm.disabled = false;
     createModalConfirm.innerHTML = '<i class="fas fa-check"></i> Crear';
@@ -1206,6 +1444,7 @@ adminEditConfirm.addEventListener('click', function() {
   var username = adminEditUsernameDisplay.textContent;
   var displayName = adminEditDisplayname.value.trim();
   var role = adminEditRole.value;
+  var departments = Array.from(adminEditDepartments.querySelectorAll('input[type="checkbox"]:checked')).map(function(cb) { return cb.value; });
   var newPassword = adminEditPassword.value;
   var newPasswordConfirm = adminEditPasswordConfirm.value;
 
@@ -1219,7 +1458,7 @@ adminEditConfirm.addEventListener('click', function() {
   adminEditConfirm.disabled = true;
   adminEditConfirm.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Guardando...';
 
-  socket.emit('update-user', { username, displayName, role }, function(res) {
+  socket.emit('update-user', { username, displayName, role, departments }, function(res) {
     if (!res.ok) {
       adminEditConfirm.disabled = false;
       adminEditConfirm.innerHTML = '<i class="fas fa-save"></i> Guardar';
@@ -1289,6 +1528,50 @@ adminEditPasswordConfirm.addEventListener('keydown', function(e) {
 });
 
 // ===================== END ADMIN EDIT =====================
+
+// ===================== CREATE DEPARTMENT MODAL =====================
+
+createDeptBtn.addEventListener('click', function() {
+  createDeptDisplayname.value = '';
+  createDeptError.textContent = '';
+  createDeptModalOverlay.classList.remove('hidden');
+  createDeptDisplayname.focus();
+});
+
+function closeCreateDeptModal() {
+  createDeptModalOverlay.classList.add('hidden');
+}
+
+createDeptClose.addEventListener('click', closeCreateDeptModal);
+createDeptCancel.addEventListener('click', closeCreateDeptModal);
+createDeptModalOverlay.addEventListener('click', function(e) {
+  if (e.target === createDeptModalOverlay) closeCreateDeptModal();
+});
+createDeptDisplayname.addEventListener('keydown', function(e) {
+  if (e.key === 'Enter') createDeptConfirm.click();
+});
+
+createDeptConfirm.addEventListener('click', function() {
+  var displayName = createDeptDisplayname.value.trim();
+  if (!displayName) { createDeptError.textContent = 'Ingresa un nombre'; return; }
+
+  createDeptConfirm.disabled = true;
+  createDeptConfirm.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Creando...';
+
+  socket.emit('admin-create-department', { name: displayName, displayName: displayName }, function(res) {
+    createDeptConfirm.disabled = false;
+    createDeptConfirm.innerHTML = '<i class="fas fa-check"></i> Crear';
+    if (!res.ok) { createDeptError.textContent = res.error; return; }
+    if (!departments.find(function(d) { return d.name === res.name; })) {
+      departments.push({ name: res.name, displayName: res.displayName });
+    }
+    closeCreateDeptModal();
+    showToast('Departamento "' + res.displayName + '" creado');
+    renderAdminPanel();
+  });
+});
+
+// ===================== END CREATE DEPARTMENT MODAL =====================
 
 // ===================== ADMIN ROOM PASSWORD MODAL =====================
 
@@ -1425,8 +1708,15 @@ function updateRoomTotalBadge() {
   updateTitle();
 }
 
-function renderMessages(messages) {
+var historyOldestId = null;
+var historyHasMore = false;
+var loadingMoreHistory = false;
+
+function renderMessages(messages, hasMore) {
   messagesList.innerHTML = '';
+  historyOldestId = messages.length > 0 ? messages[0].id : null;
+  historyHasMore = !!hasMore;
+  loadingMoreHistory = false;
   messagesStart.classList.toggle('hidden', messages.length > 0);
   if (messages.length === 0) return;
 
@@ -1435,8 +1725,97 @@ function renderMessages(messages) {
     renderMessage(m, false, lastDate);
     lastDate = m.created_at ? new Date(m.created_at).toDateString() : null;
   });
+  updateHistoryTopIndicator();
   scrollToBottom();
 }
+
+function loadMoreHistory() {
+  if (loadingMoreHistory || !historyHasMore || historyOldestId === null) return;
+  if (!currentRoom && !privateRecipient) return;
+
+  loadingMoreHistory = true;
+  showHistoryLoadingIndicator(true);
+
+  var payload = { beforeId: historyOldestId };
+  if (privateRecipient) {
+    payload.with = privateRecipient;
+  } else {
+    payload.room = currentRoom;
+  }
+
+  socket.emit('get-more-messages', payload, function(res) {
+    loadingMoreHistory = false;
+    showHistoryLoadingIndicator(false);
+    if (!res || !res.messages) return;
+    historyHasMore = !!res.hasMore;
+    if (res.messages.length > 0) {
+      historyOldestId = res.messages[0].id;
+      prependMessages(res.messages);
+    }
+    updateHistoryTopIndicator();
+  });
+}
+
+function prependMessages(olderMessages) {
+  if (!olderMessages || olderMessages.length === 0) return;
+  var prevScrollHeight = messagesContainer.scrollHeight;
+  var prevScrollTop = messagesContainer.scrollTop;
+
+  var oldFirstMsgEl = messagesList.querySelector('.message');
+  var oldFirstDate = oldFirstMsgEl ? oldFirstMsgEl.dataset.messageDate : null;
+  var oldLeadingDivider = messagesList.firstChild && messagesList.firstChild.classList && messagesList.firstChild.classList.contains('message-divider')
+    ? messagesList.firstChild : null;
+
+  var frag = document.createDocumentFragment();
+  var lastDate = null;
+  olderMessages.forEach(function(m) {
+    var msgDate = m.created_at ? new Date(m.created_at).toDateString() : null;
+    if (lastDate !== msgDate && msgDate) {
+      frag.appendChild(buildDateDivider(m));
+    }
+    frag.appendChild(buildMessageElement(m, false));
+    lastDate = msgDate;
+  });
+
+  if (oldLeadingDivider && lastDate && oldFirstDate === lastDate) {
+    oldLeadingDivider.remove();
+  }
+
+  messagesList.insertBefore(frag, messagesList.firstChild);
+  messagesContainer.scrollTop = prevScrollTop + (messagesContainer.scrollHeight - prevScrollHeight);
+}
+
+function updateHistoryTopIndicator() {
+  var existing = $('history-top-msg');
+  if (existing) existing.remove();
+  if (historyHasMore || messagesList.children.length === 0) return;
+  var marker = document.createElement('div');
+  marker.id = 'history-top-msg';
+  marker.className = 'history-top-indicator';
+  marker.textContent = 'Inicio de la conversación';
+  messagesList.insertBefore(marker, messagesList.firstChild);
+}
+
+function showHistoryLoadingIndicator(show) {
+  var el = $('history-loading-indicator');
+  if (show) {
+    if (!el) {
+      el = document.createElement('div');
+      el.id = 'history-loading-indicator';
+      el.className = 'history-loading-indicator';
+      el.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Cargando mensajes anteriores...';
+      messagesList.insertBefore(el, messagesList.firstChild);
+    }
+  } else if (el) {
+    el.remove();
+  }
+}
+
+messagesContainer.addEventListener('scroll', function() {
+  if (messagesContainer.scrollTop < 80) {
+    loadMoreHistory();
+  }
+});
 
 var REACTION_EMOJIS = ['👍', '👎', '❤️', '😄', '😮', '😢', '😡', '🎉', '🔥', '✅'];
 
@@ -1522,25 +1901,26 @@ function updateReactionsBar(el, reactions, messageId) {
   bar.appendChild(addBtn);
 }
 
-function renderMessage(msg, animate, lastDate) {
+function buildDateDivider(msg) {
+  var divider = document.createElement('div');
+  divider.className = 'message-divider';
+  divider.textContent = new Date(msg.created_at).toLocaleDateString('es-CL', {
+    weekday: 'long', day: 'numeric', month: 'long'
+  });
+  return divider;
+}
+
+function buildMessageElement(msg, animate) {
   if (animate === undefined) animate = true;
   var isPrivate = msg.type === 'private';
   var isSelf = msg.sender === currentUser;
   var msgDate = msg.created_at ? new Date(msg.created_at).toDateString() : null;
 
-  if (lastDate !== msgDate && msgDate) {
-    var divider = document.createElement('div');
-    divider.className = 'message-divider';
-    divider.textContent = new Date(msg.created_at).toLocaleDateString('es-CL', {
-      weekday: 'long', day: 'numeric', month: 'long'
-    });
-    messagesList.appendChild(divider);
-  }
-
   var el = document.createElement('div');
   el.className = 'message ' + (isSelf ? 'self' : 'other') + (isPrivate ? ' private' : '');
   if (!animate) el.style.animation = 'none';
   if (msg.id) el.dataset.messageId = msg.id;
+  if (msgDate) el.dataset.messageDate = msgDate;
 
   var senderName = msg.displayName || msg.sender;
   var senderHtml = '';
@@ -1596,7 +1976,15 @@ function renderMessage(msg, animate, lastDate) {
 
   updateReactionsBar(el, msg.reactions, msg.id);
 
-  messagesList.appendChild(el);
+  return el;
+}
+
+function renderMessage(msg, animate, lastDate) {
+  var msgDate = msg.created_at ? new Date(msg.created_at).toDateString() : null;
+  if (lastDate !== msgDate && msgDate) {
+    messagesList.appendChild(buildDateDivider(msg));
+  }
+  messagesList.appendChild(buildMessageElement(msg, animate));
   scrollToBottom();
 }
 
@@ -1612,6 +2000,8 @@ messagesList.addEventListener('click', function(e) {
         target.scrollIntoView({ behavior: 'smooth', block: 'center' });
         target.classList.add('msg-highlight');
         setTimeout(function() { target.classList.remove('msg-highlight'); }, 1500);
+      } else {
+        showToast('El mensaje original no está cargado, sube para verlo');
       }
     }
   }
@@ -1703,7 +2093,8 @@ function cancelPrivate() {
         roomUnreadCounts[currentRoom] = 0;
         renderRooms();
         updateRoomTotalBadge();
-        renderMessages(res.history);
+        renderUsers(res.users || []);
+        renderMessages(res.history, res.hasMoreHistory);
       }
     });
   }
@@ -1720,8 +2111,8 @@ function cancelReply() {
 }
 
 function loadPrivateHistory(username) {
-  socket.emit('get-private-history', { with: username }, function(history) {
-    renderMessages(history);
+  socket.emit('get-private-history', { with: username }, function(res) {
+    renderMessages(res.history, res.hasMoreHistory);
   });
 }
 
@@ -1875,10 +2266,48 @@ socket.on('avatar-updated', function(data) {
 });
 
 socket.on('room-created', function(data) {
-  rooms.push({ name: data.name, hasPassword: !!data.hasPassword, temporary: !!data.temporary });
+  rooms.push({ name: data.name, hasPassword: !!data.hasPassword, temporary: !!data.temporary, department: data.department || null });
   renderRooms();
   if (sidebarTab === 'admin') renderAdminPanel();
   showToast('Sala #' + data.name + ' creada');
+});
+
+socket.on('department-created', function(data) {
+  if (!departments.find(function(d) { return d.name === data.name; })) {
+    departments.push({ name: data.name, displayName: data.displayName });
+  }
+  if (sidebarTab === 'admin') renderAdminPanel();
+});
+
+socket.on('department-deleted', function(data) {
+  departments = departments.filter(function(d) { return d.name !== data.name; });
+  if (sidebarTab === 'admin') renderAdminPanel();
+});
+
+socket.on('profile-updated', function(data) {
+  if (data.role !== undefined) {
+    currentRole = data.role;
+    if (currentRole === 'admin') adminTab.classList.remove('hidden');
+    else adminTab.classList.add('hidden');
+  }
+  if (data.departments !== undefined) {
+    myDepartments = data.departments || [];
+  }
+  if (data.department !== undefined) {
+    currentDepartment = data.department;
+    currentDepartmentDisplayName = data.departmentDisplayName || data.department;
+    updateHeaderDepartment();
+  }
+  if (data.rooms) {
+    rooms = data.rooms;
+    renderRooms();
+    var stillVisible = rooms.some(function(r) { return r.name === currentRoom; });
+    if (!stillVisible) {
+      showToast('Tu departamento cambió. Entrando a tu nueva sala principal.');
+      cancelPrivate();
+      joinRoom({ name: rooms.length > 0 ? rooms[0].name : 'general' });
+    }
+  }
 });
 
 socket.on('room-deleted', function(data) {
@@ -1959,6 +2388,7 @@ if (privacyBannerClose) {
 
 document.addEventListener('DOMContentLoaded', function() {
   showCertBannerIfNeeded();
+  loadDepartments();
   if (!tryAutoLogin()) {
     loginUsername.focus();
   }
