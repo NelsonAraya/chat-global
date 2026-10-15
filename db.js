@@ -36,8 +36,12 @@ module.exports = (async () => {
     role VARCHAR(20) DEFAULT 'user',
     location VARCHAR(255),
     departments TEXT,
+    status VARCHAR(20) DEFAULT 'active',
     created_at VARCHAR(40)
   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
+
+  // Migración: las cuentas existentes antes de este cambio quedan activas automáticamente.
+  try { await pool.query("ALTER TABLE users ADD COLUMN status VARCHAR(20) DEFAULT 'active'"); } catch {}
 
   await pool.query(`CREATE TABLE IF NOT EXISTS rooms (
     name VARCHAR(64) PRIMARY KEY,
@@ -83,6 +87,29 @@ module.exports = (async () => {
     ip_address VARCHAR(64)
   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
 
+  await pool.query(`CREATE TABLE IF NOT EXISTS friends (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    requester VARCHAR(64) NOT NULL,
+    recipient VARCHAR(64) NOT NULL,
+    status VARCHAR(20) DEFAULT 'pending',
+    created_at VARCHAR(40),
+    responded_at VARCHAR(40),
+    UNIQUE KEY uniq_pair (requester, recipient),
+    INDEX idx_friends_requester (requester),
+    INDEX idx_friends_recipient (recipient)
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
+
+  await pool.query(`CREATE TABLE IF NOT EXISTS alerts (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    username VARCHAR(64) NOT NULL,
+    display_name VARCHAR(100),
+    department VARCHAR(64),
+    department_display_name VARCHAR(100),
+    location VARCHAR(255),
+    created_at VARCHAR(40),
+    INDEX idx_alerts_created (created_at)
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
+
   const now = new Date().toISOString();
   await pool.query(
     'INSERT IGNORE INTO users (username, password, display_name, role, created_at) VALUES (?, ?, ?, ?, ?)',
@@ -102,7 +129,7 @@ module.exports = (async () => {
     if (r.departments) {
       try { departments = JSON.parse(r.departments) || []; } catch { departments = []; }
     }
-    return { username: r.username, password: r.password, displayName: r.display_name, avatar: r.avatar, role: r.role, location: r.location, departments, created_at: r.created_at };
+    return { username: r.username, password: r.password, displayName: r.display_name, avatar: r.avatar, role: r.role, location: r.location, departments, status: r.status || 'active', created_at: r.created_at };
   };
   const mapRoom = (r) => ({ name: r.name, created_by: r.created_by, created_at: r.created_at, password: r.password, temporary: !!r.temporary, department: r.department || null });
   const mapDepartment = (r) => ({ name: r.name, displayName: r.display_name, created_at: r.created_at });
@@ -114,32 +141,37 @@ module.exports = (async () => {
     reactions: m.reactions ? JSON.parse(m.reactions) : {}, created_at: m.created_at, recipient: m.recipient, type: m.type
   });
 
+  const mapFriend = (r) => ({ id: r.id, requester: r.requester, recipient: r.recipient, status: r.status, created_at: r.created_at, responded_at: r.responded_at });
+
   const [userRows] = await pool.query('SELECT * FROM users ORDER BY username');
   const [roomRows] = await pool.query('SELECT * FROM rooms ORDER BY name');
   const [messageRows] = await pool.query('SELECT * FROM messages ORDER BY created_at');
   const [deptRows] = await pool.query('SELECT * FROM departments ORDER BY name');
+  const [friendRows] = await pool.query('SELECT * FROM friends ORDER BY id');
 
   let data = {
     users: userRows.map(mapUser),
     rooms: roomRows.map(mapRoom),
     messages: messageRows.map(mapMessage),
-    departments: deptRows.map(mapDepartment)
+    departments: deptRows.map(mapDepartment),
+    friends: friendRows.map(mapFriend)
   };
 
   // ===== Persistencia incremental: cada función escribe solo la fila que cambió =====
 
   const saveUser = async (u) => {
     await pool.query(
-      `INSERT INTO users (username, password, display_name, avatar, role, location, departments, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `INSERT INTO users (username, password, display_name, avatar, role, location, departments, status, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON DUPLICATE KEY UPDATE password=VALUES(password), display_name=VALUES(display_name), avatar=VALUES(avatar),
-         role=VALUES(role), location=VALUES(location), departments=VALUES(departments)`,
-      [u.username, u.password, u.displayName || null, u.avatar || null, u.role || 'user', u.location || null, JSON.stringify(u.departments || []), u.created_at || null]
+         role=VALUES(role), location=VALUES(location), departments=VALUES(departments), status=VALUES(status)`,
+      [u.username, u.password, u.displayName || null, u.avatar || null, u.role || 'user', u.location || null, JSON.stringify(u.departments || []), u.status || 'active', u.created_at || null]
     );
   };
 
   const deleteUser = async (username) => {
     await pool.query('DELETE FROM users WHERE username = ?', [username]);
+    await pool.query('DELETE FROM friends WHERE requester = ? OR recipient = ?', [username, username]);
   };
 
   const saveRoom = async (r) => {
@@ -187,12 +219,54 @@ module.exports = (async () => {
     await pool.query('INSERT INTO consent_log (username, terms_version, accepted_at, ip_address) VALUES (?, ?, ?, ?)', [username, termsVersion, acceptedAt, ipAddress || null]);
   };
 
+  const saveFriendRequest = async (f) => {
+    const [result] = await pool.query(
+      'INSERT INTO friends (requester, recipient, status, created_at) VALUES (?, ?, ?, ?)',
+      [f.requester, f.recipient, f.status || 'pending', f.created_at || null]
+    );
+    f.id = result.insertId;
+    return f;
+  };
+
+  const updateFriendStatus = async (id, status, respondedAt) => {
+    await pool.query('UPDATE friends SET status = ?, responded_at = ? WHERE id = ?', [status, respondedAt || null, id]);
+  };
+
+  const deleteFriendRow = async (id) => {
+    await pool.query('DELETE FROM friends WHERE id = ?', [id]);
+  };
+
+  const saveAlert = async (a) => {
+    await pool.query(
+      'INSERT INTO alerts (username, display_name, department, department_display_name, location, created_at) VALUES (?, ?, ?, ?, ?, ?)',
+      [a.username, a.displayName || null, a.department || null, a.departmentDisplayName || null, a.location || null, a.created_at || null]
+    );
+  };
+
+  const getAlertHistory = async (limit, offset) => {
+    const [rows] = await pool.query(
+      'SELECT * FROM alerts ORDER BY created_at DESC LIMIT ? OFFSET ?',
+      [limit, offset]
+    );
+    return rows.map(r => ({
+      id: r.id,
+      username: r.username,
+      displayName: r.display_name,
+      department: r.department,
+      departmentDisplayName: r.department_display_name,
+      location: r.location,
+      created_at: r.created_at
+    }));
+  };
+
   return {
     data, hashPassword,
     saveUser, deleteUser,
     saveRoom, deleteRoom,
     saveMessage, updateMessageReactions, deleteMessagesByRoom,
     saveDepartment, deleteDepartment,
-    saveConsent
+    saveConsent,
+    saveFriendRequest, updateFriendStatus, deleteFriendRow,
+    saveAlert, getAlertHistory
   };
 })();

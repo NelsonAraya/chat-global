@@ -51,6 +51,21 @@ Variables disponibles (si no se define alguna, usa el valor por defecto):
 
 Con `.env` configurado, `npm start` ya levanta el servidor conectado a esa base — no hace falta pasar nada por línea de comandos.
 
+## Correo del Botón de Alerta
+
+Cuando alguien activa el botón de alerta, además de la notificación en pantalla, el sistema puede mandar un correo. Es opcional — si no se configura, el botón sigue funcionando igual, solo que sin correo.
+
+Se configura en el mismo archivo `.env`:
+
+| Variable | Descripción |
+|---|---|
+| `SMTP_HOST` | Servidor SMTP de la cuenta que **envía** el correo (ej: `smtp.gmail.com`, `smtp.office365.com`, o el servidor propio de CORMUDESI) |
+| `SMTP_PORT` | Puerto SMTP (`587` por defecto) |
+| `SMTP_SECURE` | `true` si el puerto usa SSL directo (normalmente el 465); `false` para STARTTLS (normalmente el 587) |
+| `SMTP_USER` / `SMTP_PASSWORD` | Credenciales de la cuenta que envía. **Con Gmail y verificación en 2 pasos necesitas una "contraseña de aplicación"**, no la contraseña normal de la cuenta |
+| `ALERT_EMAIL_FROM` | Remitente que se ve en el correo (si se deja vacío, usa `SMTP_USER`) |
+| `ALERT_EMAIL_TO` | Quién(es) reciben la alerta — se puede poner más de un correo separado por comas |
+
 ### Migrar desde una instalación anterior (SQLite)
 
 Si vienes de una versión anterior que usaba `chat.db` (SQLite), migra tus datos una sola vez antes de iniciar el servidor con MySQL:
@@ -267,6 +282,7 @@ chat-cormudesi/
 ├── index.js              # Servidor (HTTP redirige a HTTPS)
 ├── db.js                 # Persistencia MySQL (mysql2) + hash de contraseñas
 ├── socket-handler.js     # Eventos de Socket.IO
+├── mailer.js             # Envío de correo para el botón de alerta (nodemailer)
 ├── migrate-to-mysql.js   # Migración única desde una instalación anterior con SQLite
 ├── .env                  # Configuración de MySQL (no se sube a git)
 ├── .env.example          # Plantilla de .env

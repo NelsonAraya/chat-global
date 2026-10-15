@@ -64,12 +64,9 @@
           <i class="fas fa-lock input-icon"></i>
           <input type="password" id="register-confirm" placeholder="Confirmar contraseña..." />
         </div>
-        <div class="input-group hidden" id="register-department-group">
-          <i class="fas fa-building input-icon"></i>
-          <select id="register-department">
-            <option value="">Selecciona tu departamento/centro...</option>
-          </select>
-        </div>
+        <p class="create-modal-info">
+          <i class="fas fa-info-circle"></i> Tu cuenta debe ser aprobada por un administrador antes de poder ingresar.
+        </p>
         <button id="register-btn" class="btn-primary">
           <i class="fas fa-user-plus"></i> Crear cuenta
         </button>
@@ -271,18 +268,23 @@
           <div id="header-avatar" class="avatar avatar-32 avatar-clickable"></div>
           <span id="display-name" class="header-display-name"></span>
           <span id="header-department" class="header-department-badge hidden"></span>
-          <button id="switch-dept-btn" class="btn-icon header-edit-btn hidden" title="Cambiar de departamento">
-            <i class="fas fa-right-left"></i>
+          <button id="header-menu-toggle" class="btn-icon mobile-only" title="Más opciones">
+            <i class="fas fa-ellipsis-vertical"></i>
           </button>
-          <button id="edit-name-btn" class="btn-icon header-edit-btn" title="Cambiar nombre">
-            <i class="fas fa-pen"></i>
-          </button>
-          <button id="change-pwd-btn" class="btn-icon header-edit-btn" title="Cambiar contraseña">
-            <i class="fas fa-key"></i>
-          </button>
-          <button id="edit-location-btn" class="btn-icon header-edit-btn" title="Asignar ubicación">
-            <i class="fas fa-map-marker-alt"></i>
-          </button>
+          <div id="header-user-menu">
+            <button id="switch-dept-btn" class="btn-icon header-edit-btn hidden" title="Cambiar de departamento">
+              <i class="fas fa-right-left"></i><span class="header-edit-label">Cambiar de departamento</span>
+            </button>
+            <button id="edit-name-btn" class="btn-icon header-edit-btn" title="Cambiar nombre">
+              <i class="fas fa-pen"></i><span class="header-edit-label">Cambiar nombre</span>
+            </button>
+            <button id="change-pwd-btn" class="btn-icon header-edit-btn" title="Cambiar contraseña">
+              <i class="fas fa-key"></i><span class="header-edit-label">Cambiar contraseña</span>
+            </button>
+            <button id="edit-location-btn" class="btn-icon header-edit-btn" title="Asignar ubicación">
+              <i class="fas fa-map-marker-alt"></i><span class="header-edit-label">Asignar ubicación</span>
+            </button>
+          </div>
           <input type="file" id="avatar-input" class="hidden" accept="image/png,image/jpeg,image/gif,image/webp" />
         </div>
         <button id="logout-btn" class="btn-icon" title="Salir">
@@ -300,15 +302,20 @@
       <aside id="sidebar-rooms">
         <div class="sidebar-tabs">
           <button class="sidebar-tab active" data-panel="rooms">
-            <i class="fas fa-hashtag"></i> Salas
+            <i class="fas fa-hashtag"></i> <span class="sidebar-tab-label">Salas</span>
             <span id="room-total-badge" class="sb-badge hidden">0</span>
           </button>
           <button class="sidebar-tab" data-panel="conversations">
-            <i class="fas fa-envelope"></i> Privados
+            <i class="fas fa-envelope"></i> <span class="sidebar-tab-label">Privados</span>
             <span id="conv-total-badge" class="sb-badge hidden">0</span>
           </button>
-          <button class="sidebar-tab hidden" data-panel="admin" id="admin-tab">
-            <i class="fas fa-cog"></i> Admin
+          <button class="sidebar-tab" data-panel="friends">
+            <i class="fas fa-user-group"></i> <span class="sidebar-tab-label">Amigos</span>
+            <span id="friends-total-badge" class="sb-badge hidden">0</span>
+          </button>
+          <button class="sidebar-tab hidden" data-panel="admin" id="admin-tab" title="Administración">
+            <i class="fas fa-cog"></i> <span class="sidebar-tab-label">Admin</span>
+            <span id="admin-pending-badge" class="sb-badge hidden">0</span>
           </button>
         </div>
         <div id="rooms-panel" class="sidebar-panel">
@@ -328,6 +335,19 @@
         <div id="conversations-panel" class="sidebar-panel hidden">
           <div id="conversations-list"></div>
         </div>
+        <div id="friends-panel" class="sidebar-panel hidden">
+          <div class="sidebar-footer" style="border-top:none;border-bottom:1px solid var(--border-color);">
+            <button id="add-friend-btn" class="btn-secondary">
+              <i class="fas fa-user-plus"></i> Agregar amigo
+            </button>
+          </div>
+          <div id="friend-requests-section" class="hidden">
+            <div class="sidebar-label" style="padding: 10px 12px 4px;">Solicitudes pendientes</div>
+            <div id="friend-requests-list"></div>
+          </div>
+          <div class="sidebar-label" style="padding: 10px 12px 4px;">Mis amigos</div>
+          <div id="friends-list"></div>
+        </div>
       </aside>
 
       <main id="chat-main">
@@ -339,6 +359,7 @@
               <button class="admin-subtab" data-admin-tab="departamentos"><i class="fas fa-building"></i> Departamentos</button>
               <button class="admin-subtab" data-admin-tab="usuarios"><i class="fas fa-users"></i> Usuarios</button>
               <button class="admin-subtab" data-admin-tab="salas"><i class="fas fa-hashtag"></i> Salas</button>
+              <button class="admin-subtab" data-admin-tab="alertas"><i class="fas fa-triangle-exclamation"></i> Alertas</button>
             </div>
           </div>
           <div id="admin-view-body">
@@ -377,6 +398,10 @@
             </div>
 
             <div id="admin-subtab-usuarios" class="admin-subtab-panel hidden">
+              <div id="admin-pending-section" class="hidden">
+                <div class="sidebar-label" style="padding: 0 0 8px;">Solicitudes de registro pendientes</div>
+                <div id="admin-pending-list" class="admin-table" style="margin-bottom:20px;"></div>
+              </div>
               <div class="admin-section-toolbar">
                 <div class="admin-search-box">
                   <i class="fas fa-search"></i>
@@ -395,6 +420,15 @@
               </div>
               <div id="admin-rooms-list" class="admin-table"></div>
             </div>
+
+            <div id="admin-subtab-alertas" class="admin-subtab-panel hidden">
+              <div id="admin-alerts-list" class="admin-table"></div>
+              <div style="text-align:center; margin-top:14px;">
+                <button id="admin-alerts-load-more" class="btn-secondary hidden">
+                  <i class="fas fa-chevron-down"></i> Cargar más
+                </button>
+              </div>
+            </div>
           </div>
         </div>
 
@@ -402,6 +436,7 @@
           <div id="chat-context">
             <i class="fas fa-hashtag" id="context-icon"></i>
             <span id="context-name">general</span>
+            <span id="context-global-badge" class="context-badge context-badge-global hidden" title="Sala global: accesible desde todos los departamentos">Global</span>
             <span id="context-badge" class="context-badge hidden">Privado</span>
           </div>
           <button id="back-to-room-btn" class="btn-icon hidden" title="Volver a la sala">
@@ -769,6 +804,23 @@
         <button id="create-dept-confirm" class="btn-primary">
           <i class="fas fa-check"></i> Crear
         </button>
+      </div>
+    </div>
+  </div>
+
+  <div id="add-friend-modal-overlay" class="hidden">
+    <div id="add-friend-modal" class="modal-box">
+      <div class="modal-header">
+        <h3><i class="fas fa-user-plus"></i> Agregar amigo</h3>
+        <button id="add-friend-modal-close" class="btn-icon"><i class="fas fa-times"></i></button>
+      </div>
+      <div class="modal-body">
+        <div class="input-group">
+          <i class="fas fa-search input-icon"></i>
+          <input type="text" id="add-friend-search" placeholder="Buscar por usuario o nombre..." maxlength="40" />
+        </div>
+        <div id="add-friend-results" class="add-friend-results"></div>
+        <p id="add-friend-error" class="login-error"></p>
       </div>
     </div>
   </div>

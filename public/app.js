@@ -21,6 +21,12 @@ let pendingFile = null;
 let replyingTo = null;
 let departments = [];
 let myDepartments = [];
+let friends = [];
+let friendRequestsIncoming = [];
+let pendingRegistrations = [];
+let alertHistory = [];
+let alertHistoryHasMore = false;
+let loadingAlertHistory = false;
 
 const $ = (id) => document.getElementById(id);
 
@@ -35,8 +41,6 @@ const loginError = $('login-error');
 const registerUsername = $('register-username');
 const registerPassword = $('register-password');
 const registerConfirm = $('register-confirm');
-const registerDepartmentGroup = $('register-department-group');
-const registerDepartment = $('register-department');
 const registerBtn = $('register-btn');
 
 const displayName = $('display-name');
@@ -64,10 +68,25 @@ const logoutBtn = $('logout-btn');
 const roomsList = $('rooms-list');
 const conversationsList = $('conversations-list');
 const convTotalBadge = $('conv-total-badge');
+const friendsList = $('friends-list');
+const friendsTotalBadge = $('friends-total-badge');
+const friendRequestsSection = $('friend-requests-section');
+const friendRequestsList = $('friend-requests-list');
+const addFriendBtn = $('add-friend-btn');
+const addFriendModalOverlay = $('add-friend-modal-overlay');
+const addFriendModalClose = $('add-friend-modal-close');
+const addFriendSearch = $('add-friend-search');
+const addFriendResults = $('add-friend-results');
+const addFriendError = $('add-friend-error');
 const roomTotalBadge = $('room-total-badge');
 const allUsersList = $('all-users-list');
 const adminTab = $('admin-tab');
 const adminUsersList = $('admin-users-list');
+const adminPendingSection = $('admin-pending-section');
+const adminPendingList = $('admin-pending-list');
+const adminPendingBadge = $('admin-pending-badge');
+const adminAlertsList = $('admin-alerts-list');
+const adminAlertsLoadMore = $('admin-alerts-load-more');
 const adminRoomsList = $('admin-rooms-list');
 const adminDepartmentsList = $('admin-departments-list');
 const createDeptBtn = $('create-dept-btn');
@@ -112,6 +131,7 @@ const roomUsersList = $('room-users-list');
 const contextName = $('context-name');
 const contextIcon = $('context-icon');
 const contextBadge = $('context-badge');
+const contextGlobalBadge = $('context-global-badge');
 const welcomeRoom = $('welcome-room');
 const backToRoomBtn = $('back-to-room-btn');
 const privateIndicator = $('private-indicator');
@@ -542,16 +562,6 @@ document.addEventListener('keydown', function(e) {
 function loadDepartments(callback) {
   socket.emit('get-departments', function(list) {
     departments = list || [];
-    if (departments.length > 0) {
-      registerDepartmentGroup.classList.remove('hidden');
-      registerDepartment.innerHTML = '<option value="">Selecciona tu departamento/centro...</option>' +
-        departments.map(function(d) {
-          return '<option value="' + escapeHtml(d.name) + '">' + escapeHtml(d.displayName || d.name) + '</option>';
-        }).join('');
-    } else {
-      registerDepartmentGroup.classList.add('hidden');
-      registerDepartment.innerHTML = '';
-    }
     if (callback) callback(departments);
   });
 }
@@ -734,7 +744,6 @@ termsAcceptBtn.addEventListener('click', function() {
   if (!pendingRegistration) return;
   const regUsername = pendingRegistration.username;
   const regPassword = pendingRegistration.password;
-  const regDepartment = pendingRegistration.department;
 
   termsAcceptBtn.disabled = true;
   termsAcceptBtn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Registrando...';
@@ -742,7 +751,6 @@ termsAcceptBtn.addEventListener('click', function() {
   socket.emit('register', {
     username: regUsername,
     password: regPassword,
-    department: regDepartment,
     terms_version: TERMS_VERSION
   }, (res) => {
     termsAcceptBtn.disabled = false;
@@ -758,14 +766,13 @@ termsAcceptBtn.addEventListener('click', function() {
     registerUsername.value = '';
     registerPassword.value = '';
     registerConfirm.value = '';
-    registerDepartment.value = '';
     document.querySelectorAll('.login-tab').forEach(t => t.classList.remove('active'));
     document.querySelector('[data-form="login"]').classList.add('active');
     document.querySelectorAll('.login-form-box').forEach(f => f.classList.add('hidden'));
     $('login-form').classList.remove('hidden');
     loginUsername.value = regUsername;
     loginPassword.focus();
-    loginError.textContent = 'Cuenta creada. Ahora ingresa.';
+    loginError.textContent = 'Cuenta creada. Debe ser aprobada por un administrador antes de que puedas ingresar.';
   });
 });
 
@@ -773,14 +780,12 @@ registerBtn.addEventListener('click', () => {
   const username = registerUsername.value.trim();
   const password = registerPassword.value;
   const confirm = registerConfirm.value;
-  const department = registerDepartment.value || null;
 
   if (!username) { loginError.textContent = 'Ingresa un usuario'; return; }
   if (!password || password.length < 3) { loginError.textContent = 'Minimo 3 caracteres'; return; }
   if (password !== confirm) { loginError.textContent = 'No coinciden'; return; }
-  if (departments.length > 0 && !department) { loginError.textContent = 'Selecciona tu departamento/centro'; return; }
 
-  pendingRegistration = { username, password, department };
+  pendingRegistration = { username, password };
   registerBtn.disabled = true;
   registerBtn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Verificando...';
   loginError.textContent = '';
@@ -856,6 +861,26 @@ avatarInput.addEventListener('change', function() {
 
 headerAvatar.addEventListener('click', function() {
   avatarInput.click();
+});
+
+var headerMenuToggle = $('header-menu-toggle');
+var headerUserMenu = $('header-user-menu');
+
+headerMenuToggle.addEventListener('click', function(e) {
+  e.stopPropagation();
+  headerUserMenu.classList.toggle('open');
+});
+
+headerUserMenu.addEventListener('click', function(e) {
+  if (e.target.closest('.header-edit-btn')) {
+    headerUserMenu.classList.remove('open');
+  }
+});
+
+document.addEventListener('click', function(e) {
+  if (headerUserMenu.classList.contains('open') && !headerUserMenu.contains(e.target) && e.target !== headerMenuToggle && !headerMenuToggle.contains(e.target)) {
+    headerUserMenu.classList.remove('open');
+  }
 });
 
 function openPwdModal() {
@@ -1097,6 +1122,8 @@ function loadConversations() {
 function initializeChat() {
   renderRooms();
   loadConversations();
+  loadFriendRequests();
+  if (currentRole === 'admin') loadPendingRegistrations();
   socket.emit('get-all-users', function(users) {
     renderAllUsers(users);
   });
@@ -1140,6 +1167,10 @@ document.querySelectorAll('.sidebar-tab').forEach(tab => {
       hideAdminView();
       document.querySelectorAll('.sidebar-panel').forEach(p => p.classList.add('hidden'));
       $(sidebarTab + '-panel').classList.remove('hidden');
+      if (sidebarTab === 'friends') {
+        loadFriends();
+        loadFriendRequests();
+      }
     }
   });
 });
@@ -1172,9 +1203,10 @@ function renderRooms() {
     if (r.temporary) { icon = 'far fa-clock'; extra = ' room-icon-temp'; }
     var unread = roomUnreadCounts[r.name] || 0;
     var badgeHtml = unread > 0 ? '<span class="room-badge">' + unread + '</span>' : '';
+    var globalHtml = !r.department ? '<span class="room-global-badge" title="Sala global: accesible desde todos los departamentos">Global</span>' : '';
     return '<div class="room-item' + (r.name === currentRoom ? ' active' : '') + (unread > 0 ? ' unread' : '') + '" data-room="' + escapeHtml(r.name) + '">' +
       '<i class="' + icon + extra + '"></i>' +
-      '<span>' + escapeHtml(r.name) + '</span>' + badgeHtml + '</div>';
+      '<span class="room-name">' + escapeHtml(r.name) + '</span>' + globalHtml + badgeHtml + '</div>';
   }).join('');
 
   roomsList.querySelectorAll('.room-item').forEach(function(el) {
@@ -1213,7 +1245,137 @@ function renderDepartmentCheckboxes(containerEl, selectedNames) {
   }).join('');
 }
 
+function loadPendingRegistrations() {
+  socket.emit('get-pending-registrations', function(list) {
+    pendingRegistrations = list || [];
+    renderPendingRegistrations();
+    updateAdminPendingBadge();
+  });
+}
+
+function renderPendingRegistrations() {
+  if (!pendingRegistrations || pendingRegistrations.length === 0) {
+    adminPendingSection.classList.add('hidden');
+    return;
+  }
+  adminPendingSection.classList.remove('hidden');
+  adminPendingList.innerHTML = pendingRegistrations.map(function(r) {
+    return '<div class="friend-request-item" data-user="' + escapeHtml(r.username) + '">' +
+      getAvatarHtml(r.username, null, 32) +
+      '<div class="friend-info">' +
+        '<div class="friend-name">' + escapeHtml(r.displayName || r.username) + '</div>' +
+        '<div class="admin-user-username">@' + escapeHtml(r.username) + '</div>' +
+      '</div>' +
+      '<div class="friend-request-actions">' +
+        '<button class="friend-request-accept" title="Aceptar"><i class="fas fa-check"></i></button>' +
+        '<button class="friend-request-reject" title="Rechazar"><i class="fas fa-times"></i></button>' +
+      '</div>' +
+    '</div>';
+  }).join('');
+
+  adminPendingList.querySelectorAll('.friend-request-accept').forEach(function(btn) {
+    btn.addEventListener('click', function() {
+      var username = btn.closest('.friend-request-item').dataset.user;
+      socket.emit('admin-approve-registration', { username: username }, function(res) {
+        if (!res.ok) { showToast(res.error); return; }
+        pendingRegistrations = pendingRegistrations.filter(function(r) { return r.username !== username; });
+        renderPendingRegistrations();
+        updateAdminPendingBadge();
+        showToast('Cuenta de ' + username + ' aprobada');
+        renderAdminPanel();
+      });
+    });
+  });
+  adminPendingList.querySelectorAll('.friend-request-reject').forEach(function(btn) {
+    btn.addEventListener('click', function() {
+      var username = btn.closest('.friend-request-item').dataset.user;
+      if (!confirm('¿Rechazar la cuenta de "' + username + '"? No podrá ingresar al chat.')) return;
+      socket.emit('admin-reject-registration', { username: username }, function(res) {
+        if (!res.ok) { showToast(res.error); return; }
+        pendingRegistrations = pendingRegistrations.filter(function(r) { return r.username !== username; });
+        renderPendingRegistrations();
+        updateAdminPendingBadge();
+        showToast('Cuenta de ' + username + ' rechazada');
+        renderAdminPanel();
+      });
+    });
+  });
+}
+
+function updateAdminPendingBadge() {
+  var count = pendingRegistrations.length;
+  if (count > 0) {
+    adminPendingBadge.textContent = count;
+    adminPendingBadge.classList.remove('hidden');
+  } else {
+    adminPendingBadge.classList.add('hidden');
+  }
+}
+
+socket.on('registration-pending', function(data) {
+  if (currentRole !== 'admin') return;
+  pendingRegistrations.push(data);
+  renderPendingRegistrations();
+  updateAdminPendingBadge();
+  playNotification();
+  showToast('Nueva solicitud de cuenta: ' + (data.displayName || data.username));
+});
+
+function formatAlertDateTime(iso) {
+  try {
+    var d = new Date(iso);
+    return d.toLocaleString('es-CL', { day: 'numeric', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' });
+  } catch (e) {
+    return '';
+  }
+}
+
+function loadAlertHistory(reset) {
+  if (loadingAlertHistory) return;
+  if (reset) {
+    alertHistory = [];
+    alertHistoryHasMore = false;
+  }
+  loadingAlertHistory = true;
+  adminAlertsLoadMore.disabled = true;
+  socket.emit('get-alert-history', { offset: reset ? 0 : alertHistory.length }, function(res) {
+    loadingAlertHistory = false;
+    adminAlertsLoadMore.disabled = false;
+    if (!res) return;
+    alertHistory = reset ? (res.alerts || []) : alertHistory.concat(res.alerts || []);
+    alertHistoryHasMore = !!res.hasMore;
+    renderAlertHistory();
+  });
+}
+
+function renderAlertHistory() {
+  if (alertHistory.length === 0) {
+    adminAlertsList.innerHTML = '<div class="admin-table-empty">Sin alertas registradas todavía.</div>';
+    adminAlertsLoadMore.classList.add('hidden');
+    return;
+  }
+  adminAlertsList.innerHTML = alertHistory.map(function(a) {
+    var dept = a.departmentDisplayName || (a.department ? a.department : 'Global / sin departamento');
+    var loc = a.location && a.location.trim() ? a.location : 'Indeterminada';
+    return '<div class="admin-user-item">' +
+      getAvatarHtml(a.username, null, 36) +
+      '<div class="admin-user-info">' +
+        '<div class="admin-user-name">' + escapeHtml(a.displayName || a.username) + ' <span class="admin-user-username">@' + escapeHtml(a.username) + '</span></div>' +
+        '<div class="admin-user-username"><i class="fas fa-building"></i> ' + escapeHtml(dept) + ' &nbsp; <i class="fas fa-map-marker-alt"></i> ' + escapeHtml(loc) + '</div>' +
+      '</div>' +
+      '<div class="admin-room-meta" style="flex-shrink:0;">' + escapeHtml(formatAlertDateTime(a.created_at)) + '</div>' +
+    '</div>';
+  }).join('');
+  adminAlertsLoadMore.classList.toggle('hidden', !alertHistoryHasMore);
+}
+
+adminAlertsLoadMore.addEventListener('click', function() {
+  loadAlertHistory(false);
+});
+
 function renderAdminPanel() {
+  loadPendingRegistrations();
+  loadAlertHistory(true);
   socket.emit('get-stats', function(stats) {
     if (stats) {
       adminStatUsers.textContent = stats.totalUsers;
@@ -1250,12 +1412,13 @@ function renderAdminPanel() {
   });
 
   socket.emit('get-all-registered-users', function(users) {
-    adminUsersList.innerHTML = users.map(function(u) {
+    adminUsersList.innerHTML = users.filter(function(u) { return u.status !== 'pending'; }).map(function(u) {
       var isAdmin = u.role === 'admin';
+      var statusHtml = u.status === 'rejected' ? ' <span class="admin-user-role admin-status-rejected">Rechazado</span>' : '';
       return '<div class="admin-user-item">' +
         '<div class="admin-user-info">' +
           '<div class="admin-user-name">' + escapeHtml(u.displayName || u.username) + '</div>' +
-          '<div class="admin-user-username">@' + escapeHtml(u.username) + '  <span class="admin-user-role' + (isAdmin ? ' admin-role-badge' : '') + '">' + (isAdmin ? 'Admin' : 'User') + '</span> <span class="admin-user-role">' + escapeHtml(userDepartmentsLabel(u.departments)) + '</span></div>' +
+          '<div class="admin-user-username">@' + escapeHtml(u.username) + '  <span class="admin-user-role' + (isAdmin ? ' admin-role-badge' : '') + '">' + (isAdmin ? 'Admin' : 'User') + '</span> <span class="admin-user-role">' + escapeHtml(userDepartmentsLabel(u.departments)) + '</span>' + statusHtml + '</div>' +
         '</div>' +
         '<button class="admin-user-edit-btn btn-icon" data-username="' + escapeHtml(u.username) + '" data-displayname="' + escapeHtml(u.displayName || u.username) + '" data-role="' + u.role + '" data-departments="' + escapeHtml((u.departments || []).join(',')) + '" title="Editar usuario"><i class="fas fa-pen"></i></button>' +
       '</div>';
@@ -1356,6 +1519,7 @@ function joinRoom(data) {
     else if (res.temporary) contextIcon.className = 'far fa-clock';
     else contextIcon.className = 'fas fa-hashtag';
     contextBadge.classList.add('hidden');
+    contextGlobalBadge.classList.toggle('hidden', !!res.department);
     backToRoomBtn.classList.add('hidden');
     welcomeRoom.textContent = name;
     renderRooms();
@@ -1693,6 +1857,251 @@ function updateConvTotalBadge() {
   }
   updateTitle();
 }
+
+function updateFriendsTotalBadge() {
+  var count = friendRequestsIncoming.length;
+  if (count > 0) {
+    friendsTotalBadge.textContent = count;
+    friendsTotalBadge.classList.remove('hidden');
+  } else {
+    friendsTotalBadge.classList.add('hidden');
+  }
+}
+
+function loadFriends() {
+  socket.emit('get-friends', function(list) {
+    friends = list || [];
+    renderFriends();
+  });
+}
+
+function loadFriendRequests() {
+  socket.emit('get-pending-friend-requests', function(res) {
+    friendRequestsIncoming = (res && res.incoming) || [];
+    renderFriendRequests();
+    updateFriendsTotalBadge();
+  });
+}
+
+function friendStatusLabel(f) {
+  if (!f.online) return 'Desconectado';
+  return f.departmentDisplayName ? f.departmentDisplayName : 'Conectado';
+}
+
+function renderFriends() {
+  if (!friends || friends.length === 0) {
+    friendsList.innerHTML = '<div style="padding:20px;text-align:center;color:var(--text-muted);font-size:13px;">Aún no tienes amigos agregados</div>';
+    return;
+  }
+  var sorted = friends.slice().sort(function(a, b) {
+    if (a.online !== b.online) return a.online ? -1 : 1;
+    return (a.displayName || a.username).localeCompare(b.displayName || b.username);
+  });
+  friendsList.innerHTML = sorted.map(function(f) {
+    return '<div class="friend-item" data-user="' + escapeHtml(f.username) + '">' +
+      '<div class="friend-avatar-wrap">' +
+        getAvatarHtml(f.username, f.avatar, 36) +
+        '<span class="friend-status-dot' + (f.online ? ' online' : '') + '"></span>' +
+      '</div>' +
+      '<div class="friend-info">' +
+        '<div class="friend-name">' + escapeHtml(f.displayName || f.username) + '</div>' +
+        '<div class="friend-status-text' + (f.online ? ' online' : '') + '">' + escapeHtml(friendStatusLabel(f)) + '</div>' +
+      '</div>' +
+      '<button class="friend-remove-btn btn-icon" title="Quitar amigo"><i class="fas fa-user-minus"></i></button>' +
+    '</div>';
+  }).join('');
+
+  friendsList.querySelectorAll('.friend-item').forEach(function(el) {
+    el.addEventListener('click', function(e) {
+      if (e.target.closest('.friend-remove-btn')) return;
+      var username = el.dataset.user;
+      cancelPrivate();
+      openPrivateChat(username);
+      document.querySelectorAll('.sidebar-tab').forEach(function(t) { t.classList.remove('active'); });
+      document.querySelector('[data-panel="conversations"]').classList.add('active');
+      sidebarTab = 'conversations';
+      document.querySelectorAll('.sidebar-panel').forEach(function(p) { p.classList.add('hidden'); });
+      $('conversations-panel').classList.remove('hidden');
+    });
+    var removeBtn = el.querySelector('.friend-remove-btn');
+    removeBtn.addEventListener('click', function(e) {
+      e.stopPropagation();
+      var username = el.dataset.user;
+      if (!confirm('¿Quitar a ' + username + ' de tus amigos?')) return;
+      socket.emit('remove-friend', { username: username }, function(res) {
+        if (!res.ok) { showToast(res.error); return; }
+        friends = friends.filter(function(f) { return f.username !== username; });
+        renderFriends();
+        showToast('Amigo eliminado');
+      });
+    });
+  });
+}
+
+function renderFriendRequests() {
+  if (!friendRequestsIncoming || friendRequestsIncoming.length === 0) {
+    friendRequestsSection.classList.add('hidden');
+    return;
+  }
+  friendRequestsSection.classList.remove('hidden');
+  friendRequestsList.innerHTML = friendRequestsIncoming.map(function(r) {
+    return '<div class="friend-request-item" data-id="' + r.id + '" data-user="' + escapeHtml(r.username) + '">' +
+      getAvatarHtml(r.username, r.avatar, 32) +
+      '<div class="friend-info">' +
+        '<div class="friend-name">' + escapeHtml(r.displayName || r.username) + '</div>' +
+      '</div>' +
+      '<div class="friend-request-actions">' +
+        '<button class="friend-request-accept" title="Aceptar"><i class="fas fa-check"></i></button>' +
+        '<button class="friend-request-reject" title="Rechazar"><i class="fas fa-times"></i></button>' +
+      '</div>' +
+    '</div>';
+  }).join('');
+
+  friendRequestsList.querySelectorAll('.friend-request-accept').forEach(function(btn) {
+    btn.addEventListener('click', function() {
+      var item = btn.closest('.friend-request-item');
+      var id = parseInt(item.dataset.id, 10);
+      socket.emit('respond-friend-request', { requestId: id, accept: true }, function(res) {
+        if (!res.ok) { showToast(res.error); return; }
+        friendRequestsIncoming = friendRequestsIncoming.filter(function(r) { return r.id !== id; });
+        renderFriendRequests();
+        updateFriendsTotalBadge();
+        loadFriends();
+        showToast('Ahora son amigos');
+      });
+    });
+  });
+  friendRequestsList.querySelectorAll('.friend-request-reject').forEach(function(btn) {
+    btn.addEventListener('click', function() {
+      var item = btn.closest('.friend-request-item');
+      var id = parseInt(item.dataset.id, 10);
+      socket.emit('respond-friend-request', { requestId: id, accept: false }, function(res) {
+        if (!res.ok) { showToast(res.error); return; }
+        friendRequestsIncoming = friendRequestsIncoming.filter(function(r) { return r.id !== id; });
+        renderFriendRequests();
+        updateFriendsTotalBadge();
+      });
+    });
+  });
+}
+
+var addFriendSearchTimer = null;
+
+addFriendBtn.addEventListener('click', function() {
+  addFriendSearch.value = '';
+  addFriendResults.innerHTML = '';
+  addFriendError.textContent = '';
+  addFriendModalOverlay.classList.remove('hidden');
+  addFriendSearch.focus();
+});
+
+function closeAddFriendModal() {
+  addFriendModalOverlay.classList.add('hidden');
+}
+addFriendModalClose.addEventListener('click', closeAddFriendModal);
+addFriendModalOverlay.addEventListener('click', function(e) {
+  if (e.target === addFriendModalOverlay) closeAddFriendModal();
+});
+
+addFriendSearch.addEventListener('input', function() {
+  clearTimeout(addFriendSearchTimer);
+  var query = this.value.trim();
+  addFriendError.textContent = '';
+  if (query.length < 2) {
+    addFriendResults.innerHTML = '';
+    return;
+  }
+  addFriendSearchTimer = setTimeout(function() {
+    socket.emit('search-users', { query: query }, function(results) {
+      renderAddFriendResults(results || []);
+    });
+  }, 300);
+});
+
+function addFriendActionLabel(status) {
+  if (status === 'friends') return 'Ya son amigos';
+  if (status === 'pending_sent') return 'Pendiente';
+  if (status === 'pending_received') return 'Te escribió';
+  return 'Agregar';
+}
+
+function renderAddFriendResults(results) {
+  if (results.length === 0) {
+    addFriendResults.innerHTML = '<div style="padding:12px;text-align:center;color:var(--text-muted);font-size:13px;">Sin resultados</div>';
+    return;
+  }
+  addFriendResults.innerHTML = results.map(function(r) {
+    var disabled = r.friendStatus !== 'none' ? ' disabled' : '';
+    return '<div class="add-friend-result-item" data-user="' + escapeHtml(r.username) + '">' +
+      getAvatarHtml(r.username, r.avatar, 32) +
+      '<div class="friend-info">' +
+        '<div class="friend-name">' + escapeHtml(r.displayName || r.username) + '</div>' +
+        '<div class="friend-username">@' + escapeHtml(r.username) + '</div>' +
+      '</div>' +
+      '<button class="add-friend-action-btn" data-status="' + r.friendStatus + '"' + disabled + '>' + addFriendActionLabel(r.friendStatus) + '</button>' +
+    '</div>';
+  }).join('');
+
+  addFriendResults.querySelectorAll('.add-friend-action-btn').forEach(function(btn) {
+    btn.addEventListener('click', function() {
+      if (btn.disabled) return;
+      var item = btn.closest('.add-friend-result-item');
+      var username = item.dataset.user;
+      btn.disabled = true;
+      btn.textContent = 'Enviando...';
+      socket.emit('send-friend-request', { username: username }, function(res) {
+        if (!res.ok) {
+          btn.disabled = false;
+          btn.textContent = 'Agregar';
+          addFriendError.textContent = res.error;
+          return;
+        }
+        if (res.autoAccepted) {
+          btn.textContent = 'Ya son amigos';
+          loadFriends();
+          showToast('Ahora son amigos');
+        } else {
+          btn.textContent = 'Pendiente';
+          showToast('Solicitud enviada');
+        }
+      });
+    });
+  });
+}
+
+socket.on('friend-request-received', function(data) {
+  friendRequestsIncoming.push(data);
+  renderFriendRequests();
+  updateFriendsTotalBadge();
+  playNotification();
+  showToast((data.displayName || data.username) + ' te envió una solicitud de amistad');
+});
+
+socket.on('friend-request-accepted', function(data) {
+  showToast((data.displayName || data.username) + ' aceptó tu solicitud de amistad');
+  loadFriends();
+});
+
+socket.on('friend-request-rejected', function() {
+  loadFriendRequests();
+});
+
+socket.on('friend-status-update', function(data) {
+  var f = friends.find(function(x) { return x.username === data.username; });
+  if (f) {
+    f.online = data.online;
+    f.department = data.department;
+    f.departmentDisplayName = data.departmentDisplayName;
+    f.departments = data.departments;
+    renderFriends();
+  }
+});
+
+socket.on('friend-removed', function(data) {
+  friends = friends.filter(function(f) { return f.username !== data.username; });
+  renderFriends();
+  showToast(data.username + ' te eliminó de sus amigos');
+});
 
 function updateRoomTotalBadge() {
   var total = 0;
@@ -2061,6 +2470,7 @@ function openPrivateChat(username) {
   contextName.textContent = username;
   contextIcon.className = 'fas fa-lock';
   contextBadge.classList.remove('hidden');
+  contextGlobalBadge.classList.add('hidden');
   backToRoomBtn.classList.remove('hidden');
 
   privateIndicator.classList.remove('hidden');
@@ -2085,6 +2495,7 @@ function cancelPrivate() {
     else if (curRoomData && curRoomData.temporary) contextIcon.className = 'far fa-clock';
     else contextIcon.className = 'fas fa-hashtag';
     contextBadge.classList.add('hidden');
+    contextGlobalBadge.classList.toggle('hidden', !!(curRoomData && curRoomData.department));
     backToRoomBtn.classList.add('hidden');
     messageInput.placeholder = 'Escribe en #' + currentRoom + '...';
 

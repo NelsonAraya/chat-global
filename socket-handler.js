@@ -1,5 +1,6 @@
 const fs = require('fs');
 const path = require('path');
+const { sendPanicAlertEmail } = require('./mailer');
 
 module.exports = (io, db) => {
   const {
@@ -8,7 +9,9 @@ module.exports = (io, db) => {
     saveRoom, deleteRoom,
     saveMessage, updateMessageReactions, deleteMessagesByRoom,
     saveDepartment, deleteDepartment,
-    saveConsent
+    saveConsent,
+    saveFriendRequest, updateFriendStatus, deleteFriendRow,
+    saveAlert, getAlertHistory
   } = db;
   const TERMS_VERSION = '1.0';
   const users = new Map();
@@ -59,12 +62,41 @@ module.exports = (io, db) => {
     return Array.from(seen.values());
   };
 
-  // La lista de "todos los usuarios" es distinta para cada visor (según su departamento),
-  // así que se envía personalizada en vez de un io.emit único.
+  // Cada socket conectado vive en una "sala" interna de Socket.IO según su
+  // contexto de visibilidad: los admins en 'role:admin' (ven a todos), el resto
+  // en 'dept:<departamento>' (o 'dept:__unassigned__' si no tiene ninguno
+  // asignado). Esto permite calcular y emitir la lista de usuarios una sola vez
+  // por grupo en vez de una vez por cada persona conectada.
+  const departmentRoom = (department) => 'dept:' + (department || '__unassigned__');
+  const ADMIN_ROOM = 'role:admin';
+
+  const visibilityRoomFor = (u) => (u.role === 'admin' ? ADMIN_ROOM : departmentRoom(u.department));
+
+  // La lista de "todos los usuarios" es distinta según el departamento del visor
+  // (y los admins ven a todos). Se calcula una vez por grupo, no una vez por
+  // persona conectada, y se emite con un solo io.to(sala).emit(...) por grupo.
   const broadcastAllUsers = () => {
-    for (const [sid, u] of users) {
-      io.to(sid).emit('all-users', { users: getAllUsers(u.department, u.role) });
+    const adminEntries = [];
+    const deptGroups = new Map();
+    const allEntries = [];
+
+    for (const [, u] of users) {
+      const entry = { username: u.username, displayName: u.displayName || u.username, avatar: u.avatar || null };
+      allEntries.push(entry);
+      if (u.role === 'admin') {
+        adminEntries.push(entry);
+      } else {
+        const key = u.department || '';
+        if (!deptGroups.has(key)) deptGroups.set(key, []);
+        deptGroups.get(key).push(entry);
+      }
     }
+
+    for (const [deptKey, entries] of deptGroups) {
+      io.to(departmentRoom(deptKey || null)).emit('all-users', { users: adminEntries.concat(entries) });
+    }
+
+    io.to(ADMIN_ROOM).emit('all-users', { users: allEntries });
   };
 
   const emitToViewersOf = (targetUserLike, event, payload) => {
@@ -149,6 +181,64 @@ module.exports = (io, db) => {
     return conversations;
   };
 
+  // ===================== AMIGOS =====================
+
+  const userPublicInfo = (username) => {
+    const u = data.users.find(x => x.username === username);
+    return { username, displayName: u?.displayName || username, avatar: u?.avatar || null };
+  };
+
+  const getFriendRow = (userA, userB) =>
+    data.friends.find(f =>
+      (f.requester === userA && f.recipient === userB) ||
+      (f.requester === userB && f.recipient === userA)
+    );
+
+  const getAcceptedFriendUsernames = (username) =>
+    data.friends
+      .filter(f => f.status === 'accepted' && (f.requester === username || f.recipient === username))
+      .map(f => (f.requester === username ? f.recipient : f.requester));
+
+  // Estado en vivo de un usuario para mostrarlo en la lista de amigos: conectado +
+  // departamento activo, o desconectado.
+  const getFriendLiveStatus = (username) => {
+    for (const [, u] of users) {
+      if (u.username === username) {
+        const deptRecord = u.department ? data.departments.find(d => d.name === u.department) : null;
+        return { online: true, department: u.department || null, departmentDisplayName: deptRecord?.displayName || u.department || null };
+      }
+    }
+    const record = data.users.find(x => x.username === username);
+    return { online: false, departments: departmentOptions(record?.departments || []) };
+  };
+
+  const getFriendsList = (username) =>
+    getAcceptedFriendUsernames(username).map(other => ({
+      ...userPublicInfo(other),
+      ...getFriendLiveStatus(other)
+    }));
+
+  const getPendingRequests = (username) => ({
+    incoming: data.friends
+      .filter(f => f.status === 'pending' && f.recipient === username)
+      .map(f => ({ id: f.id, ...userPublicInfo(f.requester) })),
+    outgoing: data.friends
+      .filter(f => f.status === 'pending' && f.requester === username)
+      .map(f => ({ id: f.id, ...userPublicInfo(f.recipient) }))
+  });
+
+  // Avisa a los amigos conectados de alguien que su estado (conectado/departamento) cambió.
+  const notifyFriendsOfStatusChange = (username) => {
+    const friendUsernames = getAcceptedFriendUsernames(username);
+    if (friendUsernames.length === 0) return;
+    const status = getFriendLiveStatus(username);
+    for (const [sid, u] of users) {
+      if (friendUsernames.includes(u.username)) {
+        io.to(sid).emit('friend-status-update', { username, ...status });
+      }
+    }
+  };
+
   const cleanupTemporaryRoom = async (roomName) => {
     const room = data.rooms.find(r => r.name === roomName);
     if (!room || !room.temporary) return false;
@@ -190,7 +280,9 @@ module.exports = (io, db) => {
     socket.location = userRecord.location || '';
     socket.department = department;
     socket.pendingUser = null;
+    socket.join(role === 'admin' ? ADMIN_ROOM : departmentRoom(department));
     broadcastAllUsers();
+    notifyFriendsOfStatusChange(userRecord.username);
     const deptRecord = department ? data.departments.find(d => d.name === department) : null;
     callback?.({
       ok: true,
@@ -207,7 +299,7 @@ module.exports = (io, db) => {
 
   io.on('connection', (socket) => {
     socket.on('register', async (data_, callback) => {
-      const { username, password, terms_version, department } = data_ || {};
+      const { username, password, terms_version } = data_ || {};
       if (!username || !username.trim()) {
         return callback?.({ ok: false, error: 'Nombre de usuario requerido' });
       }
@@ -225,21 +317,13 @@ module.exports = (io, db) => {
         return callback?.({ ok: false, error: 'Debes aceptar los Términos y Condiciones' });
       }
 
-      let userDepartments = [];
-      if (data.departments.length > 0) {
-        if (!department) return callback?.({ ok: false, error: 'Selecciona tu departamento/centro' });
-        if (!data.departments.find(d => d.name === department)) {
-          return callback?.({ ok: false, error: 'Departamento no válido' });
-        }
-        userDepartments = [department];
-      }
-
       const newUser = {
         username: name,
         password: hashPassword(password),
         displayName: name,
         avatar: null,
-        departments: userDepartments,
+        departments: [],
+        status: 'pending',
         created_at: new Date().toISOString()
       };
       data.users.push(newUser);
@@ -251,7 +335,10 @@ module.exports = (io, db) => {
         data.users = data.users.filter(u => u !== newUser);
         return callback?.({ ok: false, error: 'Error al guardar en la base de datos' });
       }
-      callback?.({ ok: true });
+
+      io.to(ADMIN_ROOM).emit('registration-pending', { username: name, displayName: name, created_at: newUser.created_at });
+
+      callback?.({ ok: true, pending: true });
     });
 
     socket.on('get-departments', (callback) => {
@@ -278,6 +365,12 @@ module.exports = (io, db) => {
       }
       if (userRecord.password !== hashPassword(password)) {
         return callback?.({ ok: false, error: 'Contraseña incorrecta' });
+      }
+      if (userRecord.status === 'pending') {
+        return callback?.({ ok: false, error: 'Tu cuenta está pendiente de aprobación por un administrador.' });
+      }
+      if (userRecord.status === 'rejected') {
+        return callback?.({ ok: false, error: 'Tu solicitud de cuenta fue rechazada. Contacta a un administrador.' });
       }
       for (const [, u] of users) {
         if (u.username === name) {
@@ -330,9 +423,14 @@ module.exports = (io, db) => {
         return callback?.({ ok: false, error: 'Ya estás en ese departamento' });
       }
 
+      if (user.role !== 'admin') {
+        socket.leave(departmentRoom(user.department));
+        socket.join(departmentRoom(department));
+      }
       user.department = department;
       socket.department = department;
       broadcastAllUsers();
+      notifyFriendsOfStatusChange(user.username);
 
       const deptRecord = data.departments.find(d => d.name === department);
       io.to(socket.id).emit('profile-updated', {
@@ -417,6 +515,7 @@ module.exports = (io, db) => {
         room: roomName,
         hasPassword: !!room.password,
         temporary: !!room.temporary,
+        department: room.department || null,
         users: getOnlineUsers(roomName)
       });
     });
@@ -704,6 +803,154 @@ module.exports = (io, db) => {
       callback?.(getConversations(user.username));
     });
 
+    socket.on('search-users', (data_, callback) => {
+      const user = users.get(socket.id);
+      if (!user) return callback?.([]);
+
+      const query = (data_?.query || '').trim().toLowerCase();
+      if (query.length < 2) return callback?.([]);
+
+      const results = data.users
+        .filter(u => u.username !== user.username && (u.username.includes(query) || (u.displayName || '').toLowerCase().includes(query)))
+        .slice(0, 20)
+        .map(u => {
+          const row = getFriendRow(user.username, u.username);
+          let friendStatus = 'none';
+          if (row) {
+            if (row.status === 'accepted') friendStatus = 'friends';
+            else friendStatus = row.requester === user.username ? 'pending_sent' : 'pending_received';
+          }
+          return { username: u.username, displayName: u.displayName || u.username, avatar: u.avatar || null, friendStatus };
+        });
+
+      callback?.(results);
+    });
+
+    socket.on('send-friend-request', async (data_, callback) => {
+      const user = users.get(socket.id);
+      if (!user) return callback?.({ ok: false, error: 'No autenticado' });
+
+      const target = data_?.username;
+      if (!target || target === user.username) return callback?.({ ok: false, error: 'Usuario no válido' });
+
+      const targetRecord = data.users.find(u => u.username === target);
+      if (!targetRecord) return callback?.({ ok: false, error: 'Usuario no encontrado' });
+
+      const existing = getFriendRow(user.username, target);
+      if (existing) {
+        if (existing.status === 'accepted') return callback?.({ ok: false, error: 'Ya son amigos' });
+        if (existing.requester === user.username) return callback?.({ ok: false, error: 'Ya le enviaste una solicitud' });
+
+        // La otra persona ya te había mandado una solicitud: se acepta directo.
+        const respondedAt = new Date().toISOString();
+        try {
+          await updateFriendStatus(existing.id, 'accepted', respondedAt);
+        } catch (err) {
+          console.error('updateFriendStatus error:', err);
+          return callback?.({ ok: false, error: 'Error al guardar en la base de datos' });
+        }
+        existing.status = 'accepted';
+        existing.responded_at = respondedAt;
+
+        for (const [sid, u] of users) {
+          if (u.username === existing.requester) {
+            io.to(sid).emit('friend-request-accepted', userPublicInfo(user.username));
+            break;
+          }
+        }
+        return callback?.({ ok: true, autoAccepted: true });
+      }
+
+      const newRequest = { requester: user.username, recipient: target, status: 'pending', created_at: new Date().toISOString() };
+      try {
+        await saveFriendRequest(newRequest);
+      } catch (err) {
+        console.error('saveFriendRequest error:', err);
+        return callback?.({ ok: false, error: 'Error al guardar en la base de datos' });
+      }
+      data.friends.push(newRequest);
+
+      for (const [sid, u] of users) {
+        if (u.username === target) {
+          io.to(sid).emit('friend-request-received', { id: newRequest.id, ...userPublicInfo(user.username) });
+          break;
+        }
+      }
+
+      callback?.({ ok: true });
+    });
+
+    socket.on('respond-friend-request', async (data_, callback) => {
+      const user = users.get(socket.id);
+      if (!user) return callback?.({ ok: false, error: 'No autenticado' });
+
+      const { requestId, accept } = data_ || {};
+      const request = data.friends.find(f => f.id === requestId && f.recipient === user.username && f.status === 'pending');
+      if (!request) return callback?.({ ok: false, error: 'Solicitud no encontrada' });
+
+      try {
+        if (accept) {
+          const respondedAt = new Date().toISOString();
+          await updateFriendStatus(request.id, 'accepted', respondedAt);
+          request.status = 'accepted';
+          request.responded_at = respondedAt;
+        } else {
+          await deleteFriendRow(request.id);
+          data.friends = data.friends.filter(f => f.id !== request.id);
+        }
+      } catch (err) {
+        console.error('respond-friend-request error:', err);
+        return callback?.({ ok: false, error: 'Error al guardar en la base de datos' });
+      }
+
+      for (const [sid, u] of users) {
+        if (u.username === request.requester) {
+          io.to(sid).emit(accept ? 'friend-request-accepted' : 'friend-request-rejected', userPublicInfo(user.username));
+          break;
+        }
+      }
+
+      callback?.({ ok: true });
+    });
+
+    socket.on('remove-friend', async (data_, callback) => {
+      const user = users.get(socket.id);
+      if (!user) return callback?.({ ok: false, error: 'No autenticado' });
+
+      const other = data_?.username;
+      const row = getFriendRow(user.username, other);
+      if (!row || row.status !== 'accepted') return callback?.({ ok: false, error: 'No son amigos' });
+
+      try {
+        await deleteFriendRow(row.id);
+      } catch (err) {
+        console.error('remove-friend error:', err);
+        return callback?.({ ok: false, error: 'Error al guardar en la base de datos' });
+      }
+      data.friends = data.friends.filter(f => f.id !== row.id);
+
+      for (const [sid, u] of users) {
+        if (u.username === other) {
+          io.to(sid).emit('friend-removed', { username: user.username });
+          break;
+        }
+      }
+
+      callback?.({ ok: true });
+    });
+
+    socket.on('get-friends', (callback) => {
+      const user = users.get(socket.id);
+      if (!user) return callback?.([]);
+      callback?.(getFriendsList(user.username));
+    });
+
+    socket.on('get-pending-friend-requests', (callback) => {
+      const user = users.get(socket.id);
+      if (!user) return callback?.({ incoming: [], outgoing: [] });
+      callback?.(getPendingRequests(user.username));
+    });
+
     socket.on('get-room-unreads', (callback) => {
       const user = users.get(socket.id);
       if (!user) return;
@@ -718,8 +965,57 @@ module.exports = (io, db) => {
         displayName: u.displayName || u.username,
         role: u.role || 'user',
         departments: u.departments || [],
+        status: u.status || 'active',
         created_at: u.created_at
       })));
+    });
+
+    socket.on('get-pending-registrations', (callback) => {
+      const user = users.get(socket.id);
+      if (!user || user.role !== 'admin') return callback?.([]);
+      callback?.(data.users.filter(u => u.status === 'pending').map(u => ({
+        username: u.username,
+        displayName: u.displayName || u.username,
+        created_at: u.created_at
+      })));
+    });
+
+    socket.on('admin-approve-registration', async (data_, callback) => {
+      const user = users.get(socket.id);
+      if (!user || user.role !== 'admin') return callback?.({ ok: false, error: 'No autorizado' });
+
+      const target = data.users.find(u => u.username === data_?.username);
+      if (!target) return callback?.({ ok: false, error: 'Usuario no encontrado' });
+      if (target.status !== 'pending') return callback?.({ ok: false, error: 'Esa cuenta no está pendiente' });
+
+      target.status = 'active';
+      try {
+        await saveUser(target);
+      } catch (err) {
+        console.error('admin-approve-registration error:', err);
+        target.status = 'pending';
+        return callback?.({ ok: false, error: 'Error al guardar en la base de datos' });
+      }
+      callback?.({ ok: true });
+    });
+
+    socket.on('admin-reject-registration', async (data_, callback) => {
+      const user = users.get(socket.id);
+      if (!user || user.role !== 'admin') return callback?.({ ok: false, error: 'No autorizado' });
+
+      const target = data.users.find(u => u.username === data_?.username);
+      if (!target) return callback?.({ ok: false, error: 'Usuario no encontrado' });
+      if (target.status !== 'pending') return callback?.({ ok: false, error: 'Esa cuenta no está pendiente' });
+
+      target.status = 'rejected';
+      try {
+        await saveUser(target);
+      } catch (err) {
+        console.error('admin-reject-registration error:', err);
+        target.status = 'pending';
+        return callback?.({ ok: false, error: 'Error al guardar en la base de datos' });
+      }
+      callback?.({ ok: true });
     });
 
     socket.on('update-user', async (data_, callback) => {
@@ -752,11 +1048,20 @@ module.exports = (io, db) => {
 
       for (const [sid, u] of users) {
         if (u.username === username) {
+          const prevRoom = visibilityRoomFor(u);
           if (role !== undefined) u.role = target.role;
           if (departments !== undefined) {
             u.departments = target.departments;
             if (u.department && !u.departments.includes(u.department)) {
               u.department = u.departments[0] || null;
+            }
+          }
+          const newRoom = visibilityRoomFor(u);
+          if (newRoom !== prevRoom) {
+            const targetSocket = io.sockets.sockets.get(sid);
+            if (targetSocket) {
+              targetSocket.leave(prevRoom);
+              targetSocket.join(newRoom);
             }
           }
           const deptRecord = u.department ? data.departments.find(d => d.name === u.department) : null;
@@ -886,6 +1191,13 @@ module.exports = (io, db) => {
         console.error('deleteUser error:', err);
         return callback?.({ ok: false, error: 'Error al guardar en la base de datos' });
       }
+      const removedFriendUsernames = getAcceptedFriendUsernames(delUsername);
+      data.friends = data.friends.filter(f => f.requester !== delUsername && f.recipient !== delUsername);
+      for (const [sid, u] of users) {
+        if (removedFriendUsernames.includes(u.username)) {
+          io.to(sid).emit('friend-removed', { username: delUsername });
+        }
+      }
 
       for (const [sid, u] of users) {
         if (u.username === delUsername) {
@@ -1013,13 +1325,14 @@ module.exports = (io, db) => {
       if (!user) return;
 
       const deptRecord = user.department ? data.departments.find(d => d.name === user.department) : null;
+      const timestamp = new Date().toISOString();
       const payload = {
         username: user.username,
         displayName: user.displayName || user.username,
         location: user.location || '',
         department: user.department || null,
         departmentDisplayName: deptRecord?.displayName || user.department || null,
-        timestamp: new Date().toISOString()
+        timestamp
       };
 
       for (const [sid, u] of users) {
@@ -1030,6 +1343,33 @@ module.exports = (io, db) => {
         if (sameDept || senderIsGlobal || recipientIsAdmin) {
           io.to(sid).emit('panic-alert', payload);
         }
+      }
+
+      saveAlert({
+        username: user.username,
+        displayName: user.displayName || user.username,
+        department: user.department || null,
+        departmentDisplayName: deptRecord?.displayName || user.department || null,
+        location: user.location || '',
+        created_at: timestamp
+      }).catch(err => console.error('saveAlert error:', err));
+
+      sendPanicAlertEmail(payload).catch(err => console.error('sendPanicAlertEmail error:', err));
+    });
+
+    socket.on('get-alert-history', async (data_, callback) => {
+      const user = users.get(socket.id);
+      if (!user || user.role !== 'admin') return callback?.({ alerts: [], hasMore: false });
+
+      const limit = 50;
+      const offset = data_?.offset || 0;
+      try {
+        const rows = await getAlertHistory(limit + 1, offset);
+        const hasMore = rows.length > limit;
+        callback?.({ alerts: rows.slice(0, limit), hasMore });
+      } catch (err) {
+        console.error('get-alert-history error:', err);
+        callback?.({ alerts: [], hasMore: false });
       }
     });
 
@@ -1103,6 +1443,7 @@ module.exports = (io, db) => {
       }
       users.delete(socket.id);
       broadcastAllUsers();
+      notifyFriendsOfStatusChange(user.username);
 
       if (oldRoom) {
         cleanupTemporaryRoom(oldRoom).catch(err => console.error('cleanupTemporaryRoom error:', err));
