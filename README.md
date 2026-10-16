@@ -46,6 +46,7 @@ Variables disponibles (si no se define alguna, usa el valor por defecto):
 | `DB_USER` | `root` | Usuario de MySQL |
 | `DB_PASSWORD` | *(vacío)* | Contraseña de MySQL |
 | `DB_NAME` | `chat_cormudesi` | Nombre de la base de datos |
+| `ALLOWED_EMAIL_DOMAINS` | `cormudesi.cl,gmail.com` | Dominios de correo aceptados al registrarse (separados por comas) |
 | `HTTP_PORT` | `3000` | Puerto HTTP (opcional) |
 | `HTTPS_PORT` | `3443` | Puerto HTTPS (opcional) |
 
@@ -248,7 +249,7 @@ Historial completo de activaciones del botón de pánico, del más reciente al m
 
 Desde que se agregó este flujo, **crear una cuenta ya no da acceso inmediato al chat**:
 
-1. Cualquiera puede registrarse desde "Crear cuenta" — pide usuario, **correo** y contraseña (el departamento ya no se elige en el registro). El correo no puede estar usado por otra cuenta.
+1. Cualquiera puede registrarse desde "Crear cuenta" — pide usuario, **correo** y contraseña (el departamento ya no se elige en el registro). **Solo se aceptan correos `@cormudesi.cl` o `@gmail.com`** (configurable con `ALLOWED_EMAIL_DOMAINS`), con formato estricto, y el correo no puede estar usado por otra cuenta.
 2. La cuenta queda en estado **pendiente**. Si intenta entrar antes de ser aprobada, ve el mensaje "Tu cuenta está pendiente de aprobación por un administrador."
 3. Si hay un administrador conectado en ese momento, le llega una notificación en vivo (sonido + aviso) y un contador en el ícono de Admin.
 4. El administrador entra a **Admin → Usuarios**, **revisa el correo con que se registró** (se muestra en la solicitud) y acepta ✓ o rechaza ✗.

@@ -225,6 +225,33 @@ function escapeHtml(text) {
   });
 }
 
+// Dominios de correo permitidos: los define el servidor (ALLOWED_EMAIL_DOMAINS); este es solo el valor inicial.
+var allowedEmailDomains = ['cormudesi.cl', 'gmail.com'];
+
+function allowedEmailDomainsText() {
+  return allowedEmailDomains.map(function(d) { return '@' + d; }).join(' o ');
+}
+
+// Misma regla que el servidor: formato estricto y solo dominios permitidos. Devuelve el error o null.
+function emailError(email) {
+  email = String(email || '').trim().toLowerCase();
+  var at = email.lastIndexOf('@');
+  var local = email.slice(0, at);
+  var domain = email.slice(at + 1);
+  if (at <= 0 || email.length > 254 || local.length > 64 || !/^[a-z0-9_%+-]+(\.[a-z0-9_%+-]+)*$/.test(local)) return 'Correo no válido';
+  if (allowedEmailDomains.indexOf(domain) === -1) return 'Solo se aceptan correos ' + allowedEmailDomainsText();
+  return null;
+}
+
+function loadEmailDomains() {
+  socket.emit('get-email-domains', function(domains) {
+    if (Array.isArray(domains) && domains.length > 0) allowedEmailDomains = domains;
+    var placeholder = 'Correo ' + allowedEmailDomainsText() + '...';
+    registerEmail.placeholder = placeholder;
+    $('twofactor-email').placeholder = placeholder;
+  });
+}
+
 // Solo se muestran archivos subidos a este servidor; cualquier otra URL (p. ej. "javascript:") se descarta.
 function safeUploadUrl(url) {
   return typeof url === 'string' && /^\/uploads\/[A-Za-z0-9._-]+$/.test(url) ? url : null;
@@ -783,7 +810,8 @@ function closeTwoFactor() {
 
 twofactorEmailBtn.addEventListener('click', function() {
   var email = twofactorEmail.value.trim();
-  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) { loginError.textContent = 'Ingresa un correo válido'; return; }
+  var twoFactorEmailError = emailError(email);
+  if (twoFactorEmailError) { loginError.textContent = twoFactorEmailError; return; }
   twofactorEmailBtn.disabled = true;
   socket.emit('two-factor-set-email', { email: email }, function(res) {
     twofactorEmailBtn.disabled = false;
@@ -947,7 +975,8 @@ registerBtn.addEventListener('click', () => {
   const confirm = registerConfirm.value;
 
   if (!username) { loginError.textContent = 'Ingresa un usuario'; return; }
-  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) { loginError.textContent = 'Ingresa un correo válido'; return; }
+  var registerEmailError = emailError(email);
+  if (registerEmailError) { loginError.textContent = registerEmailError; return; }
   if (!password || password.length < 3) { loginError.textContent = 'Minimo 3 caracteres'; return; }
   if (password !== confirm) { loginError.textContent = 'No coinciden'; return; }
 
@@ -1604,6 +1633,7 @@ function renderAdminPanel() {
         adminEditUsernameDisplay.textContent = btn.dataset.username;
         adminEditDisplayname.value = btn.dataset.displayname;
         adminEditEmail.value = btn.dataset.email || '';
+        adminEditEmail.dataset.original = btn.dataset.email || '';
         adminEditRole.value = btn.dataset.role;
         var selectedDepts = btn.dataset.departments ? btn.dataset.departments.split(',') : [];
         renderDepartmentCheckboxes(adminEditDepartments, selectedDepts);
@@ -1792,7 +1822,9 @@ adminEditConfirm.addEventListener('click', function() {
   var newPasswordConfirm = adminEditPasswordConfirm.value;
 
   if (!displayName) { adminEditError.textContent = 'Nombre requerido'; return; }
-  if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) { adminEditError.textContent = 'Correo no válido'; return; }
+  // Un correo que no cambió se deja pasar (cuentas antiguas con otro dominio); el servidor aplica la misma regla.
+  var adminEmailError = email && email.toLowerCase() !== (adminEditEmail.dataset.original || '').toLowerCase() ? emailError(email) : null;
+  if (adminEmailError) { adminEditError.textContent = adminEmailError; return; }
 
   if (newPassword || newPasswordConfirm) {
     if (newPassword.length < 3) { adminEditError.textContent = 'Contraseña: mínimo 3 caracteres'; return; }
@@ -3556,6 +3588,7 @@ if (privacyBannerClose) {
 document.addEventListener('DOMContentLoaded', function() {
   showCertBannerIfNeeded();
   loadDepartments();
+  loadEmailDomains();
   if (!tryAutoLogin()) {
     loginUsername.focus();
   }

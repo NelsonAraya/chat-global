@@ -110,7 +110,22 @@ module.exports = (io, db) => {
     for (const [k, e] of loginCodes) if (e.expiresAt <= now) loginCodes.delete(k);
     for (const [k, list] of codeSends) if (!list.some(t => now - t < OTP_SENDS_WINDOW_MS)) codeSends.delete(k);
   }, 10 * 60 * 1000).unref();
-  const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+  // Solo correos institucionales o Gmail, con formato estricto: letras, números y . _ % + - antes de la @,
+  // sin puntos al inicio/fin ni seguidos. Se configura con ALLOWED_EMAIL_DOMAINS en .env.
+  const ALLOWED_EMAIL_DOMAINS = (process.env.ALLOWED_EMAIL_DOMAINS || 'cormudesi.cl,gmail.com')
+    .split(',').map(d => d.trim().toLowerCase()).filter(Boolean);
+  const EMAIL_LOCAL_RE = /^[a-z0-9_%+-]+(\.[a-z0-9_%+-]+)*$/;
+  const allowedDomainsText = ALLOWED_EMAIL_DOMAINS.map(d => '@' + d).join(' o ');
+
+  // Devuelve null si el correo es válido, o el mensaje de error para mostrar.
+  const emailError = (email) => {
+    const at = email.lastIndexOf('@');
+    const local = email.slice(0, at);
+    const domain = email.slice(at + 1);
+    if (at <= 0 || email.length > 254 || local.length > 64 || !EMAIL_LOCAL_RE.test(local)) return 'Correo no válido';
+    if (!ALLOWED_EMAIL_DOMAINS.includes(domain)) return 'Solo se aceptan correos ' + allowedDomainsText;
+    return null;
+  };
 
   const normalizeEmail = (email) => String(email || '').trim().toLowerCase();
   const hashCode = (code) => crypto.createHash('sha256').update(code).digest('hex');
@@ -585,8 +600,9 @@ module.exports = (io, db) => {
       if (data.users.find(u => u.username === name)) {
         return callback?.({ ok: false, error: 'Ese usuario ya existe' });
       }
-      if (!EMAIL_RE.test(email) || email.length > 255) {
-        return callback?.({ ok: false, error: 'Ingresa un correo válido' });
+      const regEmailError = emailError(email);
+      if (regEmailError) {
+        return callback?.({ ok: false, error: regEmailError });
       }
       if (emailInUse(email)) {
         return callback?.({ ok: false, error: 'Ese correo ya está registrado en otra cuenta' });
@@ -619,6 +635,10 @@ module.exports = (io, db) => {
       io.to(ADMIN_ROOM).emit('registration-pending', { username: name, displayName: name, email, created_at: newUser.created_at });
 
       callback?.({ ok: true, pending: true });
+    });
+
+    socket.on('get-email-domains', (callback) => {
+      callback?.(ALLOWED_EMAIL_DOMAINS);
     });
 
     socket.on('get-departments', (callback) => {
@@ -719,7 +739,8 @@ module.exports = (io, db) => {
       if (userRecord.email) return callback?.({ ok: false, error: 'Tu cuenta ya tiene un correo registrado' });
 
       const email = normalizeEmail(data_?.email);
-      if (!EMAIL_RE.test(email) || email.length > 255) return callback?.({ ok: false, error: 'Correo no válido' });
+      const setEmailError = emailError(email);
+      if (setEmailError) return callback?.({ ok: false, error: setEmailError });
       if (emailInUse(email, userRecord.username)) return callback?.({ ok: false, error: 'Ese correo ya está registrado en otra cuenta' });
 
       const prev = loginCodes.get(userRecord.username);
@@ -1517,7 +1538,8 @@ module.exports = (io, db) => {
       let newEmail;
       if (email !== undefined) {
         newEmail = normalizeEmail(email) || null;
-        if (newEmail && (!EMAIL_RE.test(newEmail) || newEmail.length > 255)) return callback?.({ ok: false, error: 'Correo no válido' });
+        const editEmailError = newEmail && newEmail !== (target.email || null) ? emailError(newEmail) : null;
+        if (editEmailError) return callback?.({ ok: false, error: editEmailError });
         if (newEmail && emailInUse(newEmail, target.username)) return callback?.({ ok: false, error: 'Ese correo ya está registrado en otra cuenta' });
       }
 
