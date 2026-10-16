@@ -647,10 +647,7 @@ function completeLogin(username, res, opts) {
   } else {
     adminTab.classList.add('hidden');
   }
-  if (opts.password) {
-    localStorage.setItem('chat_user', currentUser);
-    localStorage.setItem('chat_pass', opts.password);
-  }
+  if (res.sessionToken) storeSession(res.sessionToken, res.sessionRemember);
   initializeChat();
   socket.emit('get-room-unreads', function(counts) {
     roomUnreadCounts = counts || {};
@@ -668,15 +665,11 @@ function doLogin(username, password, callback) {
     loginBtn.innerHTML = '<i class="fas fa-arrow-right"></i> Ingresar';
 
     if (!res.ok) {
-      if (res.error && res.error.includes('ya está conectado')) {
-        localStorage.removeItem('chat_user');
-        localStorage.removeItem('chat_pass');
-      }
       callback?.({ ok: false, error: res.error });
       return;
     }
 
-    continueLogin(username, res, { password: password }, callback);
+    continueLogin(username, res, {}, callback);
   });
 }
 
@@ -706,29 +699,65 @@ function continueLogin(username, res, opts, callback) {
   callback?.({ ok: true });
 }
 
-function tryAutoLogin() {
-  var savedUser = localStorage.getItem('chat_user');
-  var savedPass = localStorage.getItem('chat_pass');
-  if (savedUser && savedPass) {
-    loginBtn.disabled = true;
-    loginBtn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Conectando...';
-    socket.emit('login', { username: savedUser, password: savedPass }, (res) => {
-      loginBtn.disabled = false;
-      loginBtn.innerHTML = '<i class="fas fa-arrow-right"></i> Ingresar';
-      if (!res.ok) {
-        localStorage.removeItem('chat_user');
-        localStorage.removeItem('chat_pass');
-        loginUsername.focus();
-        return;
-      }
+// ===================== SESIÓN GUARDADA =====================
+// El navegador guarda solo un token de sesión (nunca la contraseña). Sin "Recordar este equipo" va en
+// sessionStorage (se borra al cerrar la pestaña); con la casilla, en localStorage (7 días).
+var SESSION_KEY = 'chat_session';
 
-      continueLogin(savedUser, res, {}, function(r) {
-        if (!r.ok) loginError.textContent = r.error;
-      });
-    });
-    return true;
+function storeSession(token, remember) {
+  try {
+    if (remember) {
+      localStorage.setItem(SESSION_KEY, token);
+      sessionStorage.removeItem(SESSION_KEY);
+    } else {
+      sessionStorage.setItem(SESSION_KEY, token);
+      localStorage.removeItem(SESSION_KEY);
+    }
+  } catch (e) {}
+}
+
+function getStoredSession() {
+  try {
+    return sessionStorage.getItem(SESSION_KEY) || localStorage.getItem(SESSION_KEY);
+  } catch (e) {
+    return null;
   }
-  return false;
+}
+
+function clearStoredSession() {
+  try {
+    sessionStorage.removeItem(SESSION_KEY);
+    localStorage.removeItem(SESSION_KEY);
+    // Versiones anteriores guardaban usuario y contraseña en el navegador: se eliminan.
+    localStorage.removeItem('chat_user');
+    localStorage.removeItem('chat_pass');
+  } catch (e) {}
+}
+
+try {
+  localStorage.removeItem('chat_user');
+  localStorage.removeItem('chat_pass');
+} catch (e) {}
+
+function tryAutoLogin() {
+  var token = getStoredSession();
+  if (!token) return false;
+  loginBtn.disabled = true;
+  loginBtn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Conectando...';
+  socket.emit('resume-session', { token: token }, function(res) {
+    loginBtn.disabled = false;
+    loginBtn.innerHTML = '<i class="fas fa-arrow-right"></i> Ingresar';
+    if (!res.ok) {
+      if (res.expired) clearStoredSession();
+      if (res.error) loginError.textContent = res.error;
+      loginUsername.focus();
+      return;
+    }
+    continueLogin(res.username, res, {}, function(r) {
+      if (!r.ok) loginError.textContent = r.error;
+    });
+  });
+  return true;
 }
 
 // ===================== DOBLE FACTOR (código por correo) =====================
@@ -831,7 +860,7 @@ twofactorVerifyBtn.addEventListener('click', function() {
   if (!/^\d{6}$/.test(code)) { loginError.textContent = 'El código tiene 6 dígitos'; return; }
   twofactorVerifyBtn.disabled = true;
   twofactorVerifyBtn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Verificando...';
-  socket.emit('two-factor-verify', { code: code }, function(res) {
+  socket.emit('two-factor-verify', { code: code, remember: $('twofactor-remember').checked }, function(res) {
     twofactorVerifyBtn.disabled = false;
     twofactorVerifyBtn.innerHTML = '<i class="fas fa-check"></i> Verificar';
     if (!res.ok) {
@@ -1136,9 +1165,15 @@ pwdChangeConfirmBtn.addEventListener('click', function() {
 
 logoutBtn.addEventListener('click', () => {
   if (!confirm('Salir del chat?')) return;
-  localStorage.removeItem('chat_user');
-  localStorage.removeItem('chat_pass');
-  location.reload();
+  var done = false;
+  function finish() {
+    if (done) return;
+    done = true;
+    clearStoredSession();
+    location.reload();
+  }
+  socket.emit('logout', finish);
+  setTimeout(finish, 2000); // si el servidor no responde, igual se sale
 });
 
 panicBtn.addEventListener('click', function() {
@@ -1642,6 +1677,7 @@ function renderAdminPanel() {
         adminEditDeleteBtn.disabled = false;
         adminEditDeleteBtn.innerHTML = '<i class="fas fa-trash"></i> Eliminar usuario';
         setAdminEditBlockButton(btn.dataset.status);
+        $('admin-edit-sessions-btn').disabled = false;
         adminEditError.textContent = '';
         adminEditOverlay.classList.remove('hidden');
         adminEditDisplayname.focus();
@@ -1893,6 +1929,18 @@ adminEditDeleteBtn.addEventListener('click', function() {
     showToast('Usuario ' + username + ' eliminado');
     adminEditOverlay.classList.add('hidden');
     renderAdminPanel();
+  });
+});
+
+$('admin-edit-sessions-btn').addEventListener('click', function() {
+  var btn = this;
+  var username = adminEditUsernameDisplay.textContent;
+  if (!confirm('¿Cerrar todas las sesiones de "' + username + '"?\nSi está conectado se le cerrará el chat, y en todos sus equipos tendrá que volver a ingresar con contraseña y código.')) return;
+  btn.disabled = true;
+  socket.emit('admin-revoke-sessions', { username: username }, function(res) {
+    btn.disabled = false;
+    if (!res.ok) { adminEditError.textContent = res.error; return; }
+    showToast('Sesiones de ' + username + ' cerradas');
   });
 });
 
@@ -3535,11 +3583,37 @@ groupModalOverlay.addEventListener('click', function(e) {
   if (e.target === groupModalOverlay) closeGroupModal();
 });
 
+var sessionReplaced = false;
+
 socket.on('force-disconnect', function(data) {
+  if (data.replaced) {
+    // La misma sesión se abrió en otra pestaña: esta se desactiva sin borrar la sesión (la otra la sigue usando).
+    sessionReplaced = true;
+    chatScreen.classList.add('hidden');
+    loginScreen.classList.add('hidden');
+    var box = document.createElement('div');
+    box.className = 'session-replaced';
+    box.innerHTML = '<div class="modal-box"><div class="modal-body" style="text-align:center;">' +
+      '<p style="margin-bottom:16px;"><i class="fas fa-clone"></i> ' + escapeHtml(data.reason) + '</p>' +
+      '<button class="btn-primary" type="button">Usar el chat aquí</button></div></div>';
+    box.querySelector('button').addEventListener('click', function() { location.reload(); });
+    document.body.appendChild(box);
+    return;
+  }
   alert(data.reason || 'Has sido desconectado');
-  localStorage.removeItem('chat_user');
-  localStorage.removeItem('chat_pass');
+  clearStoredSession();
   location.reload();
+});
+
+// Si se corta la conexión (p. ej. se reinició el servidor), al volver se recarga la página:
+// la sesión guardada permite reingresar solo, sin contraseña ni código.
+var hasConnectedOnce = false;
+socket.on('connect', function() {
+  if (hasConnectedOnce && currentUser && !sessionReplaced && getStoredSession()) {
+    location.reload();
+    return;
+  }
+  hasConnectedOnce = true;
 });
 
 // Certificado banner logic

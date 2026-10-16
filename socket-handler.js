@@ -13,6 +13,7 @@ module.exports = (io, db) => {
     saveConsent,
     saveFriendRequest, updateFriendStatus, deleteFriendRow,
     saveGroup, renameGroup, deleteGroup, saveGroupMember, deleteGroupMember,
+    saveSession, getSession, updateSessionDepartment, deleteSession, deleteUserSessions, deleteExpiredSessions,
     saveAlert, getAlertHistory
   } = db;
   const TERMS_VERSION = '1.0';
@@ -50,6 +51,29 @@ module.exports = (io, db) => {
   };
 
   const sanitizeContent = (content) => (typeof content === 'string' ? content.trim().slice(0, 5000) : '');
+
+  // ===== Sesiones =====
+  // Tras el login (contraseña + código) el navegador recibe un token de sesión; con él puede recargar la
+  // página sin volver a ingresar. Sin "Recordar este equipo" dura mientras la pestaña esté abierta (máx. 12 h);
+  // con la casilla marcada, 7 días. En la base solo se guarda el hash del token.
+  const SESSION_TTL_MS = 12 * 60 * 60 * 1000;
+  const SESSION_REMEMBER_MS = 7 * 24 * 60 * 60 * 1000;
+  const SESSION_TOKEN_RE = /^[A-Za-z0-9_-]{43}$/;
+  const hashToken = (token) => crypto.createHash('sha256').update(token).digest('hex');
+
+  // Cierra todas las sesiones guardadas de un usuario (y su conexión activa, si se indica un motivo).
+  const revokeUserSessions = async (username, kickReason) => {
+    await deleteUserSessions(username);
+    if (kickReason && kickUser(username, kickReason)) {
+      broadcastAllUsers();
+      notifyFriendsOfStatusChange(username);
+    }
+  };
+
+  deleteExpiredSessions().catch(err => console.error('deleteExpiredSessions error:', err));
+  setInterval(() => {
+    deleteExpiredSessions().catch(err => console.error('deleteExpiredSessions error:', err));
+  }, 60 * 60 * 1000).unref();
 
   // ===== Límite de intentos fallidos (en memoria) =====
   // Frena la fuerza bruta: tras varios fallos, esa cuenta / esa IP queda bloqueada un rato.
@@ -398,7 +422,7 @@ module.exports = (io, db) => {
   };
 
   // Saca del chat la sesión activa de un usuario (cuenta eliminada o bloqueada). Devuelve true si estaba conectado.
-  const kickUser = (username, reason) => {
+  const kickUser = (username, reason, extra) => {
     for (const [sid, u] of users) {
       if (u.username === username) {
         for (const [roomName, sockets] of roomUsers) {
@@ -412,7 +436,7 @@ module.exports = (io, db) => {
           delete roomUnreads[username];
         }
         if (u.uploadToken) uploadTokens.delete(u.uploadToken);
-        io.to(sid).emit('force-disconnect', { reason });
+        io.to(sid).emit('force-disconnect', { reason, ...extra });
         users.delete(sid);
         return true;
       }
@@ -425,12 +449,51 @@ module.exports = (io, db) => {
     return { name: n, displayName: rec?.displayName || n };
   });
 
-  const finalizeLogin = (socket, userRecord, department, callback) => {
+  // Crea la sesión del navegador (o reutiliza la que se reanudó) y deja al usuario conectado.
+  const finalizeLogin = async (socket, userRecord, department, callback) => {
     const role = userRecord.role || 'user';
     const assignedDepartments = userRecord.departments || [];
+
+    let sessionHash = socket.resumedSessionHash || null;
+    let sessionToken = null;
+    let sessionRemember = !!socket.resumedSessionRemember;
+    if (sessionHash) {
+      updateSessionDepartment(sessionHash, department).catch(err => console.error('updateSessionDepartment error:', err));
+    } else {
+      sessionRemember = !!socket.loginRemember;
+      sessionToken = crypto.randomBytes(32).toString('base64url');
+      sessionHash = hashToken(sessionToken);
+      try {
+        await saveSession({
+          tokenHash: sessionHash,
+          username: userRecord.username,
+          department,
+          remember: sessionRemember,
+          created_at: new Date().toISOString(),
+          expiresAt: Date.now() + (sessionRemember ? SESSION_REMEMBER_MS : SESSION_TTL_MS),
+          ip: socket.handshake.address,
+          userAgent: socket.handshake.headers?.['user-agent']
+        });
+      } catch (err) {
+        // Sin sesión guardada igual puede entrar; solo tendrá que iniciar sesión otra vez al recargar.
+        console.error('saveSession error:', err);
+        sessionToken = null;
+        sessionHash = null;
+      }
+    }
+    socket.resumedSessionHash = null;
+    socket.resumedSessionRemember = false;
+    socket.loginRemember = false;
+
+    for (const [, u] of users) {
+      if (u.username === userRecord.username) {
+        return callback?.({ ok: false, error: 'Ese usuario ya está conectado' });
+      }
+    }
+
     const uploadToken = crypto.randomUUID();
     uploadTokens.set(uploadToken, socket.id);
-    users.set(socket.id, { username: userRecord.username, currentRoom: null, displayName: userRecord.displayName || userRecord.username, avatar: userRecord.avatar || null, location: userRecord.location || '', role, department, departments: assignedDepartments, uploadToken });
+    users.set(socket.id, { username: userRecord.username, currentRoom: null, displayName: userRecord.displayName || userRecord.username, avatar: userRecord.avatar || null, location: userRecord.location || '', role, department, departments: assignedDepartments, uploadToken, sessionHash });
     socket.username = userRecord.username;
     socket.displayName = userRecord.displayName || userRecord.username;
     socket.avatar = userRecord.avatar || null;
@@ -451,7 +514,10 @@ module.exports = (io, db) => {
       department,
       departmentDisplayName: deptRecord?.displayName || department,
       departments: departmentOptions(assignedDepartments),
-      uploadToken
+      uploadToken,
+      username: userRecord.username,
+      sessionToken,
+      sessionRemember
     });
   };
 
@@ -702,6 +768,7 @@ module.exports = (io, db) => {
       // La contraseña es correcta: ahora se exige el código enviado al correo.
       // La primera vez (doble factor aún no activado) este mismo paso lo activa.
       socket.pendingUser = null;
+      socket.resumedSessionHash = null;
       const setup = !userRecord.twoFactorEnabled;
       if (!userRecord.email) {
         // Cuentas antiguas sin correo: el usuario debe indicar uno antes de recibir el código.
@@ -809,6 +876,7 @@ module.exports = (io, db) => {
         return callback?.({ ok: false, error: 'Código incorrecto' });
       }
       loginCodes.delete(userRecord.username);
+      socket.loginRemember = !!data_?.remember;
 
       if (pending.setup) {
         if (!userRecord.email && emailInUse(pending.email, userRecord.username)) {
@@ -850,6 +918,68 @@ module.exports = (io, db) => {
       finalizeLogin(socket, userRecord, assignedDepartments[0] || null, (res) => {
         callback?.({ ...res, twoFactorActivated: pending.setup });
       });
+    });
+
+    // Reanuda una sesión con el token guardado en el navegador (recarga de página, reapertura del navegador
+    // con "Recordar este equipo", o reconexión tras reiniciar el servidor). No pide contraseña ni código.
+    socket.on('resume-session', async (data_, callback) => {
+      const token = typeof data_?.token === 'string' ? data_.token : '';
+      if (!SESSION_TOKEN_RE.test(token)) return callback?.({ ok: false, expired: true });
+      const tokenHash = hashToken(token);
+
+      let session;
+      try {
+        session = await getSession(tokenHash);
+      } catch (err) {
+        console.error('getSession error:', err);
+        return callback?.({ ok: false, error: 'Error al consultar la base de datos' });
+      }
+      if (!session || session.expiresAt <= Date.now()) {
+        if (session) deleteSession(tokenHash).catch(() => {});
+        return callback?.({ ok: false, expired: true });
+      }
+
+      const userRecord = data.users.find(u => u.username === session.username);
+      if (!userRecord || userRecord.status !== 'active') {
+        deleteSession(tokenHash).catch(() => {});
+        return callback?.({ ok: false, expired: true });
+      }
+
+      for (const [, u] of users) {
+        if (u.username === userRecord.username) {
+          if (u.sessionHash !== tokenHash) {
+            return callback?.({ ok: false, error: 'Ese usuario ya está conectado en otro equipo' });
+          }
+          // Misma sesión abierta en otra pestaña (o la conexión vieja de una recarga): se reemplaza.
+          kickUser(userRecord.username, 'Abriste el chat en otra pestaña o ventana.', { replaced: true });
+          break;
+        }
+      }
+
+      socket.twoFactor = null;
+      socket.resumedSessionHash = tokenHash;
+      socket.resumedSessionRemember = session.remember;
+      const assignedDepartments = userRecord.departments || [];
+      if (session.department && assignedDepartments.includes(session.department)) {
+        return finalizeLogin(socket, userRecord, session.department, callback);
+      }
+      if (assignedDepartments.length > 1) {
+        socket.pendingUser = { username: userRecord.username };
+        return callback?.({ ok: true, username: userRecord.username, requireDepartment: true, departments: departmentOptions(assignedDepartments) });
+      }
+      finalizeLogin(socket, userRecord, assignedDepartments[0] || null, callback);
+    });
+
+    socket.on('logout', async (callback) => {
+      const user = users.get(socket.id);
+      if (user?.sessionHash) {
+        try {
+          await deleteSession(user.sessionHash);
+        } catch (err) {
+          console.error('deleteSession error:', err);
+        }
+      }
+      callback?.({ ok: true });
     });
 
     socket.on('select-department', (data_, callback) => {
@@ -894,6 +1024,9 @@ module.exports = (io, db) => {
       }
       user.department = department;
       socket.department = department;
+      if (user.sessionHash) {
+        updateSessionDepartment(user.sessionHash, department).catch(err => console.error('updateSessionDepartment error:', err));
+      }
       broadcastAllUsers();
       notifyFriendsOfStatusChange(user.username);
 
@@ -1231,6 +1364,8 @@ module.exports = (io, db) => {
         record.password = previousPassword;
         return callback?.({ ok: false, error: 'Error al guardar en la base de datos' });
       }
+      // Cierra las sesiones recordadas en otros equipos; la actual sigue abierta.
+      deleteUserSessions(user.username, user.sessionHash).catch(err => console.error('deleteUserSessions error:', err));
       callback?.({ ok: true });
     });
 
@@ -1691,6 +1826,11 @@ module.exports = (io, db) => {
         console.error('saveUser error:', err);
         return callback?.({ ok: false, error: 'Error al guardar en la base de datos' });
       }
+      try {
+        await revokeUserSessions(target.username, 'Un administrador cambió tu contraseña. Vuelve a ingresar.');
+      } catch (err) {
+        console.error('revokeUserSessions error:', err);
+      }
       callback?.({ ok: true });
     });
 
@@ -1763,10 +1903,26 @@ module.exports = (io, db) => {
 
       if (blocked) {
         loginCodes.delete(username);
-        if (kickUser(username, 'Tu cuenta ha sido bloqueada por un administrador')) {
-          broadcastAllUsers();
-          notifyFriendsOfStatusChange(username);
+        try {
+          await revokeUserSessions(username, 'Tu cuenta ha sido bloqueada por un administrador');
+        } catch (err) {
+          console.error('revokeUserSessions error:', err);
         }
+      }
+      callback?.({ ok: true });
+    });
+
+    socket.on('admin-revoke-sessions', async (data_, callback) => {
+      const user = users.get(socket.id);
+      if (!user || user.role !== 'admin') return callback?.({ ok: false, error: 'No autorizado' });
+      const username = data_?.username;
+      if (!username || !data.users.some(u => u.username === username)) return callback?.({ ok: false, error: 'Usuario no encontrado' });
+      if (username === user.username) return callback?.({ ok: false, error: 'Para cerrar tu propia sesión usa el botón Salir' });
+      try {
+        await revokeUserSessions(username, 'Un administrador cerró tu sesión. Vuelve a ingresar.');
+      } catch (err) {
+        console.error('admin-revoke-sessions error:', err);
+        return callback?.({ ok: false, error: 'Error al guardar en la base de datos' });
       }
       callback?.({ ok: true });
     });

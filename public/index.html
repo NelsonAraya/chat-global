@@ -92,6 +92,10 @@
             <input type="text" id="twofactor-code" placeholder="Código de 6 dígitos" maxlength="6" inputmode="numeric" autocomplete="one-time-code" />
           </div>
           <p id="twofactor-timer" class="create-modal-info"></p>
+          <label class="twofactor-remember">
+            <input type="checkbox" id="twofactor-remember" />
+            Recordar este equipo por 7 días <span class="group-modal-hint">(no lo marques en computadores compartidos)</span>
+          </label>
           <button id="twofactor-verify-btn" class="btn-primary" style="width:100%;margin-top:12px;">
             <i class="fas fa-check"></i> Verificar
           </button>
@@ -801,6 +805,9 @@
           </div>
         </div>
         <div class="admin-edit-delete-section">
+          <button id="admin-edit-sessions-btn" class="btn-secondary" style="width:100%;margin-bottom:8px;">
+            <i class="fas fa-right-from-bracket"></i> Cerrar sus sesiones
+          </button>
           <button id="admin-edit-block-btn" class="btn-secondary" style="width:100%;margin-bottom:8px;">
             <i class="fas fa-ban"></i> Bloquear usuario
           </button>

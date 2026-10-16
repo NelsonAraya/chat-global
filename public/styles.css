@@ -282,6 +282,27 @@ body {
   line-height: 1.5;
 }
 
+.session-replaced {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--bg-body, #f3f4f6);
+  z-index: 2000;
+  padding: 16px;
+}
+
+.twofactor-remember {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 10px;
+  font-size: 13px;
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+
 .btn-link {
   background: none;
   border: none;

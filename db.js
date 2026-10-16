@@ -98,6 +98,20 @@ module.exports = (async () => {
     INDEX idx_group_members_user (username)
   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
 
+  // Sesiones: se guarda solo el hash del token (el token en sí queda únicamente en el navegador).
+  await pool.query(`CREATE TABLE IF NOT EXISTS sessions (
+    token_hash CHAR(64) PRIMARY KEY,
+    username VARCHAR(64) NOT NULL,
+    department VARCHAR(64),
+    remember TINYINT(1) DEFAULT 0,
+    created_at VARCHAR(40),
+    expires_at BIGINT NOT NULL,
+    ip_address VARCHAR(64),
+    user_agent VARCHAR(255),
+    INDEX idx_sessions_user (username),
+    INDEX idx_sessions_expires (expires_at)
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
+
   await pool.query(`CREATE TABLE IF NOT EXISTS departments (
     name VARCHAR(64) PRIMARY KEY,
     display_name VARCHAR(100),
@@ -204,6 +218,7 @@ module.exports = (async () => {
 
   const deleteUser = async (username) => {
     await pool.query('DELETE FROM users WHERE username = ?', [username]);
+    await pool.query('DELETE FROM sessions WHERE username = ?', [username]);
     await pool.query('DELETE FROM friends WHERE requester = ? OR recipient = ?', [username, username]);
   };
 
@@ -302,6 +317,37 @@ module.exports = (async () => {
     await pool.query('DELETE FROM group_members WHERE group_id = ? AND username = ?', [groupId, username]);
   };
 
+  const saveSession = async (s) => {
+    await pool.query(
+      'INSERT INTO sessions (token_hash, username, department, remember, created_at, expires_at, ip_address, user_agent) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+      [s.tokenHash, s.username, s.department || null, s.remember ? 1 : 0, s.created_at, s.expiresAt, s.ip || null, (s.userAgent || '').slice(0, 255) || null]
+    );
+  };
+
+  const getSession = async (tokenHash) => {
+    const [rows] = await pool.query('SELECT * FROM sessions WHERE token_hash = ?', [tokenHash]);
+    const r = rows[0];
+    if (!r) return null;
+    return { tokenHash: r.token_hash, username: r.username, department: r.department, remember: !!r.remember, created_at: r.created_at, expiresAt: Number(r.expires_at) };
+  };
+
+  const updateSessionDepartment = async (tokenHash, department) => {
+    await pool.query('UPDATE sessions SET department = ? WHERE token_hash = ?', [department || null, tokenHash]);
+  };
+
+  const deleteSession = async (tokenHash) => {
+    await pool.query('DELETE FROM sessions WHERE token_hash = ?', [tokenHash]);
+  };
+
+  // Cierra todas las sesiones de un usuario, salvo (opcionalmente) la actual.
+  const deleteUserSessions = async (username, exceptTokenHash) => {
+    await pool.query('DELETE FROM sessions WHERE username = ? AND token_hash <> ?', [username, exceptTokenHash || '']);
+  };
+
+  const deleteExpiredSessions = async () => {
+    await pool.query('DELETE FROM sessions WHERE expires_at < ?', [Date.now()]);
+  };
+
   const saveAlert = async (a) => {
     await pool.query(
       'INSERT INTO alerts (username, display_name, department, department_display_name, location, created_at) VALUES (?, ?, ?, ?, ?, ?)',
@@ -334,6 +380,7 @@ module.exports = (async () => {
     saveConsent,
     saveFriendRequest, updateFriendStatus, deleteFriendRow,
     saveGroup, renameGroup, deleteGroup, saveGroupMember, deleteGroupMember,
+    saveSession, getSession, updateSessionDepartment, deleteSession, deleteUserSessions, deleteExpiredSessions,
     saveAlert, getAlertHistory
   };
 })();

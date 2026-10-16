@@ -228,6 +228,7 @@ Crear, buscar y eliminar departamentos/centros (ver [Departamentos y Centros](#d
   - Cambiar rol (Usuario / Administrador)
   - **Asignar uno o varios departamentos** (checkboxes — un usuario puede pertenecer a más de uno)
   - **Resetear contraseña** (campo opcional — si se deja vacío no se modifica). También quita el bloqueo temporal por intentos fallidos.
+  - **Cerrar sus sesiones:** lo desconecta si está conectado y anula sus sesiones recordadas en todos los equipos (ver [Sesiones](#sesiones)).
   - **Bloquear / desbloquear usuario:** al bloquear, si está conectado se le cierra la sesión al instante y no puede volver a ingresar ("Tu cuenta está bloqueada. Contacta a un administrador.") hasta que se desbloquee. No se borra nada: sus mensajes, amigos y grupos se mantienen.
   - **Eliminar usuario** (botón rojo con confirmación)
 
@@ -295,6 +296,22 @@ Reglas:
 - Botón **"Reenviar código"**, con 30 segundos de espera entre envíos y un máximo de **5 códigos cada 15 minutos** por usuario.
 - Si el usuario recarga la página o repite el login mientras su código sigue vigente, **se reutiliza el mismo código** (no llega un correo nuevo).
 - Los códigos se guardan cifrados y solo en la memoria del servidor (no en la base de datos). Si se reinicia el servidor, hay que pedir uno nuevo.
+
+## Sesiones
+
+Después de ingresar (contraseña + código), el navegador recibe un **token de sesión**. Con él puede recargar la página sin volver a pedir contraseña ni código. **El navegador nunca guarda la contraseña.**
+
+- **Por defecto** la sesión dura mientras la pestaña esté abierta (máximo 12 horas). Al cerrar la pestaña o el navegador, hay que volver a ingresar.
+- **"Recordar este equipo por 7 días"** (casilla en la pantalla del código): la sesión sobrevive a cerrar el navegador. No marcarla en computadores compartidos.
+- Al reanudar, entra directo al último departamento usado.
+- Si se reinicia el servidor o se corta la red, la página se recarga sola al volver la conexión y reingresa con la sesión.
+- Abrir el chat en otra pestaña con la misma sesión desactiva la pestaña anterior (con un botón "Usar el chat aquí"). Una sesión de **otro equipo** no puede entrar mientras el usuario esté conectado.
+- Las sesiones se cierran:
+  - con el botón **Salir**;
+  - al **cambiar la propia contraseña** (se cierran las de otros equipos, la actual sigue);
+  - cuando el admin **resetea la contraseña**, **bloquea** o **elimina** al usuario;
+  - con el botón **"Cerrar sus sesiones"** en Admin → Usuarios → ✏ (útil si alguien perdió o dejó abierto un equipo).
+- En la base de datos (tabla `sessions`) se guarda solo el hash del token, no el token. Las sesiones vencidas se borran solas.
 
 ## Grupos
 
@@ -387,7 +404,7 @@ Cada aceptación de TyC queda registrada en la base de datos con:
 
 ## Persistencia de datos
 
-- **MySQL**: base de datos (ver "Configuración de MySQL" arriba) con las tablas `users`, `rooms`, `messages`, `departments`, `friends`, `alerts`, `consent_log`, `chat_groups` y `group_members`. Las columnas y tablas nuevas (correo y doble factor en `users`, grupos) se agregan solas al iniciar el servidor, sin perder datos. Cada acción (mensaje, reacción, cambio de nombre, etc.) escribe solo la fila que cambió — no se reescribe la base completa en cada operación.
+- **MySQL**: base de datos (ver "Configuración de MySQL" arriba) con las tablas `users`, `rooms`, `messages`, `departments`, `friends`, `alerts`, `consent_log`, `chat_groups`, `group_members` y `sessions`. Las columnas y tablas nuevas (correo y doble factor en `users`, grupos) se agregan solas al iniciar el servidor, sin perder datos. Cada acción (mensaje, reacción, cambio de nombre, etc.) escribe solo la fila que cambió — no se reescribe la base completa en cada operación.
 - Los archivos adjuntos se guardan en `uploads/`
 - El certificado SSL se guarda en `certs/` (se genera automáticamente al iniciar con la IP actual)
 - Si la base de datos está vacía, se crea automáticamente con los datos por defecto (usuario `admin` y sala `general`) al iniciar
