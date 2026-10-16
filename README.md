@@ -51,9 +51,12 @@ Variables disponibles (si no se define alguna, usa el valor por defecto):
 
 Con `.env` configurado, `npm start` ya levanta el servidor conectado a esa base — no hace falta pasar nada por línea de comandos.
 
-## Correo del Botón de Alerta
+## Correo (códigos de acceso y Botón de Alerta)
 
-Cuando alguien activa el botón de alerta, además de la notificación en pantalla, el sistema puede mandar un correo. Es opcional — si no se configura, el botón sigue funcionando igual, solo que sin correo.
+El correo se usa para dos cosas:
+
+- **Código de acceso del doble factor** (ver [Doble factor](#doble-factor-código-por-correo)). **Es necesario configurarlo** para que los usuarios reciban su código al iniciar sesión. Si el SMTP no está configurado o falla, el código se muestra en la consola del servidor para que un administrador se lo entregue al usuario.
+- **Botón de alerta:** además de la notificación en pantalla, se manda un correo. Si no se configura `ALERT_EMAIL_TO`, el botón sigue funcionando igual, solo que sin correo.
 
 Se configura en el mismo archivo `.env`:
 
@@ -63,7 +66,7 @@ Se configura en el mismo archivo `.env`:
 | `SMTP_PORT` | Puerto SMTP (`587` por defecto) |
 | `SMTP_SECURE` | `true` si el puerto usa SSL directo (normalmente el 465); `false` para STARTTLS (normalmente el 587) |
 | `SMTP_USER` / `SMTP_PASSWORD` | Credenciales de la cuenta que envía. **Con Gmail y verificación en 2 pasos necesitas una "contraseña de aplicación"**, no la contraseña normal de la cuenta |
-| `ALERT_EMAIL_FROM` | Remitente que se ve en el correo (si se deja vacío, usa `SMTP_USER`) |
+| `ALERT_EMAIL_FROM` | Remitente que se ve en los correos (alerta y códigos de acceso). Si se deja vacío, usa `SMTP_USER` |
 | `ALERT_EMAIL_TO` | Quién(es) reciben la alerta — se puede poner más de un correo separado por comas |
 
 ### Migrar desde una instalación anterior (SQLite)
@@ -142,9 +145,9 @@ Al iniciar el servidor por primera vez se crea automáticamente:
 - **Contraseña:** `admin`
 - **Rol:** Administrador
 
-Cambia la contraseña del admin después del primer ingreso. Usa el panel Admin (ícono ⚙ en la barra lateral) para crear departamentos, aprobar usuarios nuevos y gestionar salas.
+**Cambia la contraseña del admin inmediatamente después del primer ingreso.** En ese primer ingreso se te pedirá un correo y te llegará un código para activar el doble factor (ver [Doble factor](#doble-factor-código-por-correo)). Usa el panel Admin (ícono ⚙ en la barra lateral) para crear departamentos, aprobar usuarios nuevos y gestionar salas.
 
-> **Importante:** cualquier persona puede crear una cuenta desde "Crear cuenta" (solo pide usuario y contraseña), pero **no puede entrar al chat hasta que un administrador la apruebe** desde el panel Admin → Usuarios. Ver [Aprobación de cuentas nuevas](#aprobación-de-cuentas-nuevas).
+> **Importante:** cualquier persona puede crear una cuenta desde "Crear cuenta" (pide usuario, correo y contraseña), pero **no puede entrar al chat hasta que un administrador la apruebe** desde el panel Admin → Usuarios. Ver [Aprobación de cuentas nuevas](#aprobación-de-cuentas-nuevas).
 
 ## Puertos personalizados
 
@@ -218,14 +221,16 @@ Crear, buscar y eliminar departamentos/centros (ver [Departamentos y Centros](#d
 ### Usuarios
 
 - **Solicitudes de registro pendientes:** aparece arriba de todo si hay cuentas nuevas esperando aprobación, con botones para aceptar ✓ o rechazar ✗ cada una (ver [Aprobación de cuentas nuevas](#aprobación-de-cuentas-nuevas)).
-- **Lista de usuarios:** buscador por nombre, y al hacer clic en ✏ junto a un usuario se abre un modal para:
+- **Lista de usuarios:** buscador por nombre; cada usuario muestra su correo y si tiene el doble factor activo o pendiente (y la etiqueta "Bloqueado" si corresponde). Al hacer clic en ✏ junto a un usuario se abre un modal para:
   - Cambiar nombre visible
+  - **Cambiar el correo** del doble factor (si se cambia, el usuario debe verificar el nuevo correo con un código en su próximo ingreso)
   - Cambiar rol (Usuario / Administrador)
   - **Asignar uno o varios departamentos** (checkboxes — un usuario puede pertenecer a más de uno)
-  - **Resetear contraseña** (campo opcional — si se deja vacío no se modifica)
+  - **Resetear contraseña** (campo opcional — si se deja vacío no se modifica). También quita el bloqueo temporal por intentos fallidos.
+  - **Bloquear / desbloquear usuario:** al bloquear, si está conectado se le cierra la sesión al instante y no puede volver a ingresar ("Tu cuenta está bloqueada. Contacta a un administrador.") hasta que se desbloquee. No se borra nada: sus mensajes, amigos y grupos se mantienen.
   - **Eliminar usuario** (botón rojo con confirmación)
 
-> Reglas de seguridad: un admin no puede eliminarse a sí mismo, no puede eliminar al usuario `admin`, y no puede cambiar su propia contraseña desde este panel (debe usar el modal de cambio de contraseña normal).
+> Reglas de seguridad: un admin no puede eliminarse ni bloquearse a sí mismo, no puede eliminar ni bloquear al usuario `admin`, y no puede cambiar su propia contraseña desde este panel (debe usar el modal de cambio de contraseña normal).
 
 ### Salas
 
@@ -243,11 +248,11 @@ Historial completo de activaciones del botón de pánico, del más reciente al m
 
 Desde que se agregó este flujo, **crear una cuenta ya no da acceso inmediato al chat**:
 
-1. Cualquiera puede registrarse desde "Crear cuenta" — solo pide usuario y contraseña (el departamento ya no se elige en el registro).
+1. Cualquiera puede registrarse desde "Crear cuenta" — pide usuario, **correo** y contraseña (el departamento ya no se elige en el registro). El correo no puede estar usado por otra cuenta.
 2. La cuenta queda en estado **pendiente**. Si intenta entrar antes de ser aprobada, ve el mensaje "Tu cuenta está pendiente de aprobación por un administrador."
 3. Si hay un administrador conectado en ese momento, le llega una notificación en vivo (sonido + aviso) y un contador en el ícono de Admin.
-4. El administrador entra a **Admin → Usuarios** y acepta ✓ o rechaza ✗ la solicitud.
-   - **Aceptada:** el usuario ya puede entrar al chat. El admin le asigna su(s) departamento(s) desde el mismo panel (editar usuario → checkboxes de departamentos).
+4. El administrador entra a **Admin → Usuarios**, **revisa el correo con que se registró** (se muestra en la solicitud) y acepta ✓ o rechaza ✗.
+   - **Aceptada:** el usuario ya puede entrar al chat. En su primer ingreso activa el doble factor con un código enviado a ese correo. El admin le asigna su(s) departamento(s) desde el mismo panel (editar usuario → checkboxes de departamentos).
    - **Rechazada:** el usuario no puede entrar ("Tu solicitud de cuenta fue rechazada. Contacta a un administrador."). La cuenta queda marcada como rechazada (no se borra sola); el admin puede eliminarla del todo si quiere.
 
 Las cuentas que ya existían antes de este cambio no se vieron afectadas — quedaron activas automáticamente.
@@ -274,16 +279,68 @@ Pensado para mantener contacto directo con alguien de otro departamento al que n
 - La lista de amigos muestra, para cada uno, si está conectado (con su departamento activo) o desconectado — todo en tiempo real.
 - Click en un amigo abre el chat privado directo con él. También se puede quitar a alguien de la lista cuando se quiera.
 
+## Doble factor (código por correo)
+
+Además de la contraseña, para entrar se pide un **código temporal de 6 dígitos** enviado al correo de la cuenta.
+
+1. El usuario ingresa usuario y contraseña.
+2. Le llega un correo "Tu código de acceso al Chat CORMUDESI" con el código (el código va solo en el cuerpo, no en el asunto).
+3. Lo ingresa en la pantalla de verificación. En pantalla se ve la cuenta regresiva.
+
+Reglas:
+
+- **Primer ingreso = activación:** la primera vez, el mismo paso verifica el correo y deja el doble factor activo. Las cuentas antiguas que no tienen correo deben indicar uno en ese momento.
+- El código **vence a los 5 minutos** y se anula tras **5 intentos incorrectos**.
+- Botón **"Reenviar código"**, con 30 segundos de espera entre envíos y un máximo de **5 códigos cada 15 minutos** por usuario.
+- Si el usuario recarga la página o repite el login mientras su código sigue vigente, **se reutiliza el mismo código** (no llega un correo nuevo).
+- Los códigos se guardan cifrados y solo en la memoria del servidor (no en la base de datos). Si se reinicia el servidor, hay que pedir uno nuevo.
+
+## Grupos
+
+Conversaciones privadas entre varias personas elegidas — a diferencia de las salas (abiertas a todo un departamento) y de los privados (1 a 1).
+
+- Pestaña **Grupos** en la barra lateral, con contador de mensajes no leídos + invitaciones pendientes.
+- **Cualquier usuario puede crear un grupo:** botón "Crear grupo" → nombre + buscar personas por usuario o nombre.
+- **Las personas invitadas deben aceptar:** la invitación aparece arriba en la pestaña Grupos con ✓ (unirse) / ✗ (rechazar). Mientras no acepte, no ve ni puede escribir nada del grupo. Solo se puede invitar a usuarios activos.
+- Dentro del grupo funciona todo lo del chat: archivos, audio, responder, reacciones e historial paginado. A la derecha se ven los miembros (clic en uno → chat privado).
+- Botón **"Miembros"** en la barra superior del grupo para administrarlo.
+
+| | Creador | Admin del grupo | Miembro |
+|---|---|---|---|
+| Escribir y leer | ✓ | ✓ | ✓ |
+| Invitar, renombrar el grupo | ✓ | ✓ | – |
+| Quitar miembros | ✓ (a cualquiera) | solo miembros normales | – |
+| Nombrar / quitar admins del grupo | ✓ | – | – |
+| Eliminar el grupo (borra todos sus mensajes) | ✓ | – | – |
+| Salir del grupo | ✓ | ✓ | ✓ |
+
+- Si el creador sale, el grupo pasa a un admin del grupo (o al miembro más antiguo). Si sale el último miembro, el grupo se elimina.
+- Si se elimina una cuenta de usuario, sale automáticamente de todos sus grupos.
+
+## Seguridad
+
+- **Contraseñas** guardadas con **scrypt con sal** (archivo `passwords.js`). Las contraseñas del formato anterior (SHA-256 sin sal) siguen funcionando y se convierten solas al formato nuevo la próxima vez que esa persona inicia sesión (lo mismo para las salas con contraseña).
+- **Límite de intentos:**
+  - 5 contraseñas incorrectas seguidas bloquean esa cuenta por 15 minutos.
+  - 20 intentos fallidos desde un mismo equipo (IP) bloquean ese equipo por 15 minutos.
+  - 10 contraseñas de sala incorrectas desde un mismo equipo lo bloquean 15 minutos.
+  - Cambiar la propia contraseña también queda limitado a 5 intentos fallidos.
+  - El login responde siempre "Usuario o contraseña incorrectos", sin revelar qué usuarios existen.
+  - Los bloqueos viven en memoria: reiniciar el servidor los borra. El admin puede desbloquear antes a alguien poniéndole una contraseña nueva.
+- **Contenido de los mensajes:** el servidor solo acepta archivos subidos a este mismo servidor (`/uploads/...`) y valida respuestas, avatares y largo del texto. La interfaz escapa todo lo que escriben los usuarios (incluidas comillas) antes de mostrarlo.
+- **Archivos subidos:** se sirven aislados (`Content-Security-Policy: sandbox`, `nosniff`) para que un `.html` o `.svg` no pueda ejecutar código en el sitio. Solo imágenes, audio, video y PDF se abren en el navegador; el resto se descarga.
+
 ## Notificaciones no leídas
 
 - Cada sala muestra un badge 🔴 con la cantidad de mensajes no leídos
 - La pestaña **Salas** suma todos los no leídos en un badge general
 - Al hacer clic en una sala o al volver a la pestaña del navegador, los contadores se reinician
 - Los mensajes privados también muestran badge 🔴 en la pestaña **Privados**
+- Los grupos muestran badge 🔴 por grupo y en la pestaña **Grupos** (que además suma las invitaciones pendientes)
 
 ## Historial de mensajes
 
-Al entrar a una sala o abrir un privado se cargan solo los últimos 50 mensajes (no la conversación completa). Al subir el scroll hasta el tope se piden automáticamente los 50 anteriores, manteniendo la posición sin saltar — igual que WhatsApp o Slack. Cuando llegas al principio real de la conversación aparece el aviso "Inicio de la conversación". Esto evita que una sala con mucho historial sea lenta de cargar.
+Al entrar a una sala, abrir un privado o abrir un grupo se cargan solo los últimos 50 mensajes (no la conversación completa). Al subir el scroll hasta el tope se piden automáticamente los 50 anteriores, manteniendo la posición sin saltar — igual que WhatsApp o Slack. Cuando llegas al principio real de la conversación aparece el aviso "Inicio de la conversación". Esto evita que una sala con mucho historial sea lenta de cargar.
 
 ## Cumplimiento Legal (Chile)
 
@@ -329,7 +386,7 @@ Cada aceptación de TyC queda registrada en la base de datos con:
 
 ## Persistencia de datos
 
-- **MySQL**: base de datos (ver "Configuración de MySQL" arriba) con las tablas `users`, `rooms`, `messages`, `departments`, `friends`, `alerts` y `consent_log`. Cada acción (mensaje, reacción, cambio de nombre, etc.) escribe solo la fila que cambió — no se reescribe la base completa en cada operación.
+- **MySQL**: base de datos (ver "Configuración de MySQL" arriba) con las tablas `users`, `rooms`, `messages`, `departments`, `friends`, `alerts`, `consent_log`, `chat_groups` y `group_members`. Las columnas y tablas nuevas (correo y doble factor en `users`, grupos) se agregan solas al iniciar el servidor, sin perder datos. Cada acción (mensaje, reacción, cambio de nombre, etc.) escribe solo la fila que cambió — no se reescribe la base completa en cada operación.
 - Los archivos adjuntos se guardan en `uploads/`
 - El certificado SSL se guarda en `certs/` (se genera automáticamente al iniciar con la IP actual)
 - Si la base de datos está vacía, se crea automáticamente con los datos por defecto (usuario `admin` y sala `general`) al iniciar
@@ -339,9 +396,10 @@ Cada aceptación de TyC queda registrada en la base de datos con:
 ```
 chat-cormudesi/
 ├── index.js              # Servidor (HTTP redirige a HTTPS)
-├── db.js                 # Persistencia MySQL (mysql2) + hash de contraseñas
-├── socket-handler.js     # Eventos de Socket.IO
-├── mailer.js             # Envío de correo para el botón de alerta (nodemailer)
+├── db.js                 # Persistencia MySQL (mysql2)
+├── passwords.js          # Hash y verificación de contraseñas (scrypt con sal)
+├── socket-handler.js     # Eventos de Socket.IO (login + doble factor, salas, privados, grupos, admin)
+├── mailer.js             # Envío de correo: códigos de acceso y botón de alerta (nodemailer)
 ├── migrate-to-mysql.js   # Migración única desde una instalación anterior con SQLite
 ├── .env                  # Configuración de MySQL y correo (no se sube a git)
 ├── .env.example          # Plantilla de .env

@@ -7,6 +7,11 @@ let currentAvatar = null;
 let currentLocation = '';
 let currentRoom = null;
 let privateRecipient = null;
+let currentGroup = null; // id del grupo abierto
+let groups = [];
+let groupInvitations = [];
+let groupUnreadCounts = {};
+let lastRoomUsers = [];
 let rooms = [];
 let conversations = [];
 let unreadCounts = {};
@@ -40,6 +45,7 @@ const loginBtn = $('login-btn');
 const loginError = $('login-error');
 
 const registerUsername = $('register-username');
+const registerEmail = $('register-email');
 const registerPassword = $('register-password');
 const registerConfirm = $('register-confirm');
 const registerBtn = $('register-btn');
@@ -100,6 +106,7 @@ const createDeptClose = $('create-dept-modal-close');
 const adminEditOverlay = $('admin-edit-user-overlay');
 const adminEditUsernameDisplay = $('admin-edit-username-display');
 const adminEditDisplayname = $('admin-edit-displayname');
+const adminEditEmail = $('admin-edit-email');
 const adminEditRole = $('admin-edit-role');
 const adminEditDepartments = $('admin-edit-departments');
 const adminEditError = $('admin-edit-error');
@@ -109,6 +116,7 @@ const adminEditClose = $('admin-edit-user-close');
 const adminEditPassword = $('admin-edit-password');
 const adminEditPasswordConfirm = $('admin-edit-password-confirm');
 const adminEditDeleteBtn = $('admin-edit-delete-btn');
+const adminEditBlockBtn = $('admin-edit-block-btn');
 const adminStats = $('admin-stats');
 const adminStatUsers = $('admin-stat-users');
 const adminStatOnline = $('admin-stat-online');
@@ -210,10 +218,16 @@ const departmentSelectClose = $('department-select-close');
 var panicAudio = new Audio('/sounds/alerta.mp3');
 panicAudio.preload = 'auto';
 
+// Escapa también comillas: el resultado se usa tanto en texto como dentro de atributos HTML.
 function escapeHtml(text) {
-  const div = document.createElement('div');
-  div.textContent = text;
-  return div.innerHTML;
+  return String(text === null || text === undefined ? '' : text).replace(/[&<>"']/g, function(c) {
+    return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+  });
+}
+
+// Solo se muestran archivos subidos a este servidor; cualquier otra URL (p. ej. "javascript:") se descarta.
+function safeUploadUrl(url) {
+  return typeof url === 'string' && /^\/uploads\/[A-Za-z0-9._-]+$/.test(url) ? url : null;
 }
 
 function formatTime(isoString) {
@@ -490,6 +504,9 @@ function startRecording() {
             payload.recipient = privateRecipient;
             socket.emit('private-message', payload);
             setTimeout(loadConversations, 100);
+          } else if (currentGroup) {
+            payload.groupId = currentGroup;
+            socket.emit('group-message', payload);
           } else if (currentRoom) {
             socket.emit('room-message', payload);
           }
@@ -632,21 +649,34 @@ function doLogin(username, password, callback) {
       return;
     }
 
-    if (res.requireDepartment) {
-      openDepartmentSelect('login', res.departments, function(dept, onError) {
-        socket.emit('select-department', { department: dept }, function(res2) {
-          if (!res2.ok) { onError(res2.error); return; }
-          completeLogin(username, res2, { password: password });
-          closeDepartmentSelect();
-          callback?.({ ok: true });
-        });
-      });
-      return;
-    }
-
-    completeLogin(username, res, { password: password });
-    callback?.({ ok: true });
+    continueLogin(username, res, { password: password }, callback);
   });
+}
+
+// Sigue el ingreso después de que el servidor aceptó la contraseña: código por correo
+// (doble factor), selección de departamento si tiene varios y, por último, entrar al chat.
+function continueLogin(username, res, opts, callback) {
+  if (res.requireTwoFactor) {
+    openTwoFactor(username, res, opts, callback);
+    return;
+  }
+
+  if (res.requireDepartment) {
+    openDepartmentSelect('login', res.departments, function(dept, onError) {
+      socket.emit('select-department', { department: dept }, function(res2) {
+        if (!res2.ok) { onError(res2.error); return; }
+        completeLogin(username, res2, opts);
+        closeDepartmentSelect();
+        if (res.twoFactorActivated) showToast('Doble factor activado');
+        callback?.({ ok: true });
+      });
+    });
+    return;
+  }
+
+  completeLogin(username, res, opts);
+  if (res.twoFactorActivated) showToast('Doble factor activado');
+  callback?.({ ok: true });
 }
 
 function tryAutoLogin() {
@@ -656,34 +686,157 @@ function tryAutoLogin() {
     loginBtn.disabled = true;
     loginBtn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Conectando...';
     socket.emit('login', { username: savedUser, password: savedPass }, (res) => {
+      loginBtn.disabled = false;
+      loginBtn.innerHTML = '<i class="fas fa-arrow-right"></i> Ingresar';
       if (!res.ok) {
         localStorage.removeItem('chat_user');
         localStorage.removeItem('chat_pass');
-        loginBtn.disabled = false;
-        loginBtn.innerHTML = '<i class="fas fa-arrow-right"></i> Ingresar';
         loginUsername.focus();
         return;
       }
 
-      if (res.requireDepartment) {
-        loginBtn.disabled = false;
-        loginBtn.innerHTML = '<i class="fas fa-arrow-right"></i> Ingresar';
-        openDepartmentSelect('login', res.departments, function(dept, onError) {
-          socket.emit('select-department', { department: dept }, function(res2) {
-            if (!res2.ok) { onError(res2.error); return; }
-            completeLogin(savedUser, res2);
-            closeDepartmentSelect();
-          });
-        });
-        return;
-      }
-
-      completeLogin(savedUser, res);
+      continueLogin(savedUser, res, {}, function(r) {
+        if (!r.ok) loginError.textContent = r.error;
+      });
     });
     return true;
   }
   return false;
 }
+
+// ===================== DOBLE FACTOR (código por correo) =====================
+
+const twofactorIntro = $('twofactor-intro');
+const twofactorEmailStep = $('twofactor-email-step');
+const twofactorEmail = $('twofactor-email');
+const twofactorEmailBtn = $('twofactor-email-btn');
+const twofactorCodeStep = $('twofactor-code-step');
+const twofactorCode = $('twofactor-code');
+const twofactorTimer = $('twofactor-timer');
+const twofactorVerifyBtn = $('twofactor-verify-btn');
+const twofactorResendBtn = $('twofactor-resend-btn');
+const twofactorCancelBtn = $('twofactor-cancel-btn');
+
+let twoFactorState = null; // { username, opts, callback, setup }
+let twoFactorInterval = null;
+
+function showLoginBox(formId) {
+  document.querySelectorAll('.login-form-box').forEach(f => f.classList.add('hidden'));
+  $(formId).classList.remove('hidden');
+  document.querySelector('.login-tabs').classList.toggle('hidden', formId === 'twofactor-form');
+}
+
+function openTwoFactor(username, res, opts, callback) {
+  twoFactorState = { username: username, opts: opts, callback: callback, setup: !!res.setup };
+  loginError.textContent = '';
+  showLoginBox('twofactor-form');
+  if (res.needEmail) {
+    twofactorIntro.textContent = 'Para proteger tu cuenta debes activar el doble factor. Indica tu correo y te enviaremos un código para verificarlo.';
+    twofactorEmail.value = '';
+    twofactorEmailStep.classList.remove('hidden');
+    twofactorCodeStep.classList.add('hidden');
+    twofactorEmail.focus();
+  } else {
+    showTwoFactorCodeStep(res);
+  }
+}
+
+function showTwoFactorCodeStep(res) {
+  twofactorIntro.textContent = twoFactorState.setup
+    ? 'Primer ingreso: debes activar el doble factor. Enviamos un código a ' + res.maskedEmail + '. Ingrésalo para verificar tu correo.'
+    : (res.reused
+      ? 'Ya te enviamos un código a ' + res.maskedEmail + ' y sigue vigente. Ingrésalo para continuar.'
+      : 'Enviamos un código de acceso a ' + res.maskedEmail + '. Ingrésalo para continuar.');
+  twofactorEmailStep.classList.add('hidden');
+  twofactorCodeStep.classList.remove('hidden');
+  twofactorCode.value = '';
+  twofactorCode.focus();
+  startTwoFactorTimer((res.expiresInSeconds || 300) * 1000);
+}
+
+function startTwoFactorTimer(ms) {
+  clearInterval(twoFactorInterval);
+  var expiresAt = Date.now() + ms;
+  function tick() {
+    var left = Math.max(0, Math.round((expiresAt - Date.now()) / 1000));
+    if (left === 0) {
+      twofactorTimer.innerHTML = '<i class="fas fa-clock"></i> El código venció. Pide uno nuevo.';
+      clearInterval(twoFactorInterval);
+      return;
+    }
+    var m = Math.floor(left / 60);
+    var s = left % 60;
+    twofactorTimer.innerHTML = '<i class="fas fa-clock"></i> El código vence en ' + m + ':' + (s < 10 ? '0' : '') + s;
+  }
+  tick();
+  twoFactorInterval = setInterval(tick, 1000);
+}
+
+function closeTwoFactor() {
+  clearInterval(twoFactorInterval);
+  twoFactorState = null;
+  twofactorVerifyBtn.disabled = false;
+  twofactorVerifyBtn.innerHTML = '<i class="fas fa-check"></i> Verificar';
+  document.querySelectorAll('.login-tab').forEach(t => t.classList.toggle('active', t.dataset.form === 'login'));
+  showLoginBox('login-form');
+}
+
+twofactorEmailBtn.addEventListener('click', function() {
+  var email = twofactorEmail.value.trim();
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) { loginError.textContent = 'Ingresa un correo válido'; return; }
+  twofactorEmailBtn.disabled = true;
+  socket.emit('two-factor-set-email', { email: email }, function(res) {
+    twofactorEmailBtn.disabled = false;
+    if (!res.ok) { loginError.textContent = res.error; return; }
+    loginError.textContent = '';
+    showTwoFactorCodeStep(res);
+  });
+});
+
+twofactorEmail.addEventListener('keydown', function(e) {
+  if (e.key === 'Enter') twofactorEmailBtn.click();
+});
+
+twofactorVerifyBtn.addEventListener('click', function() {
+  if (!twoFactorState) return;
+  var code = twofactorCode.value.trim();
+  if (!/^\d{6}$/.test(code)) { loginError.textContent = 'El código tiene 6 dígitos'; return; }
+  twofactorVerifyBtn.disabled = true;
+  twofactorVerifyBtn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Verificando...';
+  socket.emit('two-factor-verify', { code: code }, function(res) {
+    twofactorVerifyBtn.disabled = false;
+    twofactorVerifyBtn.innerHTML = '<i class="fas fa-check"></i> Verificar';
+    if (!res.ok) {
+      if (res.restart) closeTwoFactor();
+      loginError.textContent = res.error;
+      return;
+    }
+    var state = twoFactorState;
+    closeTwoFactor();
+    loginError.textContent = '';
+    continueLogin(state.username, res, state.opts, state.callback);
+  });
+});
+
+twofactorCode.addEventListener('keydown', function(e) {
+  if (e.key === 'Enter') twofactorVerifyBtn.click();
+});
+
+twofactorResendBtn.addEventListener('click', function() {
+  twofactorResendBtn.disabled = true;
+  socket.emit('two-factor-resend', function(res) {
+    twofactorResendBtn.disabled = false;
+    if (!res.ok) { loginError.textContent = res.error; return; }
+    loginError.textContent = '';
+    showTwoFactorCodeStep(res);
+    showToast('Código reenviado');
+  });
+});
+
+twofactorCancelBtn.addEventListener('click', function() {
+  closeTwoFactor();
+  loginError.textContent = '';
+});
 
 loginUsername.addEventListener('keydown', (e) => {
   if (e.key === 'Enter') loginPassword.focus();
@@ -703,6 +856,9 @@ loginBtn.addEventListener('click', () => {
 });
 
 registerUsername.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') registerEmail.focus();
+});
+registerEmail.addEventListener('keydown', (e) => {
   if (e.key === 'Enter') registerPassword.focus();
 });
 registerPassword.addEventListener('keydown', (e) => {
@@ -749,6 +905,7 @@ termsAcceptBtn.addEventListener('click', function() {
   if (!pendingRegistration) return;
   const regUsername = pendingRegistration.username;
   const regPassword = pendingRegistration.password;
+  const regEmail = pendingRegistration.email;
 
   termsAcceptBtn.disabled = true;
   termsAcceptBtn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Registrando...';
@@ -756,6 +913,7 @@ termsAcceptBtn.addEventListener('click', function() {
   socket.emit('register', {
     username: regUsername,
     password: regPassword,
+    email: regEmail,
     terms_version: TERMS_VERSION
   }, (res) => {
     termsAcceptBtn.disabled = false;
@@ -769,6 +927,7 @@ termsAcceptBtn.addEventListener('click', function() {
 
     closeTermsModal();
     registerUsername.value = '';
+    registerEmail.value = '';
     registerPassword.value = '';
     registerConfirm.value = '';
     document.querySelectorAll('.login-tab').forEach(t => t.classList.remove('active'));
@@ -783,14 +942,16 @@ termsAcceptBtn.addEventListener('click', function() {
 
 registerBtn.addEventListener('click', () => {
   const username = registerUsername.value.trim();
+  const email = registerEmail.value.trim();
   const password = registerPassword.value;
   const confirm = registerConfirm.value;
 
   if (!username) { loginError.textContent = 'Ingresa un usuario'; return; }
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) { loginError.textContent = 'Ingresa un correo válido'; return; }
   if (!password || password.length < 3) { loginError.textContent = 'Minimo 3 caracteres'; return; }
   if (password !== confirm) { loginError.textContent = 'No coinciden'; return; }
 
-  pendingRegistration = { username, password };
+  pendingRegistration = { username, email, password };
   registerBtn.disabled = true;
   registerBtn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Verificando...';
   loginError.textContent = '';
@@ -1129,6 +1290,7 @@ function loadConversations() {
 function initializeChat() {
   renderRooms();
   loadConversations();
+  loadGroups();
   loadFriendRequests();
   if (currentRole === 'admin') loadPendingRegistrations();
   socket.emit('get-all-users', function(users) {
@@ -1178,6 +1340,7 @@ document.querySelectorAll('.sidebar-tab').forEach(tab => {
         loadFriends();
         loadFriendRequests();
       }
+      if (sidebarTab === 'groups') loadGroups();
     }
   });
 });
@@ -1219,7 +1382,7 @@ function renderRooms() {
   roomsList.querySelectorAll('.room-item').forEach(function(el) {
     el.addEventListener('click', function() {
       var room = el.dataset.room;
-      if (room !== currentRoom || privateRecipient) {
+      if (room !== currentRoom || privateRecipient || currentGroup) {
         cancelPrivate();
         joinRoom({ name: room });
       }
@@ -1272,6 +1435,7 @@ function renderPendingRegistrations() {
       '<div class="friend-info">' +
         '<div class="friend-name">' + escapeHtml(r.displayName || r.username) + '</div>' +
         '<div class="admin-user-username">@' + escapeHtml(r.username) + '</div>' +
+        '<div class="admin-user-username"><i class="fas fa-envelope"></i> ' + escapeHtml(r.email || 'Sin correo') + '</div>' +
       '</div>' +
       '<div class="friend-request-actions">' +
         '<button class="friend-request-accept" title="Aceptar"><i class="fas fa-check"></i></button>' +
@@ -1421,13 +1585,17 @@ function renderAdminPanel() {
   socket.emit('get-all-registered-users', function(users) {
     adminUsersList.innerHTML = users.filter(function(u) { return u.status !== 'pending'; }).map(function(u) {
       var isAdmin = u.role === 'admin';
-      var statusHtml = u.status === 'rejected' ? ' <span class="admin-user-role admin-status-rejected">Rechazado</span>' : '';
+      var statusHtml = u.status === 'rejected' ? ' <span class="admin-user-role admin-status-rejected">Rechazado</span>'
+        : u.status === 'blocked' ? ' <span class="admin-user-role admin-status-rejected">Bloqueado</span>' : '';
+      var emailHtml = '<div class="admin-user-username"><i class="fas fa-envelope"></i> ' + escapeHtml(u.email || 'Sin correo') +
+        (u.twoFactorEnabled ? ' <span class="admin-user-role">2FA activo</span>' : ' <span class="admin-user-role">2FA pendiente</span>') + '</div>';
       return '<div class="admin-user-item">' +
         '<div class="admin-user-info">' +
           '<div class="admin-user-name">' + escapeHtml(u.displayName || u.username) + '</div>' +
           '<div class="admin-user-username">@' + escapeHtml(u.username) + '  <span class="admin-user-role' + (isAdmin ? ' admin-role-badge' : '') + '">' + (isAdmin ? 'Admin' : 'User') + '</span> <span class="admin-user-role">' + escapeHtml(userDepartmentsLabel(u.departments)) + '</span>' + statusHtml + '</div>' +
+          emailHtml +
         '</div>' +
-        '<button class="admin-user-edit-btn btn-icon" data-username="' + escapeHtml(u.username) + '" data-displayname="' + escapeHtml(u.displayName || u.username) + '" data-role="' + u.role + '" data-departments="' + escapeHtml((u.departments || []).join(',')) + '" title="Editar usuario"><i class="fas fa-pen"></i></button>' +
+        '<button class="admin-user-edit-btn btn-icon" data-username="' + escapeHtml(u.username) + '" data-displayname="' + escapeHtml(u.displayName || u.username) + '" data-role="' + u.role + '" data-departments="' + escapeHtml((u.departments || []).join(',')) + '" data-email="' + escapeHtml(u.email || '') + '" data-status="' + escapeHtml(u.status || 'active') + '" title="Editar usuario"><i class="fas fa-pen"></i></button>' +
       '</div>';
     }).join('');
 
@@ -1435,6 +1603,7 @@ function renderAdminPanel() {
       btn.addEventListener('click', function() {
         adminEditUsernameDisplay.textContent = btn.dataset.username;
         adminEditDisplayname.value = btn.dataset.displayname;
+        adminEditEmail.value = btn.dataset.email || '';
         adminEditRole.value = btn.dataset.role;
         var selectedDepts = btn.dataset.departments ? btn.dataset.departments.split(',') : [];
         renderDepartmentCheckboxes(adminEditDepartments, selectedDepts);
@@ -1442,6 +1611,7 @@ function renderAdminPanel() {
         adminEditPasswordConfirm.value = '';
         adminEditDeleteBtn.disabled = false;
         adminEditDeleteBtn.innerHTML = '<i class="fas fa-trash"></i> Eliminar usuario';
+        setAdminEditBlockButton(btn.dataset.status);
         adminEditError.textContent = '';
         adminEditOverlay.classList.remove('hidden');
         adminEditDisplayname.focus();
@@ -1520,6 +1690,7 @@ function joinRoom(data) {
 
     currentRoom = name;
     privateRecipient = null;
+    exitGroupMode();
     roomUnreadCounts[name] = 0;
     contextName.textContent = name;
     if (res.hasPassword) contextIcon.className = 'fas fa-lock';
@@ -1614,12 +1785,14 @@ createModalConfirm.addEventListener('click', function() {
 adminEditConfirm.addEventListener('click', function() {
   var username = adminEditUsernameDisplay.textContent;
   var displayName = adminEditDisplayname.value.trim();
+  var email = adminEditEmail.value.trim();
   var role = adminEditRole.value;
   var departments = Array.from(adminEditDepartments.querySelectorAll('input[type="checkbox"]:checked')).map(function(cb) { return cb.value; });
   var newPassword = adminEditPassword.value;
   var newPasswordConfirm = adminEditPasswordConfirm.value;
 
   if (!displayName) { adminEditError.textContent = 'Nombre requerido'; return; }
+  if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) { adminEditError.textContent = 'Correo no válido'; return; }
 
   if (newPassword || newPasswordConfirm) {
     if (newPassword.length < 3) { adminEditError.textContent = 'Contraseña: mínimo 3 caracteres'; return; }
@@ -1629,7 +1802,7 @@ adminEditConfirm.addEventListener('click', function() {
   adminEditConfirm.disabled = true;
   adminEditConfirm.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Guardando...';
 
-  socket.emit('update-user', { username, displayName, role, departments }, function(res) {
+  socket.emit('update-user', { username, displayName, email, role, departments }, function(res) {
     if (!res.ok) {
       adminEditConfirm.disabled = false;
       adminEditConfirm.innerHTML = '<i class="fas fa-save"></i> Guardar';
@@ -1687,6 +1860,36 @@ adminEditDeleteBtn.addEventListener('click', function() {
     if (!res.ok) { adminEditError.textContent = res.error; return; }
     showToast('Usuario ' + username + ' eliminado');
     adminEditOverlay.classList.add('hidden');
+    renderAdminPanel();
+  });
+});
+
+// Solo las cuentas activas se pueden bloquear; las bloqueadas muestran "Desbloquear".
+function setAdminEditBlockButton(status) {
+  adminEditBlockBtn.dataset.status = status || 'active';
+  adminEditBlockBtn.disabled = false;
+  adminEditBlockBtn.classList.toggle('hidden', status !== 'active' && status !== 'blocked');
+  adminEditBlockBtn.innerHTML = status === 'blocked'
+    ? '<i class="fas fa-unlock"></i> Desbloquear usuario'
+    : '<i class="fas fa-ban"></i> Bloquear usuario';
+}
+
+adminEditBlockBtn.addEventListener('click', function() {
+  var username = adminEditUsernameDisplay.textContent;
+  var block = adminEditBlockBtn.dataset.status !== 'blocked';
+  if (block && !confirm('¿Bloquear al usuario "' + username + '"?\nSe cerrará su sesión y no podrá volver a ingresar hasta que lo desbloquees.')) return;
+
+  adminEditBlockBtn.disabled = true;
+  adminEditBlockBtn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> ' + (block ? 'Bloqueando...' : 'Desbloqueando...');
+
+  socket.emit('admin-block-user', { username: username, blocked: block }, function(res) {
+    if (!res.ok) {
+      setAdminEditBlockButton(adminEditBlockBtn.dataset.status);
+      adminEditError.textContent = res.error;
+      return;
+    }
+    setAdminEditBlockButton(block ? 'blocked' : 'active');
+    showToast('Usuario ' + username + (block ? ' bloqueado' : ' desbloqueado'));
     renderAdminPanel();
   });
 });
@@ -2147,7 +2350,7 @@ function renderMessages(messages, hasMore) {
 
 function loadMoreHistory() {
   if (loadingMoreHistory || !historyHasMore || historyOldestId === null) return;
-  if (!currentRoom && !privateRecipient) return;
+  if (!currentRoom && !privateRecipient && !currentGroup) return;
 
   loadingMoreHistory = true;
   showHistoryLoadingIndicator(true);
@@ -2155,6 +2358,8 @@ function loadMoreHistory() {
   var payload = { beforeId: historyOldestId };
   if (privateRecipient) {
     payload.with = privateRecipient;
+  } else if (currentGroup) {
+    payload.group = currentGroup;
   } else {
     payload.room = currentRoom;
   }
@@ -2351,19 +2556,22 @@ function buildMessageElement(msg, animate) {
   }
 
   var fileHtml = '';
-  if (msg.file) {
-    if (msg.file.type && msg.file.type.startsWith('image/')) {
-      fileHtml = '<div class="msg-file"><img src="' + escapeHtml(msg.file.url) + '" alt="' + escapeHtml(msg.file.name) + '" class="msg-image" onclick="openImageModal(\'' + escapeHtml(msg.file.url) + '\')" loading="lazy" /></div>';
-    } else if (msg.file.type && msg.file.type.startsWith('audio/')) {
-      fileHtml = '<div class="msg-file msg-audio"><audio src="' + escapeHtml(msg.file.url) + '" controls preload="metadata"></audio></div>';
+  var fileUrl = msg.file ? safeUploadUrl(msg.file.url) : null;
+  if (fileUrl) {
+    var fileType = String(msg.file.type || '');
+    if (fileType.startsWith('image/')) {
+      fileHtml = '<div class="msg-file"><img src="' + escapeHtml(fileUrl) + '" alt="' + escapeHtml(msg.file.name) + '" class="msg-image" loading="lazy" /></div>';
+    } else if (fileType.startsWith('audio/')) {
+      fileHtml = '<div class="msg-file msg-audio"><audio src="' + escapeHtml(fileUrl) + '" controls preload="metadata"></audio></div>';
     } else {
-      fileHtml = '<div class="msg-file"><i class="fas fa-file"></i> <a href="' + escapeHtml(msg.file.url) + '" target="_blank" download>' + escapeHtml(msg.file.name) + '</a> <span class="msg-file-size">' + formatFileSize(msg.file.size) + '</span></div>';
+      fileHtml = '<div class="msg-file"><i class="fas fa-file"></i> <a href="' + escapeHtml(fileUrl) + '" target="_blank" download>' + escapeHtml(msg.file.name) + '</a> <span class="msg-file-size">' + formatFileSize(Number(msg.file.size) || 0) + '</span></div>';
     }
   }
 
   var replyHtml = '';
   if (msg.reply) {
-    var replyId = msg.reply.id ? ' data-reply-id="' + msg.reply.id + '"' : '';
+    var replyIdNum = Number(msg.reply.id);
+    var replyId = Number.isFinite(replyIdNum) && replyIdNum ? ' data-reply-id="' + replyIdNum + '"' : '';
     replyHtml = '<div class="msg-reply-block"' + replyId + '><div class="msg-reply-sender">' + escapeHtml(msg.reply.sender) + '</div><div class="msg-reply-text">' + escapeHtml(msg.reply.content) + '</div></div>';
   }
 
@@ -2406,6 +2614,10 @@ function renderMessage(msg, animate, lastDate) {
 
 // Navigate to replied message on click
 messagesList.addEventListener('click', function(e) {
+  if (e.target.classList.contains('msg-image')) {
+    openImageModal(e.target.getAttribute('src'));
+    return;
+  }
   var block = e.target.closest('.msg-reply-block');
   if (block) {
     var replyId = parseFloat(block.dataset.replyId);
@@ -2446,6 +2658,9 @@ function sendMessage() {
     payload.recipient = privateRecipient;
     socket.emit('private-message', payload);
     setTimeout(loadConversations, 100);
+  } else if (currentGroup) {
+    payload.groupId = currentGroup;
+    socket.emit('group-message', payload);
   } else if (currentRoom) {
     socket.emit('room-message', payload);
   }
@@ -2468,6 +2683,7 @@ messageInput.addEventListener('keydown', function(e) {
 
 function openPrivateChat(username) {
   if (username === currentUser) return;
+  exitGroupMode();
   privateRecipient = username;
 
   unreadCounts[username] = 0;
@@ -2492,6 +2708,7 @@ function openPrivateChat(username) {
 
 function cancelPrivate() {
   privateRecipient = null;
+  exitGroupMode();
   privateIndicator.classList.add('hidden');
   cancelReply();
 
@@ -2556,6 +2773,8 @@ function renderUserItem(u, isCurrent) {
 function renderUsers(users) {
   if (!users || !Array.isArray(users)) return;
   if (!currentUser) return;
+  lastRoomUsers = users;
+  if (currentGroup) return; // mientras hay un grupo abierto, la lista muestra a sus miembros
 
   var currentObj = { username: currentUser, displayName: currentDisplayName || currentUser, avatar: currentAvatar };
   var currentEl = renderUserItem(currentObj, true);
@@ -2605,7 +2824,7 @@ function renderAllUsers(users) {
 
 socket.on('room-message', function(msg) {
   if (msg.sender !== currentUser) playNotification();
-  if (!privateRecipient) renderMessage(msg);
+  if (!privateRecipient && !currentGroup) renderMessage(msg);
 });
 
 socket.on('room-unread-update', function(data) {
@@ -2752,6 +2971,536 @@ socket.on('room-password-changed', function(data) {
 socket.on('panic-alert', function(data) {
   showPanicModal(data);
   playPanicSound();
+});
+
+// ===================== GRUPOS =====================
+
+const groupsList = $('groups-list');
+const groupsTotalBadge = $('groups-total-badge');
+const groupInvitationsSection = $('group-invitations-section');
+const groupInvitationsList = $('group-invitations-list');
+const groupManageBtn = $('group-manage-btn');
+const roomUsersLabel = $('room-users-label');
+const groupModalOverlay = $('group-modal-overlay');
+const groupModalTitle = $('group-modal-title');
+const groupModalName = $('group-modal-name');
+const groupModalRenameBtn = $('group-modal-rename-btn');
+const groupModalMembersSection = $('group-modal-members-section');
+const groupModalMembers = $('group-modal-members');
+const groupModalInviteSection = $('group-modal-invite-section');
+const groupModalSelected = $('group-modal-selected');
+const groupModalSearch = $('group-modal-search');
+const groupModalResults = $('group-modal-results');
+const groupModalError = $('group-modal-error');
+const groupModalDelete = $('group-modal-delete');
+const groupModalLeave = $('group-modal-leave');
+const groupModalCreate = $('group-modal-create');
+
+var groupModalMode = null; // 'create' | 'manage'
+var groupModalSelectedUsers = [];
+var groupModalSearchTimer = null;
+
+function findLocalGroup(id) {
+  return groups.find(function(g) { return g.id === id; });
+}
+
+function groupAvatarHtml(group, size) {
+  return '<span class="avatar avatar-' + size + ' avatar-initial group-avatar" style="background:' + stringToColor('grupo-' + group.id) + '"><i class="fas fa-users"></i></span>';
+}
+
+function groupRoleLabel(role) {
+  if (role === 'owner') return 'Creador';
+  if (role === 'admin') return 'Admin';
+  return '';
+}
+
+function loadGroups() {
+  socket.emit('get-groups', function(res) {
+    groups = (res && res.groups) || [];
+    groupInvitations = (res && res.invitations) || [];
+    renderGroups();
+    renderGroupInvitations();
+    updateGroupsTotalBadge();
+  });
+}
+
+function updateGroupsTotalBadge() {
+  var total = groupInvitations.length;
+  for (var k in groupUnreadCounts) {
+    if (groupUnreadCounts.hasOwnProperty(k)) total += groupUnreadCounts[k];
+  }
+  if (total > 0) {
+    groupsTotalBadge.textContent = total;
+    groupsTotalBadge.classList.remove('hidden');
+  } else {
+    groupsTotalBadge.classList.add('hidden');
+  }
+}
+
+function renderGroups() {
+  if (groups.length === 0) {
+    groupsList.innerHTML = '<div style="padding:20px;text-align:center;color:var(--text-muted);font-size:13px;">Aún no estás en ningún grupo</div>';
+    return;
+  }
+  var sorted = groups.slice().sort(function(a, b) {
+    var ta = a.lastMessage ? a.lastMessage.created_at : a.created_at;
+    var tb = b.lastMessage ? b.lastMessage.created_at : b.created_at;
+    return (tb || '').localeCompare(ta || '');
+  });
+  groupsList.innerHTML = sorted.map(function(g) {
+    var unread = groupUnreadCounts[g.id] || 0;
+    var badgeHtml = unread > 0 ? '<span class="conv-badge">' + unread + '</span>' : '';
+    var preview = g.members.length + ' miembro' + (g.members.length === 1 ? '' : 's');
+    var timeHtml = '';
+    if (g.lastMessage) {
+      var lastContent = g.lastMessage.content || (g.lastMessage.file ? '[Archivo]' : '');
+      preview = (g.lastMessage.sender === currentUser ? 'Tu' : (g.lastMessage.displayName || g.lastMessage.sender)) + ': ' + lastContent;
+      timeHtml = '<span class="conv-time">' + formatDate(g.lastMessage.created_at) + '</span>';
+    }
+    if (preview.length > 40) preview = preview.substring(0, 40) + '...';
+    return '<div class="conv-item' + (currentGroup === g.id ? ' active' : '') + (unread > 0 ? ' unread' : '') + '" data-group="' + g.id + '">' +
+      groupAvatarHtml(g, 36) +
+      '<div class="conv-info">' +
+        '<div class="conv-name">' + escapeHtml(g.name) + badgeHtml + '</div>' +
+        '<div class="conv-preview">' + escapeHtml(preview) + '</div>' +
+      '</div>' +
+      '<div class="conv-meta">' + timeHtml + '</div>' +
+    '</div>';
+  }).join('');
+
+  groupsList.querySelectorAll('.conv-item').forEach(function(el) {
+    el.addEventListener('click', function() {
+      openGroupChat(parseInt(el.dataset.group, 10));
+    });
+  });
+}
+
+function renderGroupInvitations() {
+  if (groupInvitations.length === 0) {
+    groupInvitationsSection.classList.add('hidden');
+    return;
+  }
+  groupInvitationsSection.classList.remove('hidden');
+  groupInvitationsList.innerHTML = groupInvitations.map(function(inv) {
+    var by = inv.invitedBy ? (inv.invitedBy.displayName || inv.invitedBy.username) : '';
+    return '<div class="friend-request-item" data-group="' + inv.id + '">' +
+      groupAvatarHtml(inv, 32) +
+      '<div class="friend-info">' +
+        '<div class="friend-name">' + escapeHtml(inv.name) + '</div>' +
+        '<div class="admin-user-username">Te invitó ' + escapeHtml(by) + ' · ' + inv.memberCount + ' miembro' + (inv.memberCount === 1 ? '' : 's') + '</div>' +
+      '</div>' +
+      '<div class="friend-request-actions">' +
+        '<button class="friend-request-accept" title="Unirme"><i class="fas fa-check"></i></button>' +
+        '<button class="friend-request-reject" title="Rechazar"><i class="fas fa-times"></i></button>' +
+      '</div>' +
+    '</div>';
+  }).join('');
+
+  groupInvitationsList.querySelectorAll('.friend-request-item').forEach(function(item) {
+    var id = parseInt(item.dataset.group, 10);
+    item.querySelector('.friend-request-accept').addEventListener('click', function() { respondGroupInvitation(id, true); });
+    item.querySelector('.friend-request-reject').addEventListener('click', function() { respondGroupInvitation(id, false); });
+  });
+}
+
+function respondGroupInvitation(id, accept) {
+  socket.emit('group-respond-invite', { groupId: id, accept: accept }, function(res) {
+    groupInvitations = groupInvitations.filter(function(i) { return i.id !== id; });
+    renderGroupInvitations();
+    updateGroupsTotalBadge();
+    if (!res.ok) { showToast(res.error); return; }
+    if (accept && res.group) {
+      upsertLocalGroup(res.group);
+      showToast('Te uniste al grupo ' + res.group.name);
+      openGroupChat(res.group.id);
+    }
+  });
+}
+
+function upsertLocalGroup(group) {
+  var idx = groups.findIndex(function(g) { return g.id === group.id; });
+  if (idx === -1) groups.push(group);
+  else groups[idx] = group;
+  renderGroups();
+}
+
+function removeLocalGroup(id) {
+  groups = groups.filter(function(g) { return g.id !== id; });
+  groupInvitations = groupInvitations.filter(function(i) { return i.id !== id; });
+  delete groupUnreadCounts[id];
+  renderGroups();
+  renderGroupInvitations();
+  updateGroupsTotalBadge();
+  if (groupModalMode === 'manage' && currentGroup === id) closeGroupModal();
+  if (currentGroup === id) cancelPrivate();
+}
+
+function showGroupsTab() {
+  if (sidebarTab === 'groups') return;
+  document.querySelectorAll('.sidebar-tab').forEach(function(t) { t.classList.remove('active'); });
+  document.querySelector('[data-panel="groups"]').classList.add('active');
+  sidebarTab = 'groups';
+  hideAdminView();
+  document.querySelectorAll('.sidebar-panel').forEach(function(p) { p.classList.add('hidden'); });
+  $('groups-panel').classList.remove('hidden');
+}
+
+function openGroupChat(id) {
+  var group = findLocalGroup(id);
+  if (!group) return;
+  privateRecipient = null;
+  privateIndicator.classList.add('hidden');
+  cancelReply();
+  currentGroup = id;
+  groupUnreadCounts[id] = 0;
+  updateGroupsTotalBadge();
+  showGroupsTab();
+  renderGroups();
+  renderConversations();
+  updateGroupHeader(group);
+
+  contextBadge.classList.add('hidden');
+  contextGlobalBadge.classList.add('hidden');
+  backToRoomBtn.classList.remove('hidden');
+  groupManageBtn.classList.remove('hidden');
+  messageInput.focus();
+
+  socket.emit('get-group-history', { groupId: id }, function(res) {
+    if (!res.ok) { showToast(res.error); removeLocalGroup(id); return; }
+    if (currentGroup === id) renderMessages(res.history, res.hasMoreHistory);
+  });
+  onActionCloseDrawers();
+}
+
+function updateGroupHeader(group) {
+  contextName.textContent = group.name;
+  contextIcon.className = 'fas fa-users';
+  messageInput.placeholder = 'Escribe en el grupo ' + group.name + '...';
+  roomUsersLabel.textContent = 'Miembros del grupo';
+  renderGroupMembersSidebar(group);
+}
+
+function renderGroupMembersSidebar(group) {
+  roomUsersList.innerHTML = group.members.map(function(m) {
+    var isMe = m.username === currentUser;
+    var role = groupRoleLabel(m.role);
+    var roleHtml = role ? ' <span style="font-size:11px;color:var(--text-muted)">(' + role + ')</span>' : '';
+    return '<div class="user-item"' + (isMe ? '' : ' data-user="' + escapeHtml(m.username) + '"') + '>' +
+      getAvatarHtml(m.username, m.avatar, 28) +
+      '<span class="user-name">' + (isMe ? '<strong>' + escapeHtml(m.displayName) + '</strong> <span style="font-size:11px;color:var(--text-muted)">(tu)</span>' : escapeHtml(m.displayName)) + roleHtml + '</span>' +
+      (isMe ? '' : '<i class="fas fa-envelope pm-icon" title="Mensaje privado"></i>') +
+    '</div>';
+  }).join('');
+  roomUsersList.querySelectorAll('.user-item[data-user]').forEach(function(el) {
+    el.addEventListener('click', function() { openPrivateChat(el.dataset.user); });
+  });
+}
+
+// Sale de la vista de grupo (al volver a una sala o abrir un privado).
+function exitGroupMode() {
+  if (currentGroup === null) return;
+  currentGroup = null;
+  groupManageBtn.classList.add('hidden');
+  roomUsersLabel.textContent = 'En este canal';
+  renderUsers(lastRoomUsers);
+  renderGroups();
+}
+
+socket.on('group-message', function(msg) {
+  var group = findLocalGroup(msg.group_id);
+  if (group) {
+    group.lastMessage = msg;
+  }
+  if (msg.group_id === currentGroup) {
+    renderMessage(msg);
+    renderGroups();
+    return;
+  }
+  if (msg.sender !== currentUser) {
+    groupUnreadCounts[msg.group_id] = (groupUnreadCounts[msg.group_id] || 0) + 1;
+    updateGroupsTotalBadge();
+    playNotification();
+    showToast((msg.displayName || msg.sender) + ' en ' + (group ? group.name : 'un grupo'));
+  }
+  renderGroups();
+});
+
+socket.on('group-updated', function(group) {
+  upsertLocalGroup(group);
+  if (currentGroup === group.id) updateGroupHeader(group);
+  if (groupModalMode === 'manage' && currentGroup === group.id) renderGroupModalManage(group);
+});
+
+socket.on('group-invitation', function(inv) {
+  groupInvitations = groupInvitations.filter(function(i) { return i.id !== inv.id; });
+  groupInvitations.push(inv);
+  renderGroupInvitations();
+  updateGroupsTotalBadge();
+  playNotification();
+  showToast('Te invitaron al grupo ' + inv.name);
+});
+
+socket.on('group-removed', function(data) {
+  var wasMember = !!findLocalGroup(data.id);
+  removeLocalGroup(data.id);
+  if (!wasMember) return;
+  if (data.reason === 'deleted') showToast('El grupo ' + data.name + ' fue eliminado');
+  else if (data.reason === 'removed') showToast('Ya no eres parte del grupo ' + data.name);
+});
+
+groupManageBtn.addEventListener('click', function() {
+  var group = findLocalGroup(currentGroup);
+  if (group) openManageGroupModal(group);
+});
+
+// ----- Modal crear / administrar grupo -----
+
+function resetGroupModal() {
+  groupModalError.textContent = '';
+  groupModalSearch.value = '';
+  groupModalResults.innerHTML = '';
+  groupModalSelectedUsers = [];
+  groupModalSelected.innerHTML = '';
+}
+
+function closeGroupModal() {
+  groupModalOverlay.classList.add('hidden');
+  groupModalMode = null;
+}
+
+$('create-group-btn').addEventListener('click', function() {
+  onActionCloseDrawers();
+  resetGroupModal();
+  groupModalMode = 'create';
+  groupModalTitle.innerHTML = '<i class="fas fa-users"></i> Crear grupo';
+  groupModalName.value = '';
+  groupModalName.disabled = false;
+  groupModalRenameBtn.classList.add('hidden');
+  groupModalMembersSection.classList.add('hidden');
+  groupModalInviteSection.classList.remove('hidden');
+  groupModalSelected.classList.remove('hidden');
+  groupModalDelete.classList.add('hidden');
+  groupModalLeave.classList.add('hidden');
+  groupModalCreate.classList.remove('hidden');
+  groupModalCreate.disabled = false;
+  groupModalOverlay.classList.remove('hidden');
+  groupModalName.focus();
+});
+
+function openManageGroupModal(group) {
+  resetGroupModal();
+  groupModalMode = 'manage';
+  groupModalTitle.innerHTML = '<i class="fas fa-users-cog"></i> Grupo';
+  groupModalName.value = group.name;
+  groupModalSelected.classList.add('hidden');
+  groupModalMembersSection.classList.remove('hidden');
+  groupModalCreate.classList.add('hidden');
+  groupModalLeave.classList.remove('hidden');
+  renderGroupModalManage(group);
+  groupModalOverlay.classList.remove('hidden');
+}
+
+function renderGroupModalManage(group) {
+  var isOwner = group.myRole === 'owner';
+  var isManager = isOwner || group.myRole === 'admin';
+  groupModalName.disabled = !isManager;
+  if (document.activeElement !== groupModalName) groupModalName.value = group.name;
+  groupModalRenameBtn.classList.toggle('hidden', !isManager);
+  groupModalInviteSection.classList.toggle('hidden', !isManager);
+  groupModalDelete.classList.toggle('hidden', !isOwner);
+
+  var rows = group.members.map(function(m) {
+    var role = groupRoleLabel(m.role);
+    var actions = '';
+    if (m.username !== currentUser && m.role !== 'owner') {
+      if (isOwner) {
+        actions += '<button class="add-friend-action-btn secondary" data-action="' + (m.role === 'admin' ? 'unadmin' : 'admin') + '">' + (m.role === 'admin' ? 'Quitar admin' : 'Hacer admin') + '</button>';
+      }
+      if (isOwner || (isManager && m.role === 'member')) {
+        actions += '<button class="add-friend-action-btn danger" data-action="remove" title="Quitar del grupo"><i class="fas fa-user-minus"></i></button>';
+      }
+    }
+    return '<div class="add-friend-result-item" data-user="' + escapeHtml(m.username) + '">' +
+      getAvatarHtml(m.username, m.avatar, 32) +
+      '<div class="friend-info">' +
+        '<div class="friend-name">' + escapeHtml(m.displayName) + (m.username === currentUser ? ' (tu)' : '') + '</div>' +
+        '<div class="friend-username">@' + escapeHtml(m.username) + (role ? ' · ' + role : '') + '</div>' +
+      '</div>' +
+      '<div class="group-member-actions">' + actions + '</div>' +
+    '</div>';
+  });
+  group.invited.forEach(function(m) {
+    var actions = isManager ? '<button class="add-friend-action-btn danger" data-action="remove" title="Cancelar invitación"><i class="fas fa-times"></i></button>' : '';
+    rows.push('<div class="add-friend-result-item" data-user="' + escapeHtml(m.username) + '">' +
+      getAvatarHtml(m.username, m.avatar, 32) +
+      '<div class="friend-info">' +
+        '<div class="friend-name">' + escapeHtml(m.displayName) + '</div>' +
+        '<div class="friend-username">@' + escapeHtml(m.username) + ' · Invitación pendiente</div>' +
+      '</div>' +
+      '<div class="group-member-actions">' + actions + '</div>' +
+    '</div>');
+  });
+  groupModalMembers.innerHTML = rows.join('');
+
+  groupModalMembers.querySelectorAll('[data-action]').forEach(function(btn) {
+    btn.addEventListener('click', function() {
+      var username = btn.closest('.add-friend-result-item').dataset.user;
+      var action = btn.dataset.action;
+      groupModalError.textContent = '';
+      btn.disabled = true;
+      var done = function(res) {
+        btn.disabled = false;
+        if (!res.ok) groupModalError.textContent = res.error;
+      };
+      if (action === 'remove') {
+        socket.emit('group-remove-member', { groupId: group.id, username: username }, done);
+      } else {
+        socket.emit('group-set-admin', { groupId: group.id, username: username, admin: action === 'admin' }, done);
+      }
+    });
+  });
+}
+
+function renderGroupModalSelected() {
+  groupModalSelected.innerHTML = groupModalSelectedUsers.map(function(u) {
+    return '<span class="group-chip" data-user="' + escapeHtml(u.username) + '">' + escapeHtml(u.displayName || u.username) +
+      '<button type="button" title="Quitar"><i class="fas fa-times"></i></button></span>';
+  }).join('');
+  groupModalSelected.querySelectorAll('.group-chip button').forEach(function(btn) {
+    btn.addEventListener('click', function() {
+      var username = btn.parentElement.dataset.user;
+      groupModalSelectedUsers = groupModalSelectedUsers.filter(function(u) { return u.username !== username; });
+      renderGroupModalSelected();
+    });
+  });
+}
+
+groupModalSearch.addEventListener('input', function() {
+  clearTimeout(groupModalSearchTimer);
+  var query = this.value.trim();
+  if (query.length < 2) {
+    groupModalResults.innerHTML = '';
+    return;
+  }
+  groupModalSearchTimer = setTimeout(function() {
+    socket.emit('search-users', { query: query, activeOnly: true }, function(results) {
+      renderGroupModalResults(results || []);
+    });
+  }, 300);
+});
+
+function renderGroupModalResults(results) {
+  var group = groupModalMode === 'manage' ? findLocalGroup(currentGroup) : null;
+  var taken = {};
+  if (group) {
+    group.members.concat(group.invited).forEach(function(m) { taken[m.username] = true; });
+  }
+  groupModalSelectedUsers.forEach(function(u) { taken[u.username] = true; });
+
+  if (results.length === 0) {
+    groupModalResults.innerHTML = '<div style="padding:12px;text-align:center;color:var(--text-muted);font-size:13px;">Sin resultados</div>';
+    return;
+  }
+  groupModalResults.innerHTML = results.map(function(r) {
+    var disabled = taken[r.username] ? ' disabled' : '';
+    var label = taken[r.username] ? 'Agregado' : (groupModalMode === 'manage' ? 'Invitar' : 'Agregar');
+    return '<div class="add-friend-result-item" data-user="' + escapeHtml(r.username) + '" data-name="' + escapeHtml(r.displayName || r.username) + '">' +
+      getAvatarHtml(r.username, r.avatar, 32) +
+      '<div class="friend-info">' +
+        '<div class="friend-name">' + escapeHtml(r.displayName || r.username) + '</div>' +
+        '<div class="friend-username">@' + escapeHtml(r.username) + '</div>' +
+      '</div>' +
+      '<button class="add-friend-action-btn"' + disabled + '>' + label + '</button>' +
+    '</div>';
+  }).join('');
+
+  groupModalResults.querySelectorAll('.add-friend-action-btn').forEach(function(btn) {
+    btn.addEventListener('click', function() {
+      if (btn.disabled) return;
+      var item = btn.closest('.add-friend-result-item');
+      var username = item.dataset.user;
+      groupModalError.textContent = '';
+      if (groupModalMode === 'create') {
+        groupModalSelectedUsers.push({ username: username, displayName: item.dataset.name });
+        renderGroupModalSelected();
+        btn.disabled = true;
+        btn.textContent = 'Agregado';
+        return;
+      }
+      btn.disabled = true;
+      btn.textContent = 'Invitando...';
+      socket.emit('group-invite', { groupId: currentGroup, usernames: [username] }, function(res) {
+        if (!res.ok) {
+          btn.disabled = false;
+          btn.textContent = 'Invitar';
+          groupModalError.textContent = res.error;
+          return;
+        }
+        btn.textContent = 'Invitado';
+        showToast('Invitación enviada a ' + item.dataset.name);
+      });
+    });
+  });
+}
+
+groupModalCreate.addEventListener('click', function() {
+  var name = groupModalName.value.trim();
+  if (!name) { groupModalError.textContent = 'Ponle un nombre al grupo'; return; }
+  groupModalCreate.disabled = true;
+  socket.emit('create-group', { name: name, members: groupModalSelectedUsers.map(function(u) { return u.username; }) }, function(res) {
+    groupModalCreate.disabled = false;
+    if (!res.ok) { groupModalError.textContent = res.error; return; }
+    closeGroupModal();
+    upsertLocalGroup(res.group);
+    showToast(groupModalSelectedUsers.length > 0 ? 'Grupo creado. Se enviaron las invitaciones.' : 'Grupo creado');
+    openGroupChat(res.group.id);
+  });
+});
+
+groupModalRenameBtn.addEventListener('click', function() {
+  var name = groupModalName.value.trim();
+  if (!name) { groupModalError.textContent = 'Ponle un nombre al grupo'; return; }
+  socket.emit('group-rename', { groupId: currentGroup, name: name }, function(res) {
+    if (!res.ok) { groupModalError.textContent = res.error; return; }
+    groupModalName.blur();
+    showToast('Nombre actualizado');
+  });
+});
+
+groupModalName.addEventListener('keydown', function(e) {
+  if (e.key !== 'Enter') return;
+  if (groupModalMode === 'create') groupModalCreate.click();
+  else if (!groupModalRenameBtn.classList.contains('hidden')) groupModalRenameBtn.click();
+});
+
+groupModalLeave.addEventListener('click', function() {
+  var group = findLocalGroup(currentGroup);
+  if (!group) return;
+  var msg = group.myRole === 'owner'
+    ? '¿Salir del grupo "' + group.name + '"?\nOtro miembro quedará como administrador del grupo.'
+    : '¿Salir del grupo "' + group.name + '"?';
+  if (!confirm(msg)) return;
+  socket.emit('group-leave', { groupId: group.id }, function(res) {
+    if (!res.ok) { groupModalError.textContent = res.error; return; }
+    closeGroupModal();
+    removeLocalGroup(group.id);
+    showToast('Saliste del grupo ' + group.name);
+  });
+});
+
+groupModalDelete.addEventListener('click', function() {
+  var group = findLocalGroup(currentGroup);
+  if (!group) return;
+  if (!confirm('¿Eliminar el grupo "' + group.name + '"?\nSe borrarán todos sus mensajes para todos los miembros.')) return;
+  socket.emit('group-delete', { groupId: group.id }, function(res) {
+    if (!res.ok) { groupModalError.textContent = res.error; return; }
+    closeGroupModal();
+  });
+});
+
+$('group-modal-close').addEventListener('click', closeGroupModal);
+groupModalOverlay.addEventListener('click', function(e) {
+  if (e.target === groupModalOverlay) closeGroupModal();
 });
 
 socket.on('force-disconnect', function(data) {

@@ -19,8 +19,9 @@ const UPLOADS_DIR = path.join(__dirname, 'uploads');
 const storage = multer.diskStorage({
   destination: UPLOADS_DIR,
   filename: (req, file, cb) => {
-    const ext = path.extname(file.originalname);
-    const name = crypto.randomUUID() + ext;
+    // Solo letras y números en la extensión: la URL resultante debe ser segura de mostrar en el chat.
+    const ext = path.extname(file.originalname).replace(/[^A-Za-z0-9]/g, '').slice(0, 10);
+    const name = crypto.randomUUID() + (ext ? '.' + ext.toLowerCase() : '');
     cb(null, name);
   }
 });
@@ -56,7 +57,22 @@ app.post('/api/upload', (req, res, next) => {
   });
 });
 
-app.use('/uploads', express.static(UPLOADS_DIR));
+// Los archivos subidos nunca deben ejecutar código en el sitio (p. ej. un .html o .svg con scripts):
+// se sirven en "sandbox", sin que el navegador adivine el tipo, y los que no son imagen/audio/video/PDF se descargan.
+const INLINE_UPLOAD_EXTS = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp', '.mp3', '.wav', '.ogg', '.webm', '.m4a', '.mp4', '.pdf']);
+app.use('/uploads', express.static(UPLOADS_DIR, {
+  setHeaders: (res, filePath) => {
+    const ext = path.extname(filePath).toLowerCase();
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    // Chrome no muestra PDFs con CSP sandbox; un PDF igual no puede ejecutar código del sitio.
+    if (ext !== '.pdf') {
+      res.setHeader('Content-Security-Policy', "sandbox; default-src 'none'; img-src 'self'; media-src 'self'; style-src 'unsafe-inline'");
+    }
+    if (!INLINE_UPLOAD_EXTS.has(ext)) {
+      res.setHeader('Content-Disposition', 'attachment');
+    }
+  }
+}));
 
 app.get('/api/cert', (req, res) => {
   const CERT_PATH = path.join(__dirname, 'certs', 'cert.pem');

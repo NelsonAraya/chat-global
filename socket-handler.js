@@ -1,17 +1,18 @@
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
-const { sendPanicAlertEmail } = require('./mailer');
+const { sendPanicAlertEmail, sendLoginCodeEmail } = require('./mailer');
 
 module.exports = (io, db) => {
   const {
-    data, hashPassword,
+    data, hashPassword, verifyPassword, isLegacyHash,
     saveUser, deleteUser,
     saveRoom, deleteRoom,
     saveMessage, updateMessageReactions, deleteMessagesByRoom,
     saveDepartment, deleteDepartment,
     saveConsent,
     saveFriendRequest, updateFriendStatus, deleteFriendRow,
+    saveGroup, renameGroup, deleteGroup, saveGroupMember, deleteGroupMember,
     saveAlert, getAlertHistory
   } = db;
   const TERMS_VERSION = '1.0';
@@ -19,6 +20,120 @@ module.exports = (io, db) => {
   const roomUsers = new Map();
   const roomUnreads = {};
   const uploadTokens = new Map(); // token -> socket.id, solo usuarios autenticados pueden subir archivos
+
+  // ===== Validación de datos que llegan del navegador =====
+  // Los archivos solo pueden apuntar a /uploads/ (lo que generó /api/upload); cualquier otra URL se descarta
+  // para evitar inyección de código al mostrar el mensaje.
+  const UPLOAD_URL_RE = /^\/uploads\/[A-Za-z0-9._-]+$/;
+  const MIME_RE = /^[\w.+-]+\/[\w.+-]+$/;
+
+  const sanitizeFile = (file) => {
+    if (!file || typeof file !== 'object') return null;
+    if (typeof file.url !== 'string' || !UPLOAD_URL_RE.test(file.url) || file.url.includes('..')) return null;
+    const size = Number(file.size);
+    return {
+      url: file.url,
+      name: String(file.name || 'archivo').slice(0, 255),
+      size: Number.isFinite(size) && size >= 0 ? Math.round(size) : 0,
+      type: typeof file.type === 'string' && MIME_RE.test(file.type) ? file.type.slice(0, 100) : 'application/octet-stream'
+    };
+  };
+
+  const sanitizeReply = (reply) => {
+    if (!reply || typeof reply !== 'object') return null;
+    const id = Number(reply.id);
+    return {
+      id: Number.isFinite(id) ? id : null,
+      sender: String(reply.sender || '').slice(0, 64),
+      content: String(reply.content || '').slice(0, 500)
+    };
+  };
+
+  const sanitizeContent = (content) => (typeof content === 'string' ? content.trim().slice(0, 5000) : '');
+
+  // ===== Límite de intentos fallidos (en memoria) =====
+  // Frena la fuerza bruta: tras varios fallos, esa cuenta / esa IP queda bloqueada un rato.
+  const LOGIN_FAIL_WINDOW_MS = 15 * 60 * 1000;
+  const LOGIN_LOCK_MS = 15 * 60 * 1000;
+  const LOGIN_MAX_FAILS_PER_USER = 5;
+  const LOGIN_MAX_FAILS_PER_IP = 20;
+  const ROOM_MAX_FAILS_PER_IP = 10;
+  const failBuckets = new Map(); // clave -> { count, resetAt, lockedUntil }
+
+  const lockMinutesLeft = (key) => {
+    const b = failBuckets.get(key);
+    if (!b || b.lockedUntil <= Date.now()) return 0;
+    return Math.ceil((b.lockedUntil - Date.now()) / 60000);
+  };
+  const registerFailure = (key, max) => {
+    const now = Date.now();
+    let b = failBuckets.get(key);
+    if (!b || (b.resetAt <= now && b.lockedUntil <= now)) b = { count: 0, resetAt: now + LOGIN_FAIL_WINDOW_MS, lockedUntil: 0 };
+    b.count++;
+    if (b.count >= max) {
+      b.lockedUntil = now + LOGIN_LOCK_MS;
+      b.count = 0;
+      b.resetAt = b.lockedUntil;
+    }
+    failBuckets.set(key, b);
+  };
+  const clearFailures = (key) => failBuckets.delete(key);
+  const lockedError = (minutes) => 'Demasiados intentos fallidos. Intenta de nuevo en ' + minutes + ' minuto' + (minutes === 1 ? '' : 's') + '.';
+
+  // ===== Doble factor: código temporal enviado al correo registrado =====
+  const OTP_TTL_MINUTES = 5;
+  const OTP_TTL_MS = OTP_TTL_MINUTES * 60 * 1000;
+  const OTP_MAX_ATTEMPTS = 5;
+  const OTP_RESEND_COOLDOWN_MS = 30 * 1000;
+  // Máximo de códigos que se envían a un mismo usuario por ventana: limita tanto adivinar
+  // códigos (cada uno permite 5 intentos) como llenar de correos a una persona.
+  const OTP_MAX_SENDS = 5;
+  const OTP_SENDS_WINDOW_MS = 15 * 60 * 1000;
+  const loginCodes = new Map(); // username -> { hash, email, expiresAt, attempts, sentAt }
+  const codeSends = new Map(); // username -> [timestamps de envío]
+
+  // Minutos que faltan para poder enviar otro código (0 = se puede).
+  const codeSendWaitMinutes = (username) => {
+    const now = Date.now();
+    const recent = (codeSends.get(username) || []).filter(t => now - t < OTP_SENDS_WINDOW_MS);
+    codeSends.set(username, recent);
+    if (recent.length < OTP_MAX_SENDS) return 0;
+    return Math.ceil((recent[0] + OTP_SENDS_WINDOW_MS - now) / 60000);
+  };
+  const tooManyCodesError = (minutes) => 'Se enviaron demasiados códigos. Espera ' + minutes + ' minuto' + (minutes === 1 ? '' : 's') + ' para pedir otro.';
+  const codeSecondsLeft = (entry) => Math.max(1, Math.round((entry.expiresAt - Date.now()) / 1000));
+
+  // Limpieza periódica de los registros vencidos.
+  setInterval(() => {
+    const now = Date.now();
+    for (const [k, b] of failBuckets) if (b.resetAt <= now && b.lockedUntil <= now) failBuckets.delete(k);
+    for (const [k, e] of loginCodes) if (e.expiresAt <= now) loginCodes.delete(k);
+    for (const [k, list] of codeSends) if (!list.some(t => now - t < OTP_SENDS_WINDOW_MS)) codeSends.delete(k);
+  }, 10 * 60 * 1000).unref();
+  const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+  const normalizeEmail = (email) => String(email || '').trim().toLowerCase();
+  const hashCode = (code) => crypto.createHash('sha256').update(code).digest('hex');
+  const maskEmail = (email) => {
+    const [local, domain] = String(email).split('@');
+    if (!domain) return email;
+    const visible = local.length <= 2 ? local[0] : local.slice(0, 2);
+    return visible + '***@' + domain;
+  };
+  const emailInUse = (email, exceptUsername) =>
+    data.users.some(u => u.username !== exceptUsername && u.email && u.email.toLowerCase() === email);
+
+  const issueLoginCode = async (userRecord, email) => {
+    const code = crypto.randomInt(0, 1000000).toString().padStart(6, '0');
+    codeSends.set(userRecord.username, [...(codeSends.get(userRecord.username) || []), Date.now()]);
+    loginCodes.set(userRecord.username, { hash: hashCode(code), email, expiresAt: Date.now() + OTP_TTL_MS, attempts: 0, sentAt: Date.now() });
+    const sent = await sendLoginCodeEmail(email, code, userRecord.displayName || userRecord.username, OTP_TTL_MINUTES);
+    if (!sent) {
+      // Sin SMTP configurado no hay forma de entregar el código: se deja en la consola del servidor
+      // para que el administrador pueda dárselo al usuario.
+      console.warn(`[2FA] SMTP no configurado. Código de acceso para ${userRecord.username} (${email}): ${code}`);
+    }
+  };
 
   const getOnlineUsers = (roomName) => {
     const sockets = roomUsers.get(roomName);
@@ -267,6 +382,29 @@ module.exports = (io, db) => {
     return true;
   };
 
+  // Saca del chat la sesión activa de un usuario (cuenta eliminada o bloqueada). Devuelve true si estaba conectado.
+  const kickUser = (username, reason) => {
+    for (const [sid, u] of users) {
+      if (u.username === username) {
+        for (const [roomName, sockets] of roomUsers) {
+          if (sockets.has(sid)) {
+            sockets.delete(sid);
+            if (sockets.size === 0) roomUsers.delete(roomName);
+            break;
+          }
+        }
+        if (roomUnreads[username]) {
+          delete roomUnreads[username];
+        }
+        if (u.uploadToken) uploadTokens.delete(u.uploadToken);
+        io.to(sid).emit('force-disconnect', { reason });
+        users.delete(sid);
+        return true;
+      }
+    }
+    return false;
+  };
+
   const departmentOptions = (names) => names.map(n => {
     const rec = data.departments.find(d => d.name === n);
     return { name: n, displayName: rec?.displayName || n };
@@ -302,9 +440,138 @@ module.exports = (io, db) => {
     });
   };
 
+  // ===== Grupos: conversaciones privadas entre varios usuarios =====
+  // Cualquiera crea un grupo; los invitados deben aceptar. El dueño (owner) administra y puede
+  // nombrar administradores (admin), que también agregan/quitan miembros y renombran.
+  const GROUP_NAME_MAX = 60;
+  const GROUP_MAX_MEMBERS = 100;
+
+  const findGroup = (id) => data.groups.find(g => g.id === id);
+  const groupMembership = (groupId, username) => data.groupMembers.find(m => m.group_id === groupId && m.username === username);
+  const isGroupMember = (groupId, username) => groupMembership(groupId, username)?.status === 'member';
+  const canManageGroup = (groupId, username) => {
+    const m = groupMembership(groupId, username);
+    return m?.status === 'member' && (m.role === 'owner' || m.role === 'admin');
+  };
+  const groupMemberUsernames = (groupId) => data.groupMembers
+    .filter(m => m.group_id === groupId && m.status === 'member')
+    .map(m => m.username);
+
+  const emitToUsername = (username, event, payload) => {
+    for (const [sid, u] of users) {
+      if (u.username === username) io.to(sid).emit(event, payload);
+    }
+  };
+
+  const userCard = (username) => {
+    const r = data.users.find(u => u.username === username);
+    return { username, displayName: r?.displayName || username, avatar: r?.avatar || null };
+  };
+
+  const groupLastMessage = (groupId) => {
+    for (let i = data.messages.length - 1; i >= 0; i--) {
+      if (data.messages[i].group_id === groupId) return { ...data.messages[i], type: 'group' };
+    }
+    return null;
+  };
+
+  const groupView = (group, viewer) => {
+    const rows = data.groupMembers.filter(m => m.group_id === group.id);
+    const me = rows.find(m => m.username === viewer);
+    return {
+      id: group.id,
+      name: group.name,
+      created_by: group.created_by,
+      created_at: group.created_at,
+      myRole: me?.role || null,
+      members: rows.filter(m => m.status === 'member').map(m => ({ ...userCard(m.username), role: m.role })),
+      invited: rows.filter(m => m.status === 'invited').map(m => ({ ...userCard(m.username), invited_by: m.invited_by })),
+      lastMessage: groupLastMessage(group.id)
+    };
+  };
+
+  const invitationView = (group, membership) => ({
+    id: group.id,
+    name: group.name,
+    invitedBy: userCard(membership.invited_by),
+    memberCount: groupMemberUsernames(group.id).length
+  });
+
+  // Cada miembro recibe su propia vista (incluye su rol en el grupo).
+  const broadcastGroup = (group) => {
+    for (const username of groupMemberUsernames(group.id)) {
+      emitToUsername(username, 'group-updated', groupView(group, username));
+    }
+  };
+
+  const getGroupHistory = (groupId, beforeId) => {
+    const page = paginate(data.messages.filter(m => m.group_id === groupId), beforeId);
+    return { messages: page.messages.map(m => ({ ...m, type: 'group' })), hasMore: page.hasMore };
+  };
+
+  const destroyGroup = async (group) => {
+    const notify = data.groupMembers.filter(m => m.group_id === group.id).map(m => m.username);
+    for (const m of data.messages) {
+      if (m.group_id === group.id && m.file?.url && m.file.url.startsWith('/uploads/')) {
+        try { fs.unlinkSync(path.join(__dirname, 'uploads', path.basename(m.file.url))); } catch {}
+      }
+    }
+    data.messages = data.messages.filter(m => m.group_id !== group.id);
+    data.groupMembers = data.groupMembers.filter(m => m.group_id !== group.id);
+    data.groups = data.groups.filter(g => g.id !== group.id);
+    await deleteGroup(group.id);
+    for (const username of notify) emitToUsername(username, 'group-removed', { id: group.id, name: group.name, reason: 'deleted' });
+  };
+
+  // Quita a alguien del grupo (o cancela su invitación). Si sale el dueño, el grupo pasa a un
+  // administrador (o al miembro más antiguo); si no queda nadie, el grupo se elimina.
+  const removeGroupMembership = async (group, username) => {
+    const m = groupMembership(group.id, username);
+    if (!m) return 'none';
+    data.groupMembers = data.groupMembers.filter(x => x !== m);
+    await deleteGroupMember(group.id, username);
+    if (m.status === 'member') {
+      const remaining = data.groupMembers.filter(x => x.group_id === group.id && x.status === 'member');
+      if (remaining.length === 0) {
+        await destroyGroup(group);
+        return 'deleted';
+      }
+      if (m.role === 'owner') {
+        const heir = remaining.find(x => x.role === 'admin') || remaining[0];
+        heir.role = 'owner';
+        await saveGroupMember(heir);
+      }
+    }
+    return 'removed';
+  };
+
+  const inviteToGroup = async (group, inviter, usernames) => {
+    const invited = [];
+    for (const name of [...new Set((usernames || []).map(u => String(u).trim().toLowerCase()))]) {
+      if (!name || name === inviter || groupMembership(group.id, name)) continue;
+      const target = data.users.find(u => u.username === name);
+      if (!target || target.status !== 'active') continue;
+      if (data.groupMembers.filter(m => m.group_id === group.id).length >= GROUP_MAX_MEMBERS) break;
+      const m = { group_id: group.id, username: name, role: 'member', status: 'invited', invited_by: inviter, created_at: new Date().toISOString() };
+      data.groupMembers.push(m);
+      try {
+        await saveGroupMember(m);
+      } catch (err) {
+        data.groupMembers = data.groupMembers.filter(x => x !== m);
+        throw err;
+      }
+      invited.push(m);
+    }
+    for (const m of invited) emitToUsername(m.username, 'group-invitation', invitationView(group, m));
+    return invited.map(m => m.username);
+  };
+
+  const cleanGroupName = (name) => String(name || '').trim().replace(/\s+/g, ' ').slice(0, GROUP_NAME_MAX);
+
   io.on('connection', (socket) => {
     socket.on('register', async (data_, callback) => {
       const { username, password, terms_version } = data_ || {};
+      const email = normalizeEmail(data_?.email);
       if (!username || !username.trim()) {
         return callback?.({ ok: false, error: 'Nombre de usuario requerido' });
       }
@@ -318,17 +585,25 @@ module.exports = (io, db) => {
       if (data.users.find(u => u.username === name)) {
         return callback?.({ ok: false, error: 'Ese usuario ya existe' });
       }
+      if (!EMAIL_RE.test(email) || email.length > 255) {
+        return callback?.({ ok: false, error: 'Ingresa un correo válido' });
+      }
+      if (emailInUse(email)) {
+        return callback?.({ ok: false, error: 'Ese correo ya está registrado en otra cuenta' });
+      }
       if (!terms_version) {
         return callback?.({ ok: false, error: 'Debes aceptar los Términos y Condiciones' });
       }
 
       const newUser = {
         username: name,
-        password: hashPassword(password),
+        password: await hashPassword(password),
         displayName: name,
         avatar: null,
         departments: [],
         status: 'pending',
+        email,
+        twoFactorEnabled: false,
         created_at: new Date().toISOString()
       };
       data.users.push(newUser);
@@ -341,7 +616,7 @@ module.exports = (io, db) => {
         return callback?.({ ok: false, error: 'Error al guardar en la base de datos' });
       }
 
-      io.to(ADMIN_ROOM).emit('registration-pending', { username: name, displayName: name, created_at: newUser.created_at });
+      io.to(ADMIN_ROOM).emit('registration-pending', { username: name, displayName: name, email, created_at: newUser.created_at });
 
       callback?.({ ok: true, pending: true });
     });
@@ -355,7 +630,7 @@ module.exports = (io, db) => {
       callback?.(getAllUsers(user?.department, user?.role));
     });
 
-    socket.on('login', (data_, callback) => {
+    socket.on('login', async (data_, callback) => {
       const { username, password } = data_ || {};
       if (!username || !username.trim()) {
         return callback?.({ ok: false, error: 'Nombre de usuario requerido' });
@@ -363,13 +638,31 @@ module.exports = (io, db) => {
       if (!password) {
         return callback?.({ ok: false, error: 'Contraseña requerida' });
       }
-      const name = username.trim().toLowerCase();
-      const userRecord = data.users.find(u => u.username === name);
-      if (!userRecord) {
-        return callback?.({ ok: false, error: 'Usuario no encontrado' });
+      const name = String(username).trim().toLowerCase();
+      const userKey = 'login-user:' + name;
+      const ipKey = 'login-ip:' + socket.handshake.address;
+      const lockedFor = Math.max(lockMinutesLeft(userKey), lockMinutesLeft(ipKey));
+      if (lockedFor > 0) {
+        return callback?.({ ok: false, error: lockedError(lockedFor) });
       }
-      if (userRecord.password !== hashPassword(password)) {
-        return callback?.({ ok: false, error: 'Contraseña incorrecta' });
+
+      // Mismo mensaje si el usuario no existe o la contraseña es incorrecta: no revela qué cuentas existen.
+      const userRecord = data.users.find(u => u.username === name);
+      if (!userRecord || !(await verifyPassword(String(password), userRecord.password))) {
+        registerFailure(userKey, LOGIN_MAX_FAILS_PER_USER);
+        registerFailure(ipKey, LOGIN_MAX_FAILS_PER_IP);
+        const nowLocked = Math.max(lockMinutesLeft(userKey), lockMinutesLeft(ipKey));
+        return callback?.({ ok: false, error: nowLocked > 0 ? lockedError(nowLocked) : 'Usuario o contraseña incorrectos' });
+      }
+      clearFailures(userKey);
+      if (isLegacyHash(userRecord.password)) {
+        // Actualiza la contraseña al formato seguro ahora que la conocemos.
+        try {
+          userRecord.password = await hashPassword(String(password));
+          await saveUser(userRecord);
+        } catch (err) {
+          console.error('password upgrade error:', err);
+        }
       }
       if (userRecord.status === 'pending') {
         return callback?.({ ok: false, error: 'Tu cuenta está pendiente de aprobación por un administrador.' });
@@ -377,23 +670,165 @@ module.exports = (io, db) => {
       if (userRecord.status === 'rejected') {
         return callback?.({ ok: false, error: 'Tu solicitud de cuenta fue rechazada. Contacta a un administrador.' });
       }
+      if (userRecord.status === 'blocked') {
+        return callback?.({ ok: false, error: 'Tu cuenta está bloqueada. Contacta a un administrador.' });
+      }
       for (const [, u] of users) {
         if (u.username === name) {
           return callback?.({ ok: false, error: 'Ese usuario ya está conectado' });
         }
       }
 
+      // La contraseña es correcta: ahora se exige el código enviado al correo.
+      // La primera vez (doble factor aún no activado) este mismo paso lo activa.
+      socket.pendingUser = null;
+      const setup = !userRecord.twoFactorEnabled;
+      if (!userRecord.email) {
+        // Cuentas antiguas sin correo: el usuario debe indicar uno antes de recibir el código.
+        socket.twoFactor = { username: name, email: null, setup: true };
+        return callback?.({ ok: true, requireTwoFactor: true, setup: true, needEmail: true });
+      }
+
+      socket.twoFactor = { username: name, email: userRecord.email, setup };
+      // Si ya hay un código vigente (p. ej. recargó la página), se reutiliza en vez de enviar otro:
+      // así repetir el login no da intentos nuevos para adivinar ni manda más correos.
+      const existing = loginCodes.get(name);
+      if (existing && existing.email === userRecord.email && existing.expiresAt > Date.now()) {
+        return callback?.({ ok: true, requireTwoFactor: true, setup, maskedEmail: maskEmail(userRecord.email), expiresInSeconds: codeSecondsLeft(existing), reused: true });
+      }
+      const wait = codeSendWaitMinutes(name);
+      if (wait > 0) {
+        socket.twoFactor = null;
+        return callback?.({ ok: false, error: tooManyCodesError(wait) });
+      }
+      try {
+        await issueLoginCode(userRecord, userRecord.email);
+      } catch (err) {
+        console.error('issueLoginCode error:', err);
+        socket.twoFactor = null;
+        return callback?.({ ok: false, error: 'No se pudo enviar el código a tu correo. Intenta de nuevo o contacta a un administrador.' });
+      }
+      callback?.({ ok: true, requireTwoFactor: true, setup, maskedEmail: maskEmail(userRecord.email), expiresInSeconds: OTP_TTL_MINUTES * 60 });
+    });
+
+    socket.on('two-factor-set-email', async (data_, callback) => {
+      const pending = socket.twoFactor;
+      if (!pending || !pending.setup) return callback?.({ ok: false, error: 'No hay una sesión pendiente' });
+      const userRecord = data.users.find(u => u.username === pending.username);
+      if (!userRecord) return callback?.({ ok: false, error: 'Usuario no encontrado' });
+      if (userRecord.email) return callback?.({ ok: false, error: 'Tu cuenta ya tiene un correo registrado' });
+
+      const email = normalizeEmail(data_?.email);
+      if (!EMAIL_RE.test(email) || email.length > 255) return callback?.({ ok: false, error: 'Correo no válido' });
+      if (emailInUse(email, userRecord.username)) return callback?.({ ok: false, error: 'Ese correo ya está registrado en otra cuenta' });
+
+      const prev = loginCodes.get(userRecord.username);
+      if (prev && Date.now() - prev.sentAt < OTP_RESEND_COOLDOWN_MS) {
+        return callback?.({ ok: false, error: 'Espera unos segundos antes de pedir otro código' });
+      }
+      const wait = codeSendWaitMinutes(userRecord.username);
+      if (wait > 0) return callback?.({ ok: false, error: tooManyCodesError(wait) });
+      pending.email = email;
+      try {
+        await issueLoginCode(userRecord, email);
+      } catch (err) {
+        console.error('issueLoginCode error:', err);
+        return callback?.({ ok: false, error: 'No se pudo enviar el código a ese correo' });
+      }
+      callback?.({ ok: true, maskedEmail: maskEmail(email), expiresInSeconds: OTP_TTL_MINUTES * 60 });
+    });
+
+    socket.on('two-factor-resend', async (callback) => {
+      const pending = socket.twoFactor;
+      if (!pending || !pending.email) return callback?.({ ok: false, error: 'No hay una sesión pendiente' });
+      const userRecord = data.users.find(u => u.username === pending.username);
+      if (!userRecord) return callback?.({ ok: false, error: 'Usuario no encontrado' });
+
+      const prev = loginCodes.get(userRecord.username);
+      if (prev && Date.now() - prev.sentAt < OTP_RESEND_COOLDOWN_MS) {
+        return callback?.({ ok: false, error: 'Espera unos segundos antes de pedir otro código' });
+      }
+      const wait = codeSendWaitMinutes(userRecord.username);
+      if (wait > 0) return callback?.({ ok: false, error: tooManyCodesError(wait) });
+      try {
+        await issueLoginCode(userRecord, pending.email);
+      } catch (err) {
+        console.error('issueLoginCode error:', err);
+        return callback?.({ ok: false, error: 'No se pudo reenviar el código' });
+      }
+      callback?.({ ok: true, maskedEmail: maskEmail(pending.email), expiresInSeconds: OTP_TTL_MINUTES * 60 });
+    });
+
+    socket.on('two-factor-verify', async (data_, callback) => {
+      const pending = socket.twoFactor;
+      if (!pending || !pending.email) return callback?.({ ok: false, error: 'No hay una sesión pendiente' });
+      const userRecord = data.users.find(u => u.username === pending.username);
+      if (!userRecord || userRecord.status !== 'active') {
+        socket.twoFactor = null;
+        return callback?.({ ok: false, error: 'Tu cuenta no está habilitada', restart: true });
+      }
+
+      const entry = loginCodes.get(userRecord.username);
+      if (!entry || entry.email !== pending.email) {
+        return callback?.({ ok: false, error: 'Solicita un código nuevo' });
+      }
+      if (Date.now() > entry.expiresAt) {
+        loginCodes.delete(userRecord.username);
+        return callback?.({ ok: false, error: 'El código venció. Solicita uno nuevo.' });
+      }
+      const code = String(data_?.code || '').trim();
+      const match = /^\d{6}$/.test(code) &&
+        crypto.timingSafeEqual(Buffer.from(hashCode(code), 'hex'), Buffer.from(entry.hash, 'hex'));
+      if (!match) {
+        entry.attempts++;
+        if (entry.attempts >= OTP_MAX_ATTEMPTS) {
+          loginCodes.delete(userRecord.username);
+          return callback?.({ ok: false, error: 'Demasiados intentos. Solicita un código nuevo.' });
+        }
+        return callback?.({ ok: false, error: 'Código incorrecto' });
+      }
+      loginCodes.delete(userRecord.username);
+
+      if (pending.setup) {
+        if (!userRecord.email && emailInUse(pending.email, userRecord.username)) {
+          socket.twoFactor = null;
+          return callback?.({ ok: false, error: 'Ese correo ya está registrado en otra cuenta', restart: true });
+        }
+        const prevEmail = userRecord.email;
+        const prevEnabled = userRecord.twoFactorEnabled;
+        userRecord.email = pending.email;
+        userRecord.twoFactorEnabled = true;
+        try {
+          await saveUser(userRecord);
+        } catch (err) {
+          console.error('saveUser error:', err);
+          userRecord.email = prevEmail;
+          userRecord.twoFactorEnabled = prevEnabled;
+          return callback?.({ ok: false, error: 'Error al guardar en la base de datos' });
+        }
+      }
+      socket.twoFactor = null;
+
+      for (const [, u] of users) {
+        if (u.username === userRecord.username) {
+          return callback?.({ ok: false, error: 'Ese usuario ya está conectado', restart: true });
+        }
+      }
+
       const assignedDepartments = userRecord.departments || [];
       if (assignedDepartments.length > 1) {
-        socket.pendingUser = { username: name };
+        socket.pendingUser = { username: userRecord.username };
         return callback?.({
           ok: true,
+          twoFactorActivated: pending.setup,
           requireDepartment: true,
           departments: departmentOptions(assignedDepartments)
         });
       }
 
-      finalizeLogin(socket, userRecord, assignedDepartments[0] || null, callback);
+      finalizeLogin(socket, userRecord, assignedDepartments[0] || null, (res) => {
+        callback?.({ ...res, twoFactorActivated: pending.setup });
+      });
     });
 
     socket.on('select-department', (data_, callback) => {
@@ -402,6 +837,10 @@ module.exports = (io, db) => {
       const { department } = data_ || {};
       const userRecord = data.users.find(u => u.username === socket.pendingUser.username);
       if (!userRecord) return callback?.({ ok: false, error: 'Usuario no encontrado' });
+      if (userRecord.status !== 'active') {
+        socket.pendingUser = null;
+        return callback?.({ ok: false, error: 'Tu cuenta no está habilitada' });
+      }
 
       const assignedDepartments = userRecord.departments || [];
       if (!department || !assignedDepartments.includes(department)) {
@@ -449,7 +888,7 @@ module.exports = (io, db) => {
       callback?.({ ok: true });
     });
 
-    socket.on('join-room', (data_, callback) => {
+    socket.on('join-room', async (data_, callback) => {
       const user = users.get(socket.id);
       if (!user) return;
 
@@ -469,8 +908,16 @@ module.exports = (io, db) => {
         if (!password) {
           return callback?.({ ok: false, requirePassword: true });
         }
-        if (hashPassword(password) !== room.password) {
+        const roomIpKey = 'room-ip:' + socket.handshake.address;
+        const roomLocked = lockMinutesLeft(roomIpKey);
+        if (roomLocked > 0) return callback?.({ ok: false, error: lockedError(roomLocked) });
+        if (!(await verifyPassword(String(password), room.password))) {
+          registerFailure(roomIpKey, ROOM_MAX_FAILS_PER_IP);
           return callback?.({ ok: false, error: 'Contraseña incorrecta' });
+        }
+        if (isLegacyHash(room.password)) {
+          room.password = await hashPassword(String(password));
+          saveRoom(room).catch(err => console.error('saveRoom error:', err));
         }
       }
 
@@ -529,9 +976,9 @@ module.exports = (io, db) => {
       const user = users.get(socket.id);
       if (!user?.currentRoom) return;
 
-      const content = data_?.content?.trim();
-      const file = data_?.file;
-      const reply = data_?.reply;
+      const content = sanitizeContent(data_?.content);
+      const file = sanitizeFile(data_?.file);
+      const reply = sanitizeReply(data_?.reply);
       if (!content && !file) return;
 
       const msg = {
@@ -568,10 +1015,11 @@ module.exports = (io, db) => {
       const user = users.get(socket.id);
       if (!user) return;
 
-      const { recipient, content } = data_ || {};
-      const file = data_?.file;
-      const reply = data_?.reply;
-      if (!recipient || (!content?.trim() && !file)) return;
+      const recipient = data_?.recipient;
+      const content = sanitizeContent(data_?.content);
+      const file = sanitizeFile(data_?.file);
+      const reply = sanitizeReply(data_?.reply);
+      if (typeof recipient !== 'string' || !data.users.some(u => u.username === recipient) || (!content && !file)) return;
 
       const msg = {
         id: Date.now() + Math.random(),
@@ -579,7 +1027,7 @@ module.exports = (io, db) => {
         displayName: user.displayName || user.username,
         avatar: user.avatar || null,
         recipient,
-        content: content?.trim() || '',
+        content,
         file: file || null,
         reply: reply || null,
         reactions: {},
@@ -614,6 +1062,10 @@ module.exports = (io, db) => {
       if (msg.room_name) {
         const room = data.rooms.find(r => r.name === msg.room_name);
         if (!room || !canViewRoom(room, user.department, user.role)) {
+          return callback?.({ ok: false, error: 'No tienes acceso a este mensaje' });
+        }
+      } else if (msg.group_id) {
+        if (!isGroupMember(msg.group_id, user.username)) {
           return callback?.({ ok: false, error: 'No tienes acceso a este mensaje' });
         }
       } else if (msg.recipient) {
@@ -663,6 +1115,10 @@ module.exports = (io, db) => {
       // Broadcast the update to everyone who can see the message
       if (msg.room_name) {
         io.to(msg.room_name).emit('reaction-updated', msg);
+      } else if (msg.group_id) {
+        for (const username of groupMemberUsernames(msg.group_id)) {
+          emitToUsername(username, 'reaction-updated', msg);
+        }
       } else if (msg.recipient) {
         for (const [sid, u] of users) {
           if (u.username === msg.sender || u.username === msg.recipient) {
@@ -705,6 +1161,9 @@ module.exports = (io, db) => {
       if (!user) return callback?.({ ok: false, error: 'No autenticado' });
 
       const avatar = data_?.avatar || null;
+      if (avatar !== null && (typeof avatar !== 'string' || !UPLOAD_URL_RE.test(avatar) || avatar.includes('..'))) {
+        return callback?.({ ok: false, error: 'Imagen no válida' });
+      }
       user.avatar = avatar;
       const record = data.users.find(u => u.username === user.username);
       if (record) {
@@ -733,10 +1192,17 @@ module.exports = (io, db) => {
 
       const record = data.users.find(u => u.username === user.username);
       if (!record) return callback?.({ ok: false, error: 'Usuario no encontrado' });
-      if (record.password !== hashPassword(currentPassword)) return callback?.({ ok: false, error: 'Contraseña actual incorrecta' });
+      const pwdKey = 'change-pwd:' + user.username;
+      const pwdLocked = lockMinutesLeft(pwdKey);
+      if (pwdLocked > 0) return callback?.({ ok: false, error: lockedError(pwdLocked) });
+      if (!(await verifyPassword(String(currentPassword), record.password))) {
+        registerFailure(pwdKey, LOGIN_MAX_FAILS_PER_USER);
+        return callback?.({ ok: false, error: 'Contraseña actual incorrecta' });
+      }
+      clearFailures(pwdKey);
 
       const previousPassword = record.password;
-      record.password = hashPassword(newPassword);
+      record.password = await hashPassword(String(newPassword));
       try {
         await saveUser(record);
       } catch (err) {
@@ -786,7 +1252,7 @@ module.exports = (io, db) => {
         name,
         created_by: user.username,
         created_at: new Date().toISOString(),
-        password: password ? hashPassword(password) : null,
+        password: password ? await hashPassword(String(password)) : null,
         temporary,
         department
       };
@@ -828,6 +1294,7 @@ module.exports = (io, db) => {
 
       const results = data.users
         .filter(u => u.username !== user.username && (u.username.includes(query) || (u.displayName || '').toLowerCase().includes(query)))
+        .filter(u => !data_?.activeOnly || u.status === 'active')
         .slice(0, 20)
         .map(u => {
           const row = getFriendRow(user.username, u.username);
@@ -982,6 +1449,8 @@ module.exports = (io, db) => {
         role: u.role || 'user',
         departments: u.departments || [],
         status: u.status || 'active',
+        email: u.email || null,
+        twoFactorEnabled: !!u.twoFactorEnabled,
         created_at: u.created_at
       })));
     });
@@ -992,6 +1461,7 @@ module.exports = (io, db) => {
       callback?.(data.users.filter(u => u.status === 'pending').map(u => ({
         username: u.username,
         displayName: u.displayName || u.username,
+        email: u.email || null,
         created_at: u.created_at
       })));
     });
@@ -1038,11 +1508,18 @@ module.exports = (io, db) => {
       const user = users.get(socket.id);
       if (!user || user.role !== 'admin') return callback?.({ ok: false, error: 'No autorizado' });
 
-      const { username, displayName, role, departments } = data_ || {};
+      const { username, displayName, role, departments, email } = data_ || {};
       if (!username) return callback?.({ ok: false, error: 'Usuario requerido' });
 
       const target = data.users.find(u => u.username === username);
       if (!target) return callback?.({ ok: false, error: 'Usuario no encontrado' });
+
+      let newEmail;
+      if (email !== undefined) {
+        newEmail = normalizeEmail(email) || null;
+        if (newEmail && (!EMAIL_RE.test(newEmail) || newEmail.length > 255)) return callback?.({ ok: false, error: 'Correo no válido' });
+        if (newEmail && emailInUse(newEmail, target.username)) return callback?.({ ok: false, error: 'Ese correo ya está registrado en otra cuenta' });
+      }
 
       if (displayName !== undefined) target.displayName = displayName;
       if (role !== undefined && (role === 'admin' || role === 'user')) target.role = role;
@@ -1054,6 +1531,12 @@ module.exports = (io, db) => {
           }
         }
         target.departments = deptList;
+      }
+      if (newEmail !== undefined && newEmail !== (target.email || null)) {
+        // Correo nuevo = hay que volver a verificarlo: el doble factor se reactiva en el próximo ingreso.
+        target.email = newEmail;
+        target.twoFactorEnabled = false;
+        loginCodes.delete(target.username);
       }
       try {
         await saveUser(target);
@@ -1135,7 +1618,7 @@ module.exports = (io, db) => {
       const room = data.rooms.find(r => r.name === name);
       if (!room) return callback?.({ ok: false, error: 'Sala no existe' });
 
-      room.password = password ? hashPassword(password) : null;
+      room.password = password ? await hashPassword(String(password)) : null;
       try {
         await saveRoom(room);
       } catch (err) {
@@ -1178,7 +1661,8 @@ module.exports = (io, db) => {
       const target = data.users.find(u => u.username === username);
       if (!target) return callback?.({ ok: false, error: 'Usuario no encontrado' });
 
-      target.password = hashPassword(newPassword);
+      target.password = await hashPassword(String(newPassword));
+      clearFailures('login-user:' + target.username); // el admin le da una contraseña nueva: se quita el bloqueo por intentos
       try {
         await saveUser(target);
       } catch (err) {
@@ -1215,26 +1699,53 @@ module.exports = (io, db) => {
         }
       }
 
-      for (const [sid, u] of users) {
-        if (u.username === delUsername) {
-          for (const [roomName, sockets] of roomUsers) {
-            if (sockets.has(sid)) {
-              sockets.delete(sid);
-              if (sockets.size === 0) roomUsers.delete(roomName);
-              break;
-            }
-          }
-          if (roomUnreads[delUsername]) {
-            delete roomUnreads[delUsername];
-          }
-          if (u.uploadToken) uploadTokens.delete(u.uploadToken);
-          io.to(sid).emit('force-disconnect', { reason: 'Tu cuenta ha sido eliminada por un administrador' });
-          users.delete(sid);
-          break;
+      for (const m of data.groupMembers.filter(x => x.username === delUsername)) {
+        const group = findGroup(m.group_id);
+        if (!group) continue;
+        try {
+          if (await removeGroupMembership(group, delUsername) !== 'deleted') broadcastGroup(group);
+        } catch (err) {
+          console.error('removeGroupMembership error:', err);
         }
       }
 
+      kickUser(delUsername, 'Tu cuenta ha sido eliminada por un administrador');
+
       broadcastAllUsers();
+      callback?.({ ok: true });
+    });
+
+    socket.on('admin-block-user', async (data_, callback) => {
+      const user = users.get(socket.id);
+      if (!user || user.role !== 'admin') return callback?.({ ok: false, error: 'No autorizado' });
+
+      const { username, blocked } = data_ || {};
+      if (!username) return callback?.({ ok: false, error: 'Usuario requerido' });
+      if (username === user.username) return callback?.({ ok: false, error: 'No puedes bloquearte a ti mismo' });
+      if (username === 'admin') return callback?.({ ok: false, error: 'No puedes bloquear al usuario admin' });
+
+      const target = data.users.find(u => u.username === username);
+      if (!target) return callback?.({ ok: false, error: 'Usuario no encontrado' });
+      if (blocked && target.status !== 'active') return callback?.({ ok: false, error: 'Solo se pueden bloquear cuentas activas' });
+      if (!blocked && target.status !== 'blocked') return callback?.({ ok: false, error: 'Esa cuenta no está bloqueada' });
+
+      const prevStatus = target.status;
+      target.status = blocked ? 'blocked' : 'active';
+      try {
+        await saveUser(target);
+      } catch (err) {
+        console.error('admin-block-user error:', err);
+        target.status = prevStatus;
+        return callback?.({ ok: false, error: 'Error al guardar en la base de datos' });
+      }
+
+      if (blocked) {
+        loginCodes.delete(username);
+        if (kickUser(username, 'Tu cuenta ha sido bloqueada por un administrador')) {
+          broadcastAllUsers();
+          notifyFriendsOfStatusChange(username);
+        }
+      }
       callback?.({ ok: true });
     });
 
@@ -1408,6 +1919,226 @@ module.exports = (io, db) => {
       callback?.({ ok: true, location });
     });
 
+    // ===== Grupos =====
+
+    socket.on('get-groups', (callback) => {
+      const user = users.get(socket.id);
+      if (!user) return callback?.({ groups: [], invitations: [] });
+      const mine = data.groupMembers.filter(m => m.username === user.username);
+      const groups = mine.filter(m => m.status === 'member')
+        .map(m => findGroup(m.group_id)).filter(Boolean)
+        .map(g => groupView(g, user.username));
+      const invitations = mine.filter(m => m.status === 'invited')
+        .map(m => { const g = findGroup(m.group_id); return g ? invitationView(g, m) : null; })
+        .filter(Boolean);
+      callback?.({ groups, invitations });
+    });
+
+    socket.on('create-group', async (data_, callback) => {
+      const user = users.get(socket.id);
+      if (!user) return callback?.({ ok: false, error: 'No autenticado' });
+      const name = cleanGroupName(data_?.name);
+      if (!name) return callback?.({ ok: false, error: 'El grupo necesita un nombre' });
+      const members = Array.isArray(data_?.members) ? data_.members : [];
+
+      const group = { name, created_by: user.username, created_at: new Date().toISOString() };
+      try {
+        await saveGroup(group);
+        data.groups.push(group);
+        const owner = { group_id: group.id, username: user.username, role: 'owner', status: 'member', invited_by: null, created_at: group.created_at };
+        data.groupMembers.push(owner);
+        await saveGroupMember(owner);
+        await inviteToGroup(group, user.username, members);
+      } catch (err) {
+        console.error('create-group error:', err);
+        return callback?.({ ok: false, error: 'Error al guardar en la base de datos' });
+      }
+      callback?.({ ok: true, group: groupView(group, user.username) });
+    });
+
+    socket.on('group-invite', async (data_, callback) => {
+      const user = users.get(socket.id);
+      if (!user) return callback?.({ ok: false, error: 'No autenticado' });
+      const group = findGroup(data_?.groupId);
+      if (!group || !canManageGroup(group.id, user.username)) return callback?.({ ok: false, error: 'No puedes invitar a este grupo' });
+      let invited;
+      try {
+        invited = await inviteToGroup(group, user.username, data_?.usernames);
+      } catch (err) {
+        console.error('group-invite error:', err);
+        return callback?.({ ok: false, error: 'Error al guardar en la base de datos' });
+      }
+      if (invited.length === 0) return callback?.({ ok: false, error: 'Ese usuario ya está en el grupo o no está disponible' });
+      broadcastGroup(group);
+      callback?.({ ok: true, invited });
+    });
+
+    socket.on('group-respond-invite', async (data_, callback) => {
+      const user = users.get(socket.id);
+      if (!user) return callback?.({ ok: false, error: 'No autenticado' });
+      const group = findGroup(data_?.groupId);
+      const m = group && groupMembership(group.id, user.username);
+      if (!m || m.status !== 'invited') return callback?.({ ok: false, error: 'La invitación ya no existe' });
+      try {
+        if (data_?.accept) {
+          m.status = 'member';
+          try {
+            await saveGroupMember(m);
+          } catch (err) {
+            m.status = 'invited';
+            throw err;
+          }
+        } else {
+          await removeGroupMembership(group, user.username);
+        }
+      } catch (err) {
+        console.error('group-respond-invite error:', err);
+        return callback?.({ ok: false, error: 'Error al guardar en la base de datos' });
+      }
+      broadcastGroup(group);
+      callback?.({ ok: true, group: data_?.accept ? groupView(group, user.username) : null });
+    });
+
+    socket.on('group-remove-member', async (data_, callback) => {
+      const user = users.get(socket.id);
+      if (!user) return callback?.({ ok: false, error: 'No autenticado' });
+      const group = findGroup(data_?.groupId);
+      if (!group || !canManageGroup(group.id, user.username)) return callback?.({ ok: false, error: 'No puedes administrar este grupo' });
+      const targetName = data_?.username;
+      if (targetName === user.username) return callback?.({ ok: false, error: 'Para salir usa "Salir del grupo"' });
+      const target = groupMembership(group.id, targetName);
+      if (!target) return callback?.({ ok: false, error: 'Ese usuario no está en el grupo' });
+      if (target.role === 'owner') return callback?.({ ok: false, error: 'No se puede quitar al creador del grupo' });
+      const actor = groupMembership(group.id, user.username);
+      if (target.role === 'admin' && actor.role !== 'owner') return callback?.({ ok: false, error: 'Solo el creador puede quitar a un administrador' });
+
+      try {
+        await removeGroupMembership(group, targetName);
+      } catch (err) {
+        console.error('group-remove-member error:', err);
+        return callback?.({ ok: false, error: 'Error al guardar en la base de datos' });
+      }
+      emitToUsername(targetName, 'group-removed', { id: group.id, name: group.name, reason: target.status === 'invited' ? 'invitation-cancelled' : 'removed' });
+      broadcastGroup(group);
+      callback?.({ ok: true });
+    });
+
+    socket.on('group-leave', async (data_, callback) => {
+      const user = users.get(socket.id);
+      if (!user) return callback?.({ ok: false, error: 'No autenticado' });
+      const group = findGroup(data_?.groupId);
+      if (!group || !isGroupMember(group.id, user.username)) return callback?.({ ok: false, error: 'No perteneces a este grupo' });
+      let result;
+      try {
+        result = await removeGroupMembership(group, user.username);
+      } catch (err) {
+        console.error('group-leave error:', err);
+        return callback?.({ ok: false, error: 'Error al guardar en la base de datos' });
+      }
+      if (result !== 'deleted') broadcastGroup(group);
+      callback?.({ ok: true });
+    });
+
+    socket.on('group-rename', async (data_, callback) => {
+      const user = users.get(socket.id);
+      if (!user) return callback?.({ ok: false, error: 'No autenticado' });
+      const group = findGroup(data_?.groupId);
+      if (!group || !canManageGroup(group.id, user.username)) return callback?.({ ok: false, error: 'No puedes administrar este grupo' });
+      const name = cleanGroupName(data_?.name);
+      if (!name) return callback?.({ ok: false, error: 'El grupo necesita un nombre' });
+      const prev = group.name;
+      group.name = name;
+      try {
+        await renameGroup(group.id, name);
+      } catch (err) {
+        console.error('group-rename error:', err);
+        group.name = prev;
+        return callback?.({ ok: false, error: 'Error al guardar en la base de datos' });
+      }
+      broadcastGroup(group);
+      callback?.({ ok: true });
+    });
+
+    socket.on('group-set-admin', async (data_, callback) => {
+      const user = users.get(socket.id);
+      if (!user) return callback?.({ ok: false, error: 'No autenticado' });
+      const group = findGroup(data_?.groupId);
+      if (!group || groupMembership(group.id, user.username)?.role !== 'owner') {
+        return callback?.({ ok: false, error: 'Solo el creador puede nombrar administradores' });
+      }
+      const target = groupMembership(group.id, data_?.username);
+      if (!target || target.status !== 'member' || target.role === 'owner') return callback?.({ ok: false, error: 'Usuario no válido' });
+      const prev = target.role;
+      target.role = data_?.admin ? 'admin' : 'member';
+      try {
+        await saveGroupMember(target);
+      } catch (err) {
+        console.error('group-set-admin error:', err);
+        target.role = prev;
+        return callback?.({ ok: false, error: 'Error al guardar en la base de datos' });
+      }
+      broadcastGroup(group);
+      callback?.({ ok: true });
+    });
+
+    socket.on('group-delete', async (data_, callback) => {
+      const user = users.get(socket.id);
+      if (!user) return callback?.({ ok: false, error: 'No autenticado' });
+      const group = findGroup(data_?.groupId);
+      if (!group || groupMembership(group.id, user.username)?.role !== 'owner') {
+        return callback?.({ ok: false, error: 'Solo el creador puede eliminar el grupo' });
+      }
+      try {
+        await destroyGroup(group);
+      } catch (err) {
+        console.error('group-delete error:', err);
+        return callback?.({ ok: false, error: 'Error al guardar en la base de datos' });
+      }
+      callback?.({ ok: true });
+    });
+
+    socket.on('group-message', (data_, callback) => {
+      const user = users.get(socket.id);
+      if (!user) return;
+      const group = findGroup(data_?.groupId);
+      if (!group || !isGroupMember(group.id, user.username)) return callback?.({ ok: false, error: 'No perteneces a este grupo' });
+
+      const content = sanitizeContent(data_?.content);
+      const file = sanitizeFile(data_?.file);
+      const reply = sanitizeReply(data_?.reply);
+      if (!content && !file) return;
+
+      const msg = {
+        id: Date.now() + Math.random(),
+        group_id: group.id,
+        sender: user.username,
+        displayName: user.displayName || user.username,
+        avatar: user.avatar || null,
+        content: content || '',
+        file: file || null,
+        reply: reply || null,
+        reactions: {},
+        created_at: new Date().toISOString(),
+        type: 'group'
+      };
+
+      data.messages.push(msg);
+      saveMessage(msg).catch(err => console.error('saveMessage error:', err));
+      for (const username of groupMemberUsernames(group.id)) {
+        emitToUsername(username, 'group-message', msg);
+      }
+      callback?.({ ok: true });
+    });
+
+    socket.on('get-group-history', (data_, callback) => {
+      const user = users.get(socket.id);
+      if (!user) return;
+      const groupId = data_?.groupId;
+      if (!isGroupMember(groupId, user.username)) return callback?.({ ok: false, error: 'No perteneces a este grupo' });
+      const page = getGroupHistory(groupId);
+      callback?.({ ok: true, history: page.messages, hasMoreHistory: page.hasMore });
+    });
+
     socket.on('get-private-history', (data_, callback) => {
       const user = users.get(socket.id);
       if (!user) return;
@@ -1423,7 +2154,12 @@ module.exports = (io, db) => {
       const user = users.get(socket.id);
       if (!user) return callback?.({ messages: [], hasMore: false });
 
-      const { room, with: withUser, beforeId } = data_ || {};
+      const { room, with: withUser, group: groupId, beforeId } = data_ || {};
+      if (groupId) {
+        if (!isGroupMember(groupId, user.username)) return callback?.({ messages: [], hasMore: false });
+        const page = getGroupHistory(groupId, beforeId);
+        return callback?.({ messages: page.messages, hasMore: page.hasMore });
+      }
       if (room) {
         if (room !== user.currentRoom) {
           return callback?.({ messages: [], hasMore: false });

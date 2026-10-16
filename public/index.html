@@ -57,6 +57,10 @@
           <input type="text" id="register-username" placeholder="Usuario..." maxlength="30" />
         </div>
         <div class="input-group">
+          <i class="fas fa-envelope input-icon"></i>
+          <input type="email" id="register-email" placeholder="Correo electrónico..." maxlength="255" />
+        </div>
+        <div class="input-group">
           <i class="fas fa-lock input-icon"></i>
           <input type="password" id="register-password" placeholder="Contraseña..." />
         </div>
@@ -65,10 +69,38 @@
           <input type="password" id="register-confirm" placeholder="Confirmar contraseña..." />
         </div>
         <p class="create-modal-info">
-          <i class="fas fa-info-circle"></i> Tu cuenta debe ser aprobada por un administrador antes de poder ingresar.
+          <i class="fas fa-info-circle"></i> Tu cuenta debe ser aprobada por un administrador antes de poder ingresar. Al ingresar te enviaremos un código a este correo.
         </p>
         <button id="register-btn" class="btn-primary">
           <i class="fas fa-user-plus"></i> Crear cuenta
+        </button>
+      </div>
+      <div id="twofactor-form" class="login-form-box hidden">
+        <p id="twofactor-intro" class="twofactor-intro"></p>
+        <div id="twofactor-email-step" class="hidden">
+          <div class="input-group">
+            <i class="fas fa-envelope input-icon"></i>
+            <input type="email" id="twofactor-email" placeholder="Correo electrónico..." maxlength="255" />
+          </div>
+          <button id="twofactor-email-btn" class="btn-primary" style="width:100%;margin-top:12px;">
+            <i class="fas fa-paper-plane"></i> Enviar código
+          </button>
+        </div>
+        <div id="twofactor-code-step" class="hidden">
+          <div class="input-group">
+            <i class="fas fa-key input-icon"></i>
+            <input type="text" id="twofactor-code" placeholder="Código de 6 dígitos" maxlength="6" inputmode="numeric" autocomplete="one-time-code" />
+          </div>
+          <p id="twofactor-timer" class="create-modal-info"></p>
+          <button id="twofactor-verify-btn" class="btn-primary" style="width:100%;margin-top:12px;">
+            <i class="fas fa-check"></i> Verificar
+          </button>
+          <button id="twofactor-resend-btn" class="btn-secondary" style="width:100%;margin-top:8px;">
+            <i class="fas fa-redo"></i> Reenviar código
+          </button>
+        </div>
+        <button id="twofactor-cancel-btn" class="btn-link" type="button">
+          <i class="fas fa-arrow-left"></i> Volver
         </button>
       </div>
       <p id="login-error" class="login-error"></p>
@@ -309,6 +341,10 @@
             <i class="fas fa-envelope"></i> <span class="sidebar-tab-label">Privados</span>
             <span id="conv-total-badge" class="sb-badge hidden">0</span>
           </button>
+          <button class="sidebar-tab" data-panel="groups">
+            <i class="fas fa-users"></i> <span class="sidebar-tab-label">Grupos</span>
+            <span id="groups-total-badge" class="sb-badge hidden">0</span>
+          </button>
           <button class="sidebar-tab" data-panel="friends">
             <i class="fas fa-user-group"></i> <span class="sidebar-tab-label">Amigos</span>
             <span id="friends-total-badge" class="sb-badge hidden">0</span>
@@ -334,6 +370,19 @@
         </div>
         <div id="conversations-panel" class="sidebar-panel hidden">
           <div id="conversations-list"></div>
+        </div>
+        <div id="groups-panel" class="sidebar-panel hidden">
+          <div class="sidebar-footer" style="border-top:none;border-bottom:1px solid var(--border-color);">
+            <button id="create-group-btn" class="btn-secondary">
+              <i class="fas fa-plus"></i> Crear grupo
+            </button>
+          </div>
+          <div id="group-invitations-section" class="hidden">
+            <div class="sidebar-label" style="padding: 10px 12px 4px;">Invitaciones</div>
+            <div id="group-invitations-list"></div>
+          </div>
+          <div class="sidebar-label" style="padding: 10px 12px 4px;">Mis grupos</div>
+          <div id="groups-list"></div>
         </div>
         <div id="friends-panel" class="sidebar-panel hidden">
           <div class="sidebar-footer" style="border-top:none;border-bottom:1px solid var(--border-color);">
@@ -439,6 +488,9 @@
             <span id="context-global-badge" class="context-badge context-badge-global hidden" title="Sala global: accesible desde todos los departamentos">Global</span>
             <span id="context-badge" class="context-badge hidden">Privado</span>
           </div>
+          <button id="group-manage-btn" class="btn-icon hidden" title="Miembros y ajustes del grupo">
+            <i class="fas fa-users-cog"></i> Miembros
+          </button>
           <button id="back-to-room-btn" class="btn-icon hidden" title="Volver a la sala">
             <i class="fas fa-arrow-left"></i> Sala
           </button>
@@ -509,7 +561,7 @@
         <div class="sidebar-header">
           <h3><i class="fas fa-users"></i> Conectados</h3>
         </div>
-        <div class="sidebar-label">En este canal</div>
+        <div id="room-users-label" class="sidebar-label">En este canal</div>
         <div id="room-users-list"></div>
         <div class="sidebar-label" style="margin-top: 8px;">En el sistema</div>
         <div id="all-users-list"></div>
@@ -721,6 +773,11 @@
           <i class="fas fa-tag input-icon"></i>
           <input type="text" id="admin-edit-displayname" placeholder="Nombre visible" maxlength="40" />
         </div>
+        <div class="input-group" style="margin-top:12px;">
+          <i class="fas fa-envelope input-icon"></i>
+          <input type="email" id="admin-edit-email" placeholder="Correo (doble factor)" maxlength="255" />
+        </div>
+        <p class="create-modal-info"><i class="fas fa-info-circle"></i> Si cambias el correo, el usuario deberá verificarlo de nuevo al ingresar.</p>
         <div style="margin-top:12px;">
           <label style="font-size:14px;font-weight:500;display:block;margin-bottom:6px;">Rol</label>
           <select id="admin-edit-role" style="width:100%;padding:10px 12px;border-radius:var(--border-radius-sm);border:1px solid var(--border-color);font-size:14px;background:var(--bg-input);">
@@ -744,6 +801,9 @@
           </div>
         </div>
         <div class="admin-edit-delete-section">
+          <button id="admin-edit-block-btn" class="btn-secondary" style="width:100%;margin-bottom:8px;">
+            <i class="fas fa-ban"></i> Bloquear usuario
+          </button>
           <button id="admin-edit-delete-btn" class="btn-danger" style="width:100%;">
             <i class="fas fa-trash"></i> Eliminar usuario
           </button>
@@ -821,6 +881,43 @@
         </div>
         <div id="add-friend-results" class="add-friend-results"></div>
         <p id="add-friend-error" class="login-error"></p>
+      </div>
+    </div>
+  </div>
+
+  <div id="group-modal-overlay" class="hidden">
+    <div id="group-modal" class="modal-box">
+      <div class="modal-header">
+        <h3 id="group-modal-title"><i class="fas fa-users"></i> Crear grupo</h3>
+        <button id="group-modal-close" class="btn-icon"><i class="fas fa-times"></i></button>
+      </div>
+      <div class="modal-body">
+        <div class="group-modal-name-row">
+          <div class="input-group" style="flex:1;">
+            <i class="fas fa-tag input-icon"></i>
+            <input type="text" id="group-modal-name" placeholder="Nombre del grupo" maxlength="60" />
+          </div>
+          <button id="group-modal-rename-btn" class="btn-secondary hidden" title="Guardar nombre"><i class="fas fa-save"></i></button>
+        </div>
+        <div id="group-modal-members-section" class="hidden">
+          <div class="admin-edit-section-label" style="margin-top:14px;"><i class="fas fa-users"></i> Miembros</div>
+          <div id="group-modal-members" class="add-friend-results" style="margin-top:4px;"></div>
+        </div>
+        <div id="group-modal-invite-section">
+          <div class="admin-edit-section-label" style="margin-top:14px;"><i class="fas fa-user-plus"></i> Invitar personas <span class="group-modal-hint">(deberán aceptar la invitación)</span></div>
+          <div id="group-modal-selected" class="group-chips"></div>
+          <div class="input-group">
+            <i class="fas fa-search input-icon"></i>
+            <input type="text" id="group-modal-search" placeholder="Buscar por usuario o nombre..." maxlength="40" />
+          </div>
+          <div id="group-modal-results" class="add-friend-results"></div>
+        </div>
+        <p id="group-modal-error" class="login-error"></p>
+      </div>
+      <div class="modal-footer">
+        <button id="group-modal-delete" class="btn-danger hidden"><i class="fas fa-trash"></i> Eliminar grupo</button>
+        <button id="group-modal-leave" class="btn-secondary hidden"><i class="fas fa-sign-out-alt"></i> Salir del grupo</button>
+        <button id="group-modal-create" class="btn-primary"><i class="fas fa-check"></i> Crear grupo</button>
       </div>
     </div>
   </div>

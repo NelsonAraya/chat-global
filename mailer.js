@@ -60,4 +60,25 @@ async function sendPanicAlertEmail(payload) {
   });
 }
 
-module.exports = { sendPanicAlertEmail };
+// Envía el código temporal del doble factor. Si el SMTP no está configurado, devuelve false
+// para que quien llama decida qué hacer (no se puede entregar el código por correo).
+async function sendLoginCodeEmail(to, code, displayName, minutes) {
+  if (!transporter) return false;
+  await transporter.sendMail({
+    from: ALERT_EMAIL_FROM,
+    to,
+    subject: 'Tu código de acceso al Chat CORMUDESI',
+    text:
+      'Hola ' + displayName + ',\n\n' +
+      'Tu código de acceso al Chat CORMUDESI es: ' + code + '\n\n' +
+      'El código vence en ' + minutes + ' minutos. Si no intentaste ingresar, ignora este correo y avisa a un administrador.\n',
+    html:
+      '<p>Hola ' + escapeHtml(displayName) + ',</p>' +
+      '<p>Tu código de acceso al Chat CORMUDESI es:</p>' +
+      '<p style="font-size:28px;font-weight:bold;letter-spacing:6px;">' + escapeHtml(code) + '</p>' +
+      '<p>El código vence en ' + minutes + ' minutos. Si no intentaste ingresar, ignora este correo y avisa a un administrador.</p>'
+  });
+  return true;
+}
+
+module.exports = { sendPanicAlertEmail, sendLoginCodeEmail };

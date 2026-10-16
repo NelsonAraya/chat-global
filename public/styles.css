@@ -276,6 +276,25 @@ body {
   text-align: center;
 }
 
+.twofactor-intro {
+  font-size: 14px;
+  color: var(--text-secondary);
+  line-height: 1.5;
+}
+
+.btn-link {
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  font-size: 13px;
+  cursor: pointer;
+  align-self: center;
+}
+
+.btn-link:hover {
+  text-decoration: underline;
+}
+
 /* ===================== CHAT SCREEN ===================== */
 
 #chat-screen {
@@ -869,6 +888,71 @@ body {
   background: var(--bg-input);
   color: var(--text-muted);
   cursor: default;
+}
+
+/* ===================== GRUPOS ===================== */
+
+.group-avatar {
+  font-size: 15px;
+}
+
+.group-modal-name-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.group-modal-hint {
+  font-weight: 400;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.group-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 6px 0 8px;
+}
+
+.group-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 6px 4px 10px;
+  border-radius: 999px;
+  background: var(--color-primary-light);
+  color: var(--color-primary);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.group-chip button {
+  border: none;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  padding: 0 4px;
+}
+
+.group-member-actions {
+  display: flex;
+  gap: 4px;
+  flex-shrink: 0;
+}
+
+.group-member-actions .add-friend-action-btn.secondary {
+  background: var(--bg-input);
+  color: var(--text-secondary);
+}
+
+.group-member-actions .add-friend-action-btn.danger {
+  background: var(--color-danger);
+}
+
+#group-modal .modal-body {
+  max-height: 70vh;
+  overflow-y: auto;
 }
 
 .room-item .room-name {
@@ -2005,7 +2089,8 @@ body {
 #admin-room-pwd-overlay,
 #create-dept-modal-overlay,
 #department-select-overlay,
-#add-friend-modal-overlay {
+#add-friend-modal-overlay,
+#group-modal-overlay {
   position: fixed;
   top: 0;
   left: 0;
@@ -2031,7 +2116,8 @@ body {
 #admin-room-pwd-overlay.hidden,
 #create-dept-modal-overlay.hidden,
 #department-select-overlay.hidden,
-#add-friend-modal-overlay.hidden {
+#add-friend-modal-overlay.hidden,
+#group-modal-overlay.hidden {
   display: none;
 }
 

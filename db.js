@@ -1,15 +1,11 @@
 const mysql = require('mysql2/promise');
-const crypto = require('crypto');
+const { hashPassword, verifyPassword, isLegacyHash } = require('./passwords');
 
 const DB_HOST = process.env.DB_HOST || 'localhost';
 const DB_PORT = process.env.DB_PORT || 3306;
 const DB_USER = process.env.DB_USER || 'root';
 const DB_PASSWORD = process.env.DB_PASSWORD || '';
 const DB_NAME = process.env.DB_NAME || 'chat_cormudesi';
-
-function hashPassword(password) {
-  return crypto.createHash('sha256').update(password).digest('hex');
-}
 
 module.exports = (async () => {
   // Crea la base de datos si no existe (requiere conexión sin seleccionar schema)
@@ -37,11 +33,16 @@ module.exports = (async () => {
     location VARCHAR(255),
     departments TEXT,
     status VARCHAR(20) DEFAULT 'active',
+    email VARCHAR(255),
+    two_factor_enabled TINYINT(1) DEFAULT 0,
     created_at VARCHAR(40)
   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
 
   // Migración: las cuentas existentes antes de este cambio quedan activas automáticamente.
   try { await pool.query("ALTER TABLE users ADD COLUMN status VARCHAR(20) DEFAULT 'active'"); } catch {}
+  // Migración: correo de registro y estado del doble factor (código por correo).
+  try { await pool.query('ALTER TABLE users ADD COLUMN email VARCHAR(255)'); } catch {}
+  try { await pool.query('ALTER TABLE users ADD COLUMN two_factor_enabled TINYINT(1) DEFAULT 0'); } catch {}
 
   await pool.query(`CREATE TABLE IF NOT EXISTS rooms (
     name VARCHAR(64) PRIMARY KEY,
@@ -68,9 +69,33 @@ module.exports = (async () => {
     created_at VARCHAR(40),
     recipient VARCHAR(64),
     type VARCHAR(20) DEFAULT 'room',
+    group_id INT,
     INDEX idx_messages_room (room_name),
     INDEX idx_messages_recipient (recipient),
     INDEX idx_messages_sender (sender)
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
+
+  // Migración: mensajes de grupo.
+  try { await pool.query('ALTER TABLE messages ADD COLUMN group_id INT'); } catch {}
+  try { await pool.query('ALTER TABLE messages ADD INDEX idx_messages_group (group_id)'); } catch {}
+
+  await pool.query(`CREATE TABLE IF NOT EXISTS chat_groups (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    name VARCHAR(100) NOT NULL,
+    created_by VARCHAR(64) NOT NULL,
+    created_at VARCHAR(40)
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
+
+  // role: owner | admin | member. status: invited (debe aceptar) | member.
+  await pool.query(`CREATE TABLE IF NOT EXISTS group_members (
+    group_id INT NOT NULL,
+    username VARCHAR(64) NOT NULL,
+    role VARCHAR(20) DEFAULT 'member',
+    status VARCHAR(20) DEFAULT 'invited',
+    invited_by VARCHAR(64),
+    created_at VARCHAR(40),
+    PRIMARY KEY (group_id, username),
+    INDEX idx_group_members_user (username)
   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
 
   await pool.query(`CREATE TABLE IF NOT EXISTS departments (
@@ -113,7 +138,7 @@ module.exports = (async () => {
   const now = new Date().toISOString();
   await pool.query(
     'INSERT IGNORE INTO users (username, password, display_name, role, created_at) VALUES (?, ?, ?, ?, ?)',
-    ['admin', hashPassword('admin'), 'admin', 'admin', now]
+    ['admin', await hashPassword('admin'), 'admin', 'admin', now]
   );
   await pool.query(
     'INSERT IGNORE INTO consent_log (username, terms_version, accepted_at, ip_address) VALUES (?, ?, ?, ?)',
@@ -129,7 +154,7 @@ module.exports = (async () => {
     if (r.departments) {
       try { departments = JSON.parse(r.departments) || []; } catch { departments = []; }
     }
-    return { username: r.username, password: r.password, displayName: r.display_name, avatar: r.avatar, role: r.role, location: r.location, departments, status: r.status || 'active', created_at: r.created_at };
+    return { username: r.username, password: r.password, displayName: r.display_name, avatar: r.avatar, role: r.role, location: r.location, departments, status: r.status || 'active', email: r.email || null, twoFactorEnabled: !!r.two_factor_enabled, created_at: r.created_at };
   };
   const mapRoom = (r) => ({ name: r.name, created_by: r.created_by, created_at: r.created_at, password: r.password, temporary: !!r.temporary, department: r.department || null });
   const mapDepartment = (r) => ({ name: r.name, displayName: r.display_name, created_at: r.created_at });
@@ -138,8 +163,11 @@ module.exports = (async () => {
     content: m.content,
     file: m.file_url ? { url: m.file_url, name: m.file_name, size: m.file_size, type: m.file_mimetype } : null,
     reply: m.reply ? JSON.parse(m.reply) : null,
-    reactions: m.reactions ? JSON.parse(m.reactions) : {}, created_at: m.created_at, recipient: m.recipient, type: m.type
+    reactions: m.reactions ? JSON.parse(m.reactions) : {}, created_at: m.created_at, recipient: m.recipient, type: m.type,
+    group_id: m.group_id || null
   });
+  const mapGroup = (r) => ({ id: r.id, name: r.name, created_by: r.created_by, created_at: r.created_at });
+  const mapGroupMember = (r) => ({ group_id: r.group_id, username: r.username, role: r.role || 'member', status: r.status || 'invited', invited_by: r.invited_by, created_at: r.created_at });
 
   const mapFriend = (r) => ({ id: r.id, requester: r.requester, recipient: r.recipient, status: r.status, created_at: r.created_at, responded_at: r.responded_at });
 
@@ -148,24 +176,29 @@ module.exports = (async () => {
   const [messageRows] = await pool.query('SELECT * FROM messages ORDER BY created_at');
   const [deptRows] = await pool.query('SELECT * FROM departments ORDER BY name');
   const [friendRows] = await pool.query('SELECT * FROM friends ORDER BY id');
+  const [groupRows] = await pool.query('SELECT * FROM chat_groups ORDER BY id');
+  const [groupMemberRows] = await pool.query('SELECT * FROM group_members ORDER BY created_at');
 
   let data = {
     users: userRows.map(mapUser),
     rooms: roomRows.map(mapRoom),
     messages: messageRows.map(mapMessage),
     departments: deptRows.map(mapDepartment),
-    friends: friendRows.map(mapFriend)
+    friends: friendRows.map(mapFriend),
+    groups: groupRows.map(mapGroup),
+    groupMembers: groupMemberRows.map(mapGroupMember)
   };
 
   // ===== Persistencia incremental: cada función escribe solo la fila que cambió =====
 
   const saveUser = async (u) => {
     await pool.query(
-      `INSERT INTO users (username, password, display_name, avatar, role, location, departments, status, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `INSERT INTO users (username, password, display_name, avatar, role, location, departments, status, email, two_factor_enabled, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON DUPLICATE KEY UPDATE password=VALUES(password), display_name=VALUES(display_name), avatar=VALUES(avatar),
-         role=VALUES(role), location=VALUES(location), departments=VALUES(departments), status=VALUES(status)`,
-      [u.username, u.password, u.displayName || null, u.avatar || null, u.role || 'user', u.location || null, JSON.stringify(u.departments || []), u.status || 'active', u.created_at || null]
+         role=VALUES(role), location=VALUES(location), departments=VALUES(departments), status=VALUES(status),
+         email=VALUES(email), two_factor_enabled=VALUES(two_factor_enabled)`,
+      [u.username, u.password, u.displayName || null, u.avatar || null, u.role || 'user', u.location || null, JSON.stringify(u.departments || []), u.status || 'active', u.email || null, u.twoFactorEnabled ? 1 : 0, u.created_at || null]
     );
   };
 
@@ -189,13 +222,13 @@ module.exports = (async () => {
 
   const saveMessage = async (m) => {
     await pool.query(
-      `INSERT INTO messages (id, room_name, sender, display_name, avatar, content, file_name, file_url, file_size, file_mimetype, reply, reactions, created_at, recipient, type)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO messages (id, room_name, sender, display_name, avatar, content, file_name, file_url, file_size, file_mimetype, reply, reactions, created_at, recipient, type, group_id)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [m.id, m.room_name || null, m.sender, m.displayName || null, m.avatar || null,
         m.content || '', m.file?.name || null, m.file?.url || null, m.file?.size || null, m.file?.type || null,
         m.reply ? JSON.stringify(m.reply) : null,
         JSON.stringify(m.reactions || {}),
-        m.created_at || null, m.recipient || null, m.type || 'room']
+        m.created_at || null, m.recipient || null, m.type || 'room', m.group_id || null]
     );
   };
 
@@ -236,6 +269,39 @@ module.exports = (async () => {
     await pool.query('DELETE FROM friends WHERE id = ?', [id]);
   };
 
+  const saveGroup = async (g) => {
+    const [result] = await pool.query(
+      'INSERT INTO chat_groups (name, created_by, created_at) VALUES (?, ?, ?)',
+      [g.name, g.created_by, g.created_at || null]
+    );
+    g.id = result.insertId;
+    return g;
+  };
+
+  const renameGroup = async (id, name) => {
+    await pool.query('UPDATE chat_groups SET name = ? WHERE id = ?', [name, id]);
+  };
+
+  // Borra el grupo, sus miembros y sus mensajes.
+  const deleteGroup = async (id) => {
+    await pool.query('DELETE FROM messages WHERE group_id = ?', [id]);
+    await pool.query('DELETE FROM group_members WHERE group_id = ?', [id]);
+    await pool.query('DELETE FROM chat_groups WHERE id = ?', [id]);
+  };
+
+  const saveGroupMember = async (m) => {
+    await pool.query(
+      `INSERT INTO group_members (group_id, username, role, status, invited_by, created_at)
+       VALUES (?, ?, ?, ?, ?, ?)
+       ON DUPLICATE KEY UPDATE role=VALUES(role), status=VALUES(status)`,
+      [m.group_id, m.username, m.role || 'member', m.status || 'invited', m.invited_by || null, m.created_at || null]
+    );
+  };
+
+  const deleteGroupMember = async (groupId, username) => {
+    await pool.query('DELETE FROM group_members WHERE group_id = ? AND username = ?', [groupId, username]);
+  };
+
   const saveAlert = async (a) => {
     await pool.query(
       'INSERT INTO alerts (username, display_name, department, department_display_name, location, created_at) VALUES (?, ?, ?, ?, ?, ?)',
@@ -260,13 +326,14 @@ module.exports = (async () => {
   };
 
   return {
-    data, hashPassword,
+    data, hashPassword, verifyPassword, isLegacyHash,
     saveUser, deleteUser,
     saveRoom, deleteRoom,
     saveMessage, updateMessageReactions, deleteMessagesByRoom,
     saveDepartment, deleteDepartment,
     saveConsent,
     saveFriendRequest, updateFriendStatus, deleteFriendRow,
+    saveGroup, renameGroup, deleteGroup, saveGroupMember, deleteGroupMember,
     saveAlert, getAlertHistory
   };
 })();
