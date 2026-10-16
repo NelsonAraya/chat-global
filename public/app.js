@@ -398,6 +398,7 @@ document.addEventListener('click', function(e) {
 });
 
 attachBtn.addEventListener('click', function() {
+  showToast('Puedes adjuntar archivos de máximo 2 MB');
   fileInput.click();
 });
 
@@ -405,8 +406,8 @@ fileInput.addEventListener('change', function() {
   var file = fileInput.files[0];
   if (!file) return;
 
-  if (file.size > 10 * 1024 * 1024) {
-    showToast('El archivo es demasiado grande (máximo 10 MB)');
+  if (file.size > 2 * 1024 * 1024) {
+    showToast('El archivo es demasiado grande (máximo 2 MB)');
     fileInput.value = '';
     return;
   }
@@ -840,8 +841,8 @@ nameModalConfirm.addEventListener('click', function() {
 avatarInput.addEventListener('change', function() {
   var file = avatarInput.files[0];
   if (!file) return;
-  if (file.size > 5 * 1024 * 1024) {
-    showToast('La imagen debe ser menor a 5 MB');
+  if (file.size > 2 * 1024 * 1024) {
+    showToast('La imagen debe ser menor a 2 MB');
     avatarInput.value = '';
     return;
   }
@@ -865,6 +866,7 @@ avatarInput.addEventListener('change', function() {
 });
 
 headerAvatar.addEventListener('click', function() {
+  showToast('La imagen de avatar debe ser de máximo 2 MB');
   avatarInput.click();
 });
 

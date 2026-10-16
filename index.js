@@ -26,12 +26,20 @@ const storage = multer.diskStorage({
 });
 const upload = multer({
   storage,
-  limits: { fileSize: 10 * 1024 * 1024 }
+  limits: { fileSize: 2 * 1024 * 1024 }
 });
 
 let socketHandlers = null;
 
-app.post('/api/upload', upload.single('file'), (req, res) => {
+app.post('/api/upload', (req, res, next) => {
+  upload.single('file')(req, res, (err) => {
+    if (err instanceof multer.MulterError && err.code === 'LIMIT_FILE_SIZE') {
+      return res.status(413).json({ error: 'El archivo es demasiado grande (máximo 2 MB)' });
+    }
+    if (err) return res.status(400).json({ error: 'Error al subir el archivo' });
+    next();
+  });
+}, (req, res) => {
   if (!req.file) {
     return res.status(400).json({ error: 'No se recibió archivo' });
   }
