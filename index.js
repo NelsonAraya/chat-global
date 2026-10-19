@@ -1,4 +1,7 @@
 require('dotenv').config();
+// scrypt (contraseñas) corre en el grupo de hilos de Node, que por defecto tiene solo 4: con cientos de ingresos
+// a la vez (p. ej. a las 8:00) harían cola. Debe fijarse antes de que se use el primer hilo.
+process.env.UV_THREADPOOL_SIZE = process.env.UV_THREADPOOL_SIZE || '16';
 
 const express = require('express');
 const http = require('http');
@@ -10,10 +13,41 @@ const os = require('os');
 const crypto = require('crypto');
 const multer = require('multer');
 const forge = require('node-forge');
+const compression = require('compression');
 
 const app = express();
+app.disable('x-powered-by');
 
-app.use(express.static(path.join(__dirname, 'public')));
+// Comprime las respuestas (app.js, estilos, HTML): con 2000 equipos entrando a la vez se envía ~4 veces menos.
+app.use(compression());
+
+// Cabeceras de seguridad de la página. Los archivos subidos (/uploads) llevan su propia política, más estricta.
+const PAGE_CSP = [
+  "default-src 'self'",
+  "script-src 'self'",
+  "style-src 'self' 'unsafe-inline' https://cdnjs.cloudflare.com",
+  "font-src 'self' https://cdnjs.cloudflare.com data:",
+  "img-src 'self' data: blob:",
+  "media-src 'self' blob:",
+  "connect-src 'self'",
+  "object-src 'none'",
+  "base-uri 'self'",
+  "form-action 'self'",
+  "frame-ancestors 'none'"
+].join('; ');
+app.use((req, res, next) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'DENY'); // nadie puede mostrar el chat dentro de otra página
+  res.setHeader('Referrer-Policy', 'same-origin');
+  res.setHeader('Permissions-Policy', 'camera=(), geolocation=(), microphone=(self)');
+  if (!req.path.startsWith('/uploads/')) res.setHeader('Content-Security-Policy', PAGE_CSP);
+  next();
+});
+
+// Los navegadores siempre preguntan si hay una versión nueva (ETag): una recarga trae solo lo que cambió.
+app.use(express.static(path.join(__dirname, 'public'), {
+  setHeaders: (res) => res.setHeader('Cache-Control', 'no-cache')
+}));
 
 const UPLOADS_DIR = path.join(__dirname, 'uploads');
 const storage = multer.diskStorage({

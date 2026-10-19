@@ -22,7 +22,6 @@ module.exports = (io, db, errorLog) => {
   const TERMS_VERSION = '1.0';
   const users = new Map();
   const roomUsers = new Map();
-  const roomUnreads = {};
   const uploadTokens = new Map(); // token -> socket.id, solo usuarios autenticados pueden subir archivos
 
   // ===== Validación de datos que llegan del navegador =====
@@ -116,7 +115,6 @@ module.exports = (io, db, errorLog) => {
   const revokeUserSessions = async (username, kickReason) => {
     await deleteUserSessions(username);
     if (kickReason && kickUser(username, kickReason)) {
-      broadcastAllUsers();
       notifyFriendsOfStatusChange(username);
     }
   };
@@ -257,87 +255,169 @@ module.exports = (io, db, errorLog) => {
     return !sockets || sockets.size === 0;
   };
 
-  // Un usuario "target" (dept propio) es visible para un visor admin, para cualquiera si target es admin,
-  // o solo para quienes comparten su mismo departamento.
-  const canViewUser = (target, viewerDept, viewerRole) => {
-    if (viewerRole === 'admin') return true;
-    if (target.role === 'admin') return true;
-    return !!target.department && target.department === viewerDept;
-  };
-
-  // Una sala sin departamento es global (visible por todos). Si tiene departamento, solo
-  // la ven los admins y los usuarios de ese mismo departamento.
-  const canViewRoom = (room, viewerDept, viewerRole) => {
-    if (viewerRole === 'admin') return true;
-    return !room.department || room.department === viewerDept;
-  };
-
-  const getAllRooms = (viewerDept, viewerRole) => data.rooms
-    .filter(r => canViewRoom(r, viewerDept, viewerRole))
-    .map(r => ({ name: r.name, hasPassword: !!r.password, temporary: !!r.temporary, department: r.department || null }));
-
-  const getAllUsers = (viewerDept, viewerRole) => {
-    const seen = new Map();
-    for (const [, u] of users) {
-      if (!canViewUser(u, viewerDept, viewerRole)) continue;
-      if (!seen.has(u.username)) {
-        seen.set(u.username, { username: u.username, displayName: u.displayName || u.username, avatar: u.avatar || null });
+  // ===== Índices en memoria =====
+  // Buscar una cuenta o las amistades de alguien recorría la lista completa (2000 cuentas, decenas de miles de
+  // amistades) en cada ingreso, salida y mensaje. Estos índices se rehacen solos cuando la lista cambia de
+  // tamaño o se reemplaza (agregar = push, quitar = filter); los cambios dentro de una fila no los afectan.
+  const lazyIndex = (getList, build) => {
+    let list = null;
+    let length = -1;
+    let index = null;
+    return () => {
+      const current = getList();
+      if (current !== list || current.length !== length) {
+        list = current;
+        length = current.length;
+        index = build(current);
       }
+      return index;
+    };
+  };
+  const usersIndex = lazyIndex(() => data.users, list => new Map(list.map(u => [u.username, u])));
+  const findUser = (username) => (typeof username === 'string' ? usersIndex().get(username) : undefined);
+
+  const friendsIndex = lazyIndex(() => data.friends, list => {
+    const byUser = new Map();
+    const add = (username, row) => {
+      if (!byUser.has(username)) byUser.set(username, []);
+      byUser.get(username).push(row);
+    };
+    for (const f of list) {
+      add(f.requester, f);
+      if (f.recipient !== f.requester) add(f.recipient, f);
     }
-    return Array.from(seen.values());
+    return byUser;
+  });
+  const friendRowsOf = (username) => friendsIndex().get(username) || [];
+
+  // ===== Administradores =====
+  // Un admin SIN departamentos asignados es el administrador general: ve y administra todo.
+  // Los demás admins lo son solo en los departamentos marcados como tales (adminDepartments); en el resto de
+  // sus departamentos son usuarios normales. Solo ven y administran lo de sus departamentos de admin
+  // (usuarios, salas, alertas y estadísticas). Las solicitudes de registro, los departamentos y el registro
+  // de errores quedan solo para el administrador general.
+  const isSuperAdmin = (u) => !!u && u.role === 'admin' && !(u.departments || []).length;
+  const adminDeptsOf = (u) => (u && u.role === 'admin' ? (u.adminDepartments || []) : []);
+  const isDeptAdmin = (u) => !isSuperAdmin(u) && adminDeptsOf(u).length > 0;
+
+  // Departamentos "en los que está" un usuario conectado: aquellos donde es admin (todos a la vez) más el
+  // que eligió al entrar, donde puede ser un usuario normal.
+  const deptsOf = (u) => {
+    const list = [...adminDeptsOf(u)];
+    if (u.department && !list.includes(u.department)) list.push(u.department);
+    return list;
   };
 
-  // Cada socket conectado vive en una "sala" interna de Socket.IO según su
-  // contexto de visibilidad: los admins en 'role:admin' (ven a todos), el resto
-  // en 'dept:<departamento>' (o 'dept:__unassigned__' si no tiene ninguno
-  // asignado). Esto permite calcular y emitir la lista de usuarios una sola vez
-  // por grupo en vez de una vez por cada persona conectada.
+  // Departamentos que administra un admin (null = todos).
+  const adminScope = (admin) => (isSuperAdmin(admin) ? null : adminDeptsOf(admin));
+  const inAdminScope = (admin, department) => isSuperAdmin(admin) || (!!department && adminScope(admin).includes(department));
+
+  // ¿Puede este admin administrar esta cuenta? El general, a todos. El de departamento, a quienes comparten
+  // alguno de sus departamentos de admin, siempre que la cuenta no sea admin fuera de ellos; nunca a un
+  // administrador general.
+  const canManageUser = (admin, target) => {
+    if (isSuperAdmin(admin)) return true;
+    if (!isDeptAdmin(admin) || isSuperAdmin(target)) return false;
+    const scope = adminScope(admin);
+    if (adminDeptsOf(target).some(d => !scope.includes(d))) return false;
+    return (target.departments || []).some(d => scope.includes(d));
+  };
+
+  // Cambiar la contraseña o el correo, bloquear o eliminar una cuenta afecta también a sus otros
+  // departamentos: el admin de departamento solo puede hacerlo si todos los departamentos de la cuenta son suyos.
+  const FULL_SCOPE_ERROR = 'Ese usuario también pertenece a otros departamentos: solo el administrador general puede hacerlo';
+  const canManageUserFully = (admin, target) => canManageUser(admin, target) &&
+    (isSuperAdmin(admin) || (target.departments || []).every(d => adminScope(admin).includes(d)));
+
+  // Quién ve a quién en "Conectados": el general ve a todos y todos lo ven a él; el resto, solo a quienes
+  // comparten departamento.
+  const canViewUser = (target, viewer) => {
+    if (isSuperAdmin(viewer) || isSuperAdmin(target)) return true;
+    const viewerDepts = deptsOf(viewer);
+    return deptsOf(target).some(d => viewerDepts.includes(d));
+  };
+
+  // Una sala sin departamento es global (visible por todos). Si tiene departamento, solo la ven quienes
+  // están en ese departamento (y el administrador general).
+  const canViewRoom = (room, viewer) => {
+    if (isSuperAdmin(viewer)) return true;
+    return !room.department || deptsOf(viewer).includes(room.department);
+  };
+
+  const getAllRooms = (viewer) => (viewer ? data.rooms
+    .filter(r => canViewRoom(r, viewer))
+    .map(r => ({ name: r.name, hasPassword: !!r.password, temporary: !!r.temporary, department: r.department || null })) : []);
+
+  const getAllUsers = (viewer) => {
+    if (!viewer) return [];
+    const list = [];
+    for (const [, u] of users) {
+      if (canViewUser(u, viewer)) list.push({ username: u.username, displayName: u.displayName || u.username, avatar: u.avatar || null });
+    }
+    return list;
+  };
+
+  // Cada socket conectado vive en "salas" internas de Socket.IO según lo que puede ver: el administrador
+  // general en 'role:admin'; el admin de departamento en 'dept:<d>' de cada uno de sus departamentos; el resto
+  // en 'dept:<departamento>' (o 'dept:__unassigned__'). Así un aviso se emite una vez por grupo y no una vez
+  // por persona. Los nombres llevan ":", que no se permite en los nombres de sala del chat: nadie puede
+  // crear una sala que coincida con una de estas.
   const departmentRoom = (department) => 'dept:' + (department || '__unassigned__');
   const ADMIN_ROOM = 'role:admin';
+  const AUTH_ROOM = 'role:auth'; // todos los sockets con sesión iniciada
 
-  const visibilityRoomFor = (u) => (u.role === 'admin' ? ADMIN_ROOM : departmentRoom(u.department));
+  const visibilityRoomsFor = (u) => {
+    if (isSuperAdmin(u)) return [ADMIN_ROOM];
+    const depts = deptsOf(u);
+    return depts.length ? depts.map(departmentRoom) : [departmentRoom(null)];
+  };
 
-  // La lista de "todos los usuarios" es distinta según el departamento del visor
-  // (y los admins ven a todos). Se calcula una vez por grupo, no una vez por
-  // persona conectada, y se emite con un solo io.to(sala).emit(...) por grupo.
+  // Reenvía la lista completa de conectados (solo cuando cambian roles o departamentos, algo poco frecuente).
+  // Primero una lista por departamento; luego, a cada admin de departamento, la suya (puede tener varios).
   const broadcastAllUsers = () => {
-    const adminEntries = [];
-    const deptGroups = new Map();
-    const allEntries = [];
-
-    for (const [, u] of users) {
-      const entry = { username: u.username, displayName: u.displayName || u.username, avatar: u.avatar || null };
-      allEntries.push(entry);
-      if (u.role === 'admin') {
-        adminEntries.push(entry);
-      } else {
-        const key = u.department || '';
-        if (!deptGroups.has(key)) deptGroups.set(key, []);
-        deptGroups.get(key).push(entry);
-      }
+    for (const d of [...data.departments.map(x => x.name), null]) {
+      io.to(departmentRoom(d)).emit('all-users', { users: getAllUsers({ role: 'user', department: d }) });
     }
-
-    for (const [deptKey, entries] of deptGroups) {
-      io.to(departmentRoom(deptKey || null)).emit('all-users', { users: adminEntries.concat(entries) });
-    }
-
-    io.to(ADMIN_ROOM).emit('all-users', { users: allEntries });
-  };
-
-  const emitToViewersOf = (targetUserLike, event, payload) => {
+    io.to(ADMIN_ROOM).emit('all-users', { users: getAllUsers({ role: 'admin', departments: [] }) });
     for (const [sid, u] of users) {
-      if (canViewUser(targetUserLike, u.department, u.role)) {
-        io.to(sid).emit(event, payload);
-      }
+      if (isDeptAdmin(u)) io.to(sid).emit('all-users', { users: getAllUsers(u) });
     }
   };
 
-  const emitToViewersOfRoom = (room, event, payload) => {
-    for (const [sid, u] of users) {
-      if (canViewRoom(room, u.department, u.role)) {
-        io.to(sid).emit(event, payload);
-      }
-    }
+  // ===== Presencia: se avisa solo el cambio ("entró", "salió", "cambió su nombre") =====
+  // Antes cada ingreso o salida reenviaba la lista completa de conectados a todos (con 1000 usuarios,
+  // ~6,5 MB por ingreso). Ahora cada navegador recibe la lista una vez al entrar y luego solo los cambios,
+  // y solo quienes pueden ver a esa persona.
+  const socketIdByUsername = new Map(); // usuario conectado -> socket.id (evita recorrer a todos los conectados)
+  const onlineSid = (username) => socketIdByUsername.get(username) || null;
+  const isOnline = (username) => socketIdByUsername.has(username);
+
+  const userEntry = (u) => ({ username: u.username, displayName: u.displayName || u.username, avatar: u.avatar || null });
+
+  // Quiénes ven a un usuario en "Conectados" (misma regla que canViewUser): al administrador general lo ven
+  // todos; a los demás, quienes están en sus departamentos y el administrador general.
+  const presenceRooms = (u) => {
+    if (isSuperAdmin(u)) return [AUTH_ROOM];
+    return [...deptsOf(u).map(departmentRoom), ADMIN_ROOM];
+  };
+  const announceOnline = (u) => io.to(presenceRooms(u)).emit('user-online', userEntry(u));
+  const announceOffline = (u) => io.to(presenceRooms(u)).emit('user-offline', { username: u.username });
+  const announceUserUpdate = (u) => {
+    const rooms = presenceRooms(u);
+    if (u.currentRoom && !isGlobalRoom(u.currentRoom)) rooms.push(u.currentRoom); // quienes lo ven en la sala aunque sean de otro departamento
+    io.to(rooms).emit('user-updated', userEntry(u));
+  };
+
+  // Quiénes ven una sala: global = todos; de un departamento = ese departamento y los admins.
+  const roomViewerRooms = (room) => (room.department ? [departmentRoom(room.department), ADMIN_ROOM] : [AUTH_ROOM]);
+  const emitToViewersOfRoom = (room, event, payload) => io.to(roomViewerRooms(room)).emit(event, payload);
+
+  // Las salas globales (p. ej. "general") pueden tener a las 2000 personas conectadas: no se envía ni se muestra
+  // quiénes (ni cuántos) están en ellas. Así no viaja una lista de ~200 KB a cada persona que entra, ni se
+  // avisa a todos cada entrada y salida.
+  const isGlobalRoom = (roomName) => {
+    const room = data.rooms.find(r => r.name === roomName);
+    return !!room && !room.department;
   };
 
   const HISTORY_PAGE_SIZE = 50;
@@ -358,7 +438,7 @@ module.exports = (io, db, errorLog) => {
     const conversations = [];
     for (const msg of await getLastPrivateMessages(username)) {
       const other = msg.sender === username ? msg.recipient : msg.sender;
-      const uc = data.users.find(u => u.username === other);
+      const uc = findUser(other);
       conversations.push({
         with: other,
         displayName: uc?.displayName || other,
@@ -376,31 +456,31 @@ module.exports = (io, db, errorLog) => {
   // ===================== AMIGOS =====================
 
   const userPublicInfo = (username) => {
-    const u = data.users.find(x => x.username === username);
+    const u = findUser(username);
     return { username, displayName: u?.displayName || username, avatar: u?.avatar || null };
   };
 
   const getFriendRow = (userA, userB) =>
-    data.friends.find(f =>
+    friendRowsOf(userA).find(f =>
       (f.requester === userA && f.recipient === userB) ||
       (f.requester === userB && f.recipient === userA)
     );
 
   const getAcceptedFriendUsernames = (username) =>
-    data.friends
-      .filter(f => f.status === 'accepted' && (f.requester === username || f.recipient === username))
+    friendRowsOf(username)
+      .filter(f => f.status === 'accepted')
       .map(f => (f.requester === username ? f.recipient : f.requester));
 
   // Estado en vivo de un usuario para mostrarlo en la lista de amigos: conectado +
   // departamento activo, o desconectado.
   const getFriendLiveStatus = (username) => {
-    for (const [, u] of users) {
-      if (u.username === username) {
-        const deptRecord = u.department ? data.departments.find(d => d.name === u.department) : null;
-        return { online: true, department: u.department || null, departmentDisplayName: deptRecord?.displayName || u.department || null };
-      }
+    const sid = onlineSid(username);
+    if (sid) {
+      const u = users.get(sid);
+      const deptRecord = u.department ? data.departments.find(d => d.name === u.department) : null;
+      return { online: true, department: u.department || null, departmentDisplayName: deptRecord?.displayName || u.department || null };
     }
-    const record = data.users.find(x => x.username === username);
+    const record = findUser(username);
     return { online: false, departments: departmentOptions(record?.departments || []) };
   };
 
@@ -411,10 +491,10 @@ module.exports = (io, db, errorLog) => {
     }));
 
   const getPendingRequests = (username) => ({
-    incoming: data.friends
+    incoming: friendRowsOf(username)
       .filter(f => f.status === 'pending' && f.recipient === username)
       .map(f => ({ id: f.id, ...userPublicInfo(f.requester) })),
-    outgoing: data.friends
+    outgoing: friendRowsOf(username)
       .filter(f => f.status === 'pending' && f.requester === username)
       .map(f => ({ id: f.id, ...userPublicInfo(f.recipient) }))
   });
@@ -424,10 +504,9 @@ module.exports = (io, db, errorLog) => {
     const friendUsernames = getAcceptedFriendUsernames(username);
     if (friendUsernames.length === 0) return;
     const status = getFriendLiveStatus(username);
-    for (const [sid, u] of users) {
-      if (friendUsernames.includes(u.username)) {
-        io.to(sid).emit('friend-status-update', { username, ...status });
-      }
+    for (const friend of friendUsernames) {
+      const sid = onlineSid(friend);
+      if (sid) io.to(sid).emit('friend-status-update', { username, ...status });
     }
   };
 
@@ -445,31 +524,105 @@ module.exports = (io, db, errorLog) => {
     await deleteMessagesByRoom(roomName);
     fileUrls.forEach(deleteUploadedFile);
     emitToViewersOfRoom(room, 'room-deleted', { name: roomName });
-    roomUsers.delete(roomName);
+    emptyRoom(roomName);
     return true;
   };
 
+  // Saca a una conexión de la sala donde está. Devuelve el nombre de la sala que dejó (o null).
+  const leaveCurrentRoom = (sid, u) => {
+    const roomName = u.currentRoom;
+    if (!roomName) return null;
+    u.currentRoom = null;
+    io.sockets.sockets.get(sid)?.leave(roomName);
+    const sockets = roomUsers.get(roomName);
+    if (sockets) {
+      sockets.delete(sid);
+      if (sockets.size === 0) roomUsers.delete(roomName);
+      else if (!isGlobalRoom(roomName)) io.to(roomName).emit('room-user-left', { room: roomName, username: u.username });
+    }
+    return roomName;
+  };
+
+  // El permiso se revisaba solo al entrar: quien perdía el acceso (le cambiaron el departamento) seguía
+  // leyendo y escribiendo en la sala. Esto lo saca si ya no puede verla.
+  const leaveRoomIfNoAccess = (sid, u) => {
+    if (!u.currentRoom) return;
+    const room = data.rooms.find(r => r.name === u.currentRoom);
+    if (room && canViewRoom(room, u)) return;
+    const left = leaveCurrentRoom(sid, u);
+    if (left) cleanupTemporaryRoom(left).catch(err => console.error('cleanupTemporaryRoom error:', err));
+  };
+
+  // Sala eliminada: nadie queda "dentro" (si otro departamento crea una sala con el mismo nombre, no
+  // recibirían sus mensajes).
+  const emptyRoom = (roomName) => {
+    for (const sid of [...(roomUsers.get(roomName) || [])]) {
+      const u = users.get(sid);
+      if (u) leaveCurrentRoom(sid, u);
+    }
+    io.in(roomName).socketsLeave(roomName);
+    roomUsers.delete(roomName);
+  };
+
+  // Salas temporales: cada usuario puede tener pocas abiertas a la vez, y una que nadie usa no se queda
+  // para siempre (antes solo se borraba al salir la última persona, así que una sala creada y nunca usada
+  // quedaba en la lista de todo el departamento).
+  const PANIC_COOLDOWN_MS = 30 * 1000;
+  const lastPanicAt = new Map(); // username -> hora de su última alerta (se borra al pasar la espera)
+
+  const MAX_TEMP_ROOMS_PER_USER = 3;
+  const TEMP_ROOM_UNUSED_MS = 10 * 60 * 1000;
+  const scheduleUnusedTemporaryRoomCleanup = (room) => {
+    setTimeout(() => {
+      // Solo si sigue siendo la misma sala (pudo borrarse y crearse otra con el mismo nombre) y está vacía.
+      if (!data.rooms.includes(room)) return;
+      cleanupTemporaryRoom(room.name).catch(err => console.error('cleanupTemporaryRoom error:', err));
+    }, TEMP_ROOM_UNUSED_MS).unref();
+  };
+
+  // Al iniciar no hay nadie conectado: las salas temporales que quedaron (el servidor se apagó con gente
+  // dentro, o nunca se usaron) se borran con sus mensajes y archivos. Se quitan de la lista de inmediato,
+  // antes de que alguien pueda entrar.
+  const leftoverTemporaryRooms = data.rooms.filter(r => r.temporary);
+  if (leftoverTemporaryRooms.length) {
+    data.rooms = data.rooms.filter(r => !r.temporary);
+    (async () => {
+      for (const room of leftoverTemporaryRooms) {
+        const fileUrls = await getRoomFileUrls(room.name);
+        await deleteRoom(room.name);
+        await deleteMessagesByRoom(room.name);
+        fileUrls.forEach(deleteUploadedFile);
+      }
+      console.log(`[Salas] ${leftoverTemporaryRooms.length} sala(s) temporal(es) sin uso eliminada(s) al iniciar`);
+    })().catch(err => console.error('leftover temporary rooms cleanup error:', err));
+  }
+
   // Saca del chat la sesión activa de un usuario (cuenta eliminada o bloqueada). Devuelve true si estaba conectado.
   const kickUser = (username, reason, extra) => {
-    for (const [sid, u] of users) {
-      if (u.username === username) {
-        for (const [roomName, sockets] of roomUsers) {
-          if (sockets.has(sid)) {
-            sockets.delete(sid);
-            if (sockets.size === 0) roomUsers.delete(roomName);
-            break;
-          }
-        }
-        if (roomUnreads[username]) {
-          delete roomUnreads[username];
-        }
-        if (u.uploadToken) uploadTokens.delete(u.uploadToken);
-        io.to(sid).emit('force-disconnect', { reason, ...extra });
-        users.delete(sid);
-        return true;
+    const sid = onlineSid(username);
+    if (!sid) return false;
+    const u = users.get(sid);
+    if (u.currentRoom) {
+      const sockets = roomUsers.get(u.currentRoom);
+      if (sockets) {
+        sockets.delete(sid);
+        if (sockets.size === 0) roomUsers.delete(u.currentRoom);
+        else if (!isGlobalRoom(u.currentRoom)) io.to(u.currentRoom).emit('room-user-left', { room: u.currentRoom, username });
       }
     }
-    return false;
+    if (u.uploadToken) uploadTokens.delete(u.uploadToken);
+    io.to(sid).emit('force-disconnect', { reason, ...extra });
+    users.delete(sid);
+    socketIdByUsername.delete(username);
+    // La conexión expulsada deja de recibir avisos de inmediato (aunque tarde en cerrarse).
+    const kicked = io.sockets.sockets.get(sid);
+    if (kicked) {
+      kicked.leave(AUTH_ROOM);
+      for (const r of visibilityRoomsFor(u)) kicked.leave(r);
+      if (u.currentRoom) kicked.leave(u.currentRoom);
+    }
+    announceOffline(u);
+    return true;
   };
 
   const departmentOptions = (names) => names.map(n => {
@@ -513,28 +666,30 @@ module.exports = (io, db, errorLog) => {
     socket.resumedSessionRemember = false;
     socket.loginRemember = false;
 
-    for (const [, u] of users) {
-      if (u.username === userRecord.username) {
-        return callback?.({ ok: false, error: 'Ese usuario ya está conectado' });
-      }
+    if (isOnline(userRecord.username)) {
+      return callback?.({ ok: false, error: 'Ese usuario ya está conectado' });
     }
 
     const uploadToken = crypto.randomUUID();
     uploadTokens.set(uploadToken, socket.id);
-    users.set(socket.id, { username: userRecord.username, currentRoom: null, displayName: userRecord.displayName || userRecord.username, avatar: userRecord.avatar || null, location: userRecord.location || '', role, department, departments: assignedDepartments, uploadToken, sessionHash, sessionRemember });
+    users.set(socket.id, { username: userRecord.username, currentRoom: null, displayName: userRecord.displayName || userRecord.username, avatar: userRecord.avatar || null, location: userRecord.location || '', role, department, departments: assignedDepartments, adminDepartments: adminDeptsOf(userRecord), uploadToken, sessionHash, sessionRemember });
+    socketIdByUsername.set(userRecord.username, socket.id);
     socket.username = userRecord.username;
     socket.displayName = userRecord.displayName || userRecord.username;
     socket.avatar = userRecord.avatar || null;
     socket.location = userRecord.location || '';
     socket.department = department;
     socket.pendingUser = null;
-    socket.join(role === 'admin' ? ADMIN_ROOM : departmentRoom(department));
-    broadcastAllUsers();
+    const onlineUser = users.get(socket.id);
+    socket.join(visibilityRoomsFor(onlineUser));
+    socket.join(AUTH_ROOM);
+    announceOnline(onlineUser);
     notifyFriendsOfStatusChange(userRecord.username);
     const deptRecord = department ? data.departments.find(d => d.name === department) : null;
     callback?.({
       ok: true,
-      rooms: getAllRooms(department, role),
+      rooms: getAllRooms(onlineUser),
+      superAdmin: isSuperAdmin(onlineUser),
       displayName: userRecord.displayName || userRecord.username,
       avatar: userRecord.avatar || null,
       location: userRecord.location || '',
@@ -542,6 +697,7 @@ module.exports = (io, db, errorLog) => {
       department,
       departmentDisplayName: deptRecord?.displayName || department,
       departments: departmentOptions(assignedDepartments),
+      adminDepartments: adminDeptsOf(userRecord),
       uploadToken,
       username: userRecord.username,
       sessionToken,
@@ -567,13 +723,12 @@ module.exports = (io, db, errorLog) => {
     .map(m => m.username);
 
   const emitToUsername = (username, event, payload) => {
-    for (const [sid, u] of users) {
-      if (u.username === username) io.to(sid).emit(event, payload);
-    }
+    const sid = onlineSid(username);
+    if (sid) io.to(sid).emit(event, payload);
   };
 
   const userCard = (username) => {
-    const r = data.users.find(u => u.username === username);
+    const r = findUser(username);
     return { username, displayName: r?.displayName || username, avatar: r?.avatar || null };
   };
 
@@ -592,19 +747,26 @@ module.exports = (io, db, errorLog) => {
     return msg ? { ...msg, type: 'group' } : null;
   };
 
-  const groupView = (group, viewer) => {
+  // Parte común de la vista de un grupo (igual para todos sus miembros).
+  const groupBaseView = (group) => {
     const rows = data.groupMembers.filter(m => m.group_id === group.id);
-    const me = rows.find(m => m.username === viewer);
     return {
-      id: group.id,
-      name: group.name,
-      created_by: group.created_by,
-      created_at: group.created_at,
-      myRole: me?.role || null,
-      members: rows.filter(m => m.status === 'member').map(m => ({ ...userCard(m.username), role: m.role })),
-      invited: rows.filter(m => m.status === 'invited').map(m => ({ ...userCard(m.username), invited_by: m.invited_by })),
-      lastMessage: groupLastMessage(group.id)
+      rows,
+      view: {
+        id: group.id,
+        name: group.name,
+        created_by: group.created_by,
+        created_at: group.created_at,
+        members: rows.filter(m => m.status === 'member').map(m => ({ ...userCard(m.username), role: m.role })),
+        invited: rows.filter(m => m.status === 'invited').map(m => ({ ...userCard(m.username), invited_by: m.invited_by })),
+        lastMessage: groupLastMessage(group.id)
+      }
     };
+  };
+
+  const groupView = (group, viewer, base = groupBaseView(group)) => {
+    const me = base.rows.find(m => m.username === viewer);
+    return { ...base.view, myRole: me?.role || null };
   };
 
   const invitationView = (group, membership) => ({
@@ -616,8 +778,9 @@ module.exports = (io, db, errorLog) => {
 
   // Cada miembro recibe su propia vista (incluye su rol en el grupo).
   const broadcastGroup = (group) => {
+    const base = groupBaseView(group);
     for (const username of groupMemberUsernames(group.id)) {
-      emitToUsername(username, 'group-updated', groupView(group, username));
+      if (isOnline(username)) emitToUsername(username, 'group-updated', groupView(group, username, base));
     }
   };
 
@@ -663,7 +826,7 @@ module.exports = (io, db, errorLog) => {
     const invited = [];
     for (const name of [...new Set((usernames || []).map(u => String(u).trim().toLowerCase()))]) {
       if (!name || name === inviter || groupMembership(group.id, name)) continue;
-      const target = data.users.find(u => u.username === name);
+      const target = findUser(name);
       if (!target || target.status !== 'active') continue;
       if (data.groupMembers.filter(m => m.group_id === group.id).length >= GROUP_MAX_MEMBERS) break;
       const m = { group_id: group.id, username: name, role: 'member', status: 'invited', invited_by: inviter, created_at: new Date().toISOString() };
@@ -702,7 +865,7 @@ module.exports = (io, db, errorLog) => {
   const canSeeMessage = (msg, user) => {
     if (msg.room_name) {
       const room = data.rooms.find(r => r.name === msg.room_name);
-      return !!room && canViewRoom(room, user.department, user.role);
+      return !!room && canViewRoom(room, user);
     }
     if (msg.group_id) return isGroupMember(msg.group_id, user.username);
     if (msg.recipient) return user.username === msg.sender || user.username === msg.recipient;
@@ -774,7 +937,7 @@ module.exports = (io, db, errorLog) => {
       if (!/^[a-z0-9áéíóúüñ]+$/.test(name)) {
         return callback?.({ ok: false, error: 'Solo letras, números (sin espacios)' });
       }
-      if (data.users.find(u => u.username === name)) {
+      if (findUser(name)) {
         return callback?.({ ok: false, error: 'Ese usuario ya existe' });
       }
       const regEmailError = emailError(email);
@@ -801,6 +964,7 @@ module.exports = (io, db, errorLog) => {
         displayName: name,
         avatar: null,
         departments: [],
+        adminDepartments: [],
         status: 'pending',
         email,
         twoFactorEnabled: false,
@@ -832,7 +996,7 @@ module.exports = (io, db, errorLog) => {
 
     socket.on('get-all-users', (callback) => {
       const user = users.get(socket.id);
-      callback?.(getAllUsers(user?.department, user?.role));
+      callback?.(getAllUsers(user));
     });
 
     socket.on('login', async (data_, callback) => {
@@ -853,7 +1017,7 @@ module.exports = (io, db, errorLog) => {
       }
 
       // Mismo mensaje si el usuario no existe o la contraseña es incorrecta: no revela qué cuentas existen.
-      const userRecord = data.users.find(u => u.username === name);
+      const userRecord = findUser(name);
       if (!userRecord || !(await verifyPassword(String(password), userRecord.password))) {
         registerFailure(userKey, LOGIN_MAX_FAILS_PER_USER);
         registerFailure(ipKey, LOGIN_MAX_FAILS_PER_IP);
@@ -879,10 +1043,8 @@ module.exports = (io, db, errorLog) => {
       if (userRecord.status === 'blocked') {
         return callback?.({ ok: false, error: 'Tu cuenta está bloqueada. Contacta a un administrador.' });
       }
-      for (const [, u] of users) {
-        if (u.username === name) {
-          return callback?.({ ok: false, error: 'Ese usuario ya está conectado' });
-        }
+      if (isOnline(name)) {
+        return callback?.({ ok: false, error: 'Ese usuario ya está conectado' });
       }
 
       // La contraseña es correcta: ahora se exige el código enviado al correo.
@@ -921,7 +1083,7 @@ module.exports = (io, db, errorLog) => {
     socket.on('two-factor-set-email', async (data_, callback) => {
       const pending = socket.twoFactor;
       if (!pending || !pending.setup) return callback?.({ ok: false, error: 'No hay una sesión pendiente' });
-      const userRecord = data.users.find(u => u.username === pending.username);
+      const userRecord = findUser(pending.username);
       if (!userRecord) return callback?.({ ok: false, error: 'Usuario no encontrado' });
       if (userRecord.email) return callback?.({ ok: false, error: 'Tu cuenta ya tiene un correo registrado' });
 
@@ -949,7 +1111,7 @@ module.exports = (io, db, errorLog) => {
     socket.on('two-factor-resend', async (callback) => {
       const pending = socket.twoFactor;
       if (!pending || !pending.email) return callback?.({ ok: false, error: 'No hay una sesión pendiente' });
-      const userRecord = data.users.find(u => u.username === pending.username);
+      const userRecord = findUser(pending.username);
       if (!userRecord) return callback?.({ ok: false, error: 'Usuario no encontrado' });
 
       const prev = loginCodes.get(userRecord.username);
@@ -970,7 +1132,7 @@ module.exports = (io, db, errorLog) => {
     socket.on('two-factor-verify', async (data_, callback) => {
       const pending = socket.twoFactor;
       if (!pending || !pending.email) return callback?.({ ok: false, error: 'No hay una sesión pendiente' });
-      const userRecord = data.users.find(u => u.username === pending.username);
+      const userRecord = findUser(pending.username);
       if (!userRecord || userRecord.status !== 'active') {
         socket.twoFactor = null;
         return callback?.({ ok: false, error: 'Tu cuenta no está habilitada', restart: true });
@@ -1018,10 +1180,8 @@ module.exports = (io, db, errorLog) => {
       }
       socket.twoFactor = null;
 
-      for (const [, u] of users) {
-        if (u.username === userRecord.username) {
-          return callback?.({ ok: false, error: 'Ese usuario ya está conectado', restart: true });
-        }
+      if (isOnline(userRecord.username)) {
+        return callback?.({ ok: false, error: 'Ese usuario ya está conectado', restart: true });
       }
 
       const assignedDepartments = userRecord.departments || [];
@@ -1059,21 +1219,19 @@ module.exports = (io, db, errorLog) => {
         return callback?.({ ok: false, expired: true });
       }
 
-      const userRecord = data.users.find(u => u.username === session.username);
+      const userRecord = findUser(session.username);
       if (!userRecord || userRecord.status !== 'active') {
         deleteSession(tokenHash).catch(() => {});
         return callback?.({ ok: false, expired: true });
       }
 
-      for (const [, u] of users) {
-        if (u.username === userRecord.username) {
-          if (u.sessionHash !== tokenHash) {
-            return callback?.({ ok: false, error: 'Ese usuario ya está conectado en otro equipo' });
-          }
-          // Misma sesión abierta en otra pestaña (o la conexión vieja de una recarga): se reemplaza.
-          kickUser(userRecord.username, 'Abriste el chat en otra pestaña o ventana.', { replaced: true });
-          break;
+      const existingSid = onlineSid(userRecord.username);
+      if (existingSid) {
+        if (users.get(existingSid).sessionHash !== tokenHash) {
+          return callback?.({ ok: false, error: 'Ese usuario ya está conectado en otro equipo' });
         }
+        // Misma sesión abierta en otra pestaña (o la conexión vieja de una recarga): se reemplaza.
+        kickUser(userRecord.username, 'Abriste el chat en otra pestaña o ventana.', { replaced: true });
       }
 
       socket.twoFactor = null;
@@ -1106,7 +1264,7 @@ module.exports = (io, db, errorLog) => {
       if (!socket.pendingUser) return callback?.({ ok: false, error: 'No hay una sesión pendiente' });
 
       const { department } = data_ || {};
-      const userRecord = data.users.find(u => u.username === socket.pendingUser.username);
+      const userRecord = findUser(socket.pendingUser.username);
       if (!userRecord) return callback?.({ ok: false, error: 'Usuario no encontrado' });
       if (userRecord.status !== 'active') {
         socket.pendingUser = null;
@@ -1117,10 +1275,8 @@ module.exports = (io, db, errorLog) => {
       if (!department || !assignedDepartments.includes(department)) {
         return callback?.({ ok: false, error: 'Departamento no válido' });
       }
-      for (const [, u] of users) {
-        if (u.username === userRecord.username) {
-          return callback?.({ ok: false, error: 'Ese usuario ya está conectado' });
-        }
+      if (isOnline(userRecord.username)) {
+        return callback?.({ ok: false, error: 'Ese usuario ya está conectado' });
       }
 
       finalizeLogin(socket, userRecord, department, callback);
@@ -1138,25 +1294,32 @@ module.exports = (io, db, errorLog) => {
         return callback?.({ ok: false, error: 'Ya estás en ese departamento' });
       }
 
-      if (user.role !== 'admin') {
-        socket.leave(departmentRoom(user.department));
-        socket.join(departmentRoom(department));
-      }
+      // Sale de la vista del departamento anterior y aparece en la del nuevo; recibe la lista del nuevo.
+      // (Los departamentos donde es admin los sigue viendo siempre.)
+      const prevRooms = visibilityRoomsFor(user);
+      announceOffline(user);
       user.department = department;
+      const newRooms = visibilityRoomsFor(user);
+      for (const r of prevRooms) if (!newRooms.includes(r)) socket.leave(r);
+      socket.join(newRooms);
+      announceOnline(user);
+      io.to(socket.id).emit('all-users', { users: getAllUsers(user) });
+      leaveRoomIfNoAccess(socket.id, user);
       socket.department = department;
       if (user.sessionHash) {
         updateSessionDepartment(user.sessionHash, department).catch(err => console.error('updateSessionDepartment error:', err));
       }
-      broadcastAllUsers();
       notifyFriendsOfStatusChange(user.username);
 
       const deptRecord = data.departments.find(d => d.name === department);
       io.to(socket.id).emit('profile-updated', {
         role: user.role,
+        superAdmin: isSuperAdmin(user),
         department: user.department,
         departmentDisplayName: deptRecord?.displayName || department,
         departments: departmentOptions(user.departments || []),
-        rooms: getAllRooms(user.department, user.role)
+        adminDepartments: adminDeptsOf(user),
+        rooms: getAllRooms(user)
       });
 
       callback?.({ ok: true });
@@ -1174,7 +1337,7 @@ module.exports = (io, db, errorLog) => {
       const room = data.rooms.find(r => r.name === roomName);
       if (!room) return callback?.({ ok: false, error: 'La sala no existe' });
 
-      if (!canViewRoom(room, user.department, user.role)) {
+      if (!canViewRoom(room, user)) {
         return callback?.({ ok: false, error: 'No tienes acceso a esta sala' });
       }
 
@@ -1195,24 +1358,9 @@ module.exports = (io, db, errorLog) => {
         }
       }
 
-      if (user.currentRoom) {
-        socket.leave(user.currentRoom);
-        const prev = roomUsers.get(user.currentRoom);
-        if (prev) {
-          prev.delete(socket.id);
-          const wasEmpty = prev.size === 0;
-          if (wasEmpty) {
-            roomUsers.delete(user.currentRoom);
-          } else {
-            io.to(user.currentRoom).emit('users-update', {
-              room: user.currentRoom,
-              users: getOnlineUsers(user.currentRoom)
-            });
-          }
-          if (wasEmpty) {
-            cleanupTemporaryRoom(user.currentRoom).catch(err => console.error('cleanupTemporaryRoom error:', err));
-          }
-        }
+      const prevRoom = leaveCurrentRoom(socket.id, user);
+      if (prevRoom && isRoomEmpty(prevRoom)) {
+        cleanupTemporaryRoom(prevRoom).catch(err => console.error('cleanupTemporaryRoom error:', err));
       }
 
       user.currentRoom = roomName;
@@ -1223,14 +1371,10 @@ module.exports = (io, db, errorLog) => {
       }
       roomUsers.get(roomName).add(socket.id);
 
-      io.to(roomName).emit('users-update', {
-        room: roomName,
-        users: getOnlineUsers(roomName)
-      });
-
-      if (roomUnreads[user.username]) {
-        roomUnreads[user.username][roomName] = 0;
-      }
+      // Quienes ya estaban reciben solo "entró X"; quien entra recibe la lista completa en la respuesta.
+      // En las salas globales no hay lista (ver isGlobalRoom).
+      const listsUsers = !!room.department;
+      if (listsUsers) socket.to(roomName).emit('room-user-joined', { room: roomName, user: userEntry(user) });
       io.to(socket.id).emit('room-unread-update', { room: roomName, count: 0 });
 
       const historyPage = await getRoomHistory(roomName);
@@ -1242,7 +1386,8 @@ module.exports = (io, db, errorLog) => {
         hasPassword: !!room.password,
         temporary: !!room.temporary,
         department: room.department || null,
-        users: getOnlineUsers(roomName)
+        hideUsers: !listsUsers,
+        users: listsUsers ? getOnlineUsers(roomName) : []
       });
     });
 
@@ -1250,6 +1395,12 @@ module.exports = (io, db, errorLog) => {
       const user = users.get(socket.id);
       if (!user?.currentRoom) return;
       const roomName = user.currentRoom;
+      // El permiso se vuelve a revisar en cada mensaje, no solo al entrar.
+      const room = data.rooms.find(r => r.name === roomName);
+      if (!room || !canViewRoom(room, user)) {
+        leaveRoomIfNoAccess(socket.id, user);
+        return callback?.({ ok: false, error: 'Ya no tienes acceso a esta sala' });
+      }
 
       const content = sanitizeContent(data_?.content);
       const file = sanitizeFile(data_?.file);
@@ -1279,14 +1430,8 @@ module.exports = (io, db, errorLog) => {
       }
       io.to(roomName).emit('room-message', msg);
 
-      for (const [sid, u] of users) {
-        if (u.currentRoom !== roomName) {
-          if (!roomUnreads[u.username]) roomUnreads[u.username] = {};
-          const count = (roomUnreads[u.username][roomName] || 0) + 1;
-          roomUnreads[u.username][roomName] = count;
-          io.to(sid).emit('room-unread-update', { room: roomName, count });
-        }
-      }
+      // "+1 no leído" solo para quienes pueden ver la sala y no están en ella (cada navegador lleva su cuenta).
+      if (data.rooms.includes(room)) io.to(roomViewerRooms(room)).except(roomName).emit('room-unread-increment', { room: roomName });
 
       callback?.({ ok: true });
     });
@@ -1300,7 +1445,7 @@ module.exports = (io, db, errorLog) => {
       const file = sanitizeFile(data_?.file);
       const reply = await buildReply(data_?.reply, m => !!m.recipient &&
         ((m.sender === user.username && m.recipient === recipient) || (m.sender === recipient && m.recipient === user.username)));
-      if (typeof recipient !== 'string' || !data.users.some(u => u.username === recipient) || (!content && !file)) return;
+      if (typeof recipient !== 'string' || !findUser(recipient) || (!content && !file)) return;
 
       const msg = {
         id: nextMessageId(),
@@ -1322,12 +1467,7 @@ module.exports = (io, db, errorLog) => {
         console.error('saveMessage error:', err);
         return callback?.({ ok: false, error: SEND_ERROR });
       }
-      for (const [sid, u] of users) {
-        if (u.username === recipient) {
-          io.to(sid).emit('private-message', msg);
-          break;
-        }
-      }
+      emitToUsername(recipient, 'private-message', msg);
 
       socket.emit('private-message', msg);
       callback?.({ ok: true });
@@ -1359,11 +1499,8 @@ module.exports = (io, db, errorLog) => {
           emitToUsername(username, 'reaction-updated', msg);
         }
       } else if (msg.recipient) {
-        for (const [sid, u] of users) {
-          if (u.username === msg.sender || u.username === msg.recipient) {
-            io.to(sid).emit('reaction-updated', msg);
-          }
-        }
+        emitToUsername(msg.sender, 'reaction-updated', msg);
+        if (msg.recipient !== msg.sender) emitToUsername(msg.recipient, 'reaction-updated', msg);
       }
 
       callback?.({ ok: true, reactions: msg.reactions });
@@ -1378,20 +1515,13 @@ module.exports = (io, db, errorLog) => {
       if (displayName.length > 40) return callback?.({ ok: false, error: 'Maximo 40 caracteres' });
 
       user.displayName = displayName;
-      const record = data.users.find(u => u.username === user.username);
+      const record = findUser(user.username);
       if (record) {
         record.displayName = displayName;
         saveUser(record).catch(err => console.error('saveUser error:', err));
       }
       socket.displayName = displayName;
-      broadcastAllUsers();
-      emitToViewersOf(user, 'display-name-updated', { username: user.username, displayName });
-      if (user.currentRoom) {
-        io.to(user.currentRoom).emit('users-update', {
-          room: user.currentRoom,
-          users: getOnlineUsers(user.currentRoom)
-        });
-      }
+      announceUserUpdate(user);
       callback?.({ ok: true, displayName });
     });
 
@@ -1404,20 +1534,13 @@ module.exports = (io, db, errorLog) => {
         return callback?.({ ok: false, error: 'Imagen no válida' });
       }
       user.avatar = avatar;
-      const record = data.users.find(u => u.username === user.username);
+      const record = findUser(user.username);
       if (record) {
         record.avatar = avatar;
         saveUser(record).catch(err => console.error('saveUser error:', err));
       }
       socket.avatar = avatar;
-      broadcastAllUsers();
-      emitToViewersOf(user, 'avatar-updated', { username: user.username, avatar });
-      if (user.currentRoom) {
-        io.to(user.currentRoom).emit('users-update', {
-          room: user.currentRoom,
-          users: getOnlineUsers(user.currentRoom)
-        });
-      }
+      announceUserUpdate(user);
       callback?.({ ok: true, avatar });
     });
 
@@ -1430,7 +1553,7 @@ module.exports = (io, db, errorLog) => {
       if (!currentPassword) return callback?.({ ok: false, error: 'Contraseña actual requerida' });
       if (!newPassword || newPassword.length < 3) return callback?.({ ok: false, error: 'Mínimo 3 caracteres' });
 
-      const record = data.users.find(u => u.username === user.username);
+      const record = findUser(user.username);
       if (!record) return callback?.({ ok: false, error: 'Usuario no encontrado' });
       const pwdKey = 'change-pwd:' + user.username;
       const pwdLocked = lockMinutesLeft(pwdKey);
@@ -1476,12 +1599,20 @@ module.exports = (io, db, errorLog) => {
       if (!temporary && user.role !== 'admin') {
         return callback?.({ ok: false, error: 'Solo administradores pueden crear salas fijas' });
       }
+      if (temporary && data.rooms.filter(r => r.temporary && r.created_by === user.username).length >= MAX_TEMP_ROOMS_PER_USER) {
+        return callback?.({ ok: false, error: 'Ya tienes ' + MAX_TEMP_ROOMS_PER_USER + ' salas temporales abiertas. Espera a que se cierre alguna para crear otra.' });
+      }
 
       let department;
       if (user.role === 'admin') {
-        department = data_?.department || null;
+        department = str(data_?.department) || null;
         if (department && !data.departments.find(d => d.name === department)) {
           return callback?.({ ok: false, error: 'Departamento no válido' });
+        }
+        // El admin de departamento crea salas en los departamentos que administra; en el que está como
+        // usuario, solo temporales (como cualquier usuario). Las globales, solo el general.
+        if (!inAdminScope(user, department) && !(temporary && department && department === user.department)) {
+          return callback?.({ ok: false, error: 'Solo puedes crear salas en tus departamentos' });
         }
       } else {
         if (!user.department) {
@@ -1513,12 +1644,13 @@ module.exports = (io, db, errorLog) => {
         temporary,
         department
       });
+      if (temporary) scheduleUnusedTemporaryRoomCleanup(newRoom);
       callback?.({ ok: true, name });
     });
 
     socket.on('get-rooms', (callback) => {
       const user = users.get(socket.id);
-      callback?.(getAllRooms(user?.department, user?.role));
+      callback?.(getAllRooms(user));
     });
 
     socket.on('get-conversations', async (callback) => {
@@ -1534,9 +1666,11 @@ module.exports = (io, db, errorLog) => {
       const query = str(data_?.query).trim().toLowerCase();
       if (query.length < 2) return callback?.([]);
 
+      // Solo un administrador puede encontrar cuentas pendientes, rechazadas o bloqueadas (y solo si lo pide).
+      const onlyActive = user.role !== 'admin' || !!data_?.activeOnly;
       const results = data.users
         .filter(u => u.username !== user.username && (u.username.includes(query) || (u.displayName || '').toLowerCase().includes(query)))
-        .filter(u => !data_?.activeOnly || u.status === 'active')
+        .filter(u => !onlyActive || u.status === 'active')
         .slice(0, 20)
         .map(u => {
           const row = getFriendRow(user.username, u.username);
@@ -1558,7 +1692,7 @@ module.exports = (io, db, errorLog) => {
       const target = data_?.username;
       if (!target || target === user.username) return callback?.({ ok: false, error: 'Usuario no válido' });
 
-      const targetRecord = data.users.find(u => u.username === target);
+      const targetRecord = findUser(target);
       if (!targetRecord) return callback?.({ ok: false, error: 'Usuario no encontrado' });
 
       const existing = getFriendRow(user.username, target);
@@ -1577,12 +1711,7 @@ module.exports = (io, db, errorLog) => {
         existing.status = 'accepted';
         existing.responded_at = respondedAt;
 
-        for (const [sid, u] of users) {
-          if (u.username === existing.requester) {
-            io.to(sid).emit('friend-request-accepted', userPublicInfo(user.username));
-            break;
-          }
-        }
+        emitToUsername(existing.requester, 'friend-request-accepted', userPublicInfo(user.username));
         return callback?.({ ok: true, autoAccepted: true });
       }
 
@@ -1595,12 +1724,7 @@ module.exports = (io, db, errorLog) => {
       }
       data.friends.push(newRequest);
 
-      for (const [sid, u] of users) {
-        if (u.username === target) {
-          io.to(sid).emit('friend-request-received', { id: newRequest.id, ...userPublicInfo(user.username) });
-          break;
-        }
-      }
+      emitToUsername(target, 'friend-request-received', { id: newRequest.id, ...userPublicInfo(user.username) });
 
       callback?.({ ok: true });
     });
@@ -1610,7 +1734,7 @@ module.exports = (io, db, errorLog) => {
       if (!user) return callback?.({ ok: false, error: 'No autenticado' });
 
       const { requestId, accept } = data_ || {};
-      const request = data.friends.find(f => f.id === requestId && f.recipient === user.username && f.status === 'pending');
+      const request = friendRowsOf(user.username).find(f => f.id === requestId && f.recipient === user.username && f.status === 'pending');
       if (!request) return callback?.({ ok: false, error: 'Solicitud no encontrada' });
 
       try {
@@ -1628,12 +1752,7 @@ module.exports = (io, db, errorLog) => {
         return callback?.({ ok: false, error: 'Error al guardar en la base de datos' });
       }
 
-      for (const [sid, u] of users) {
-        if (u.username === request.requester) {
-          io.to(sid).emit(accept ? 'friend-request-accepted' : 'friend-request-rejected', userPublicInfo(user.username));
-          break;
-        }
-      }
+      emitToUsername(request.requester, accept ? 'friend-request-accepted' : 'friend-request-rejected', userPublicInfo(user.username));
 
       callback?.({ ok: true });
     });
@@ -1654,12 +1773,7 @@ module.exports = (io, db, errorLog) => {
       }
       data.friends = data.friends.filter(f => f.id !== row.id);
 
-      for (const [sid, u] of users) {
-        if (u.username === other) {
-          io.to(sid).emit('friend-removed', { username: user.username });
-          break;
-        }
-      }
+      emitToUsername(other, 'friend-removed', { username: user.username });
 
       callback?.({ ok: true });
     });
@@ -1676,20 +1790,22 @@ module.exports = (io, db, errorLog) => {
       callback?.(getPendingRequests(user.username));
     });
 
+    // Los no leídos los cuenta cada navegador desde que entra (se mantiene por compatibilidad).
     socket.on('get-room-unreads', (callback) => {
-      const user = users.get(socket.id);
-      if (!user) return;
-      callback?.(roomUnreads[user.username] || {});
+      callback?.({});
     });
 
     socket.on('get-all-registered-users', (callback) => {
       const user = users.get(socket.id);
       if (!user || user.role !== 'admin') return callback?.([]);
-      callback?.(data.users.map(u => ({
+      // El admin de departamento ve solo las cuentas que puede administrar.
+      callback?.(data.users.filter(u => isSuperAdmin(user) || canManageUser(user, u)).map(u => ({
         username: u.username,
         displayName: u.displayName || u.username,
         role: u.role || 'user',
         departments: u.departments || [],
+        adminDepartments: adminDeptsOf(u),
+        fullyManaged: canManageUserFully(user, u), // puede cambiar contraseña/correo, bloquear o eliminar
         status: u.status || 'active',
         email: u.email || null,
         twoFactorEnabled: !!u.twoFactorEnabled,
@@ -1697,9 +1813,10 @@ module.exports = (io, db, errorLog) => {
       })));
     });
 
+    // Las solicitudes de registro llegan sin departamento: solo las revisa el administrador general.
     socket.on('get-pending-registrations', (callback) => {
       const user = users.get(socket.id);
-      if (!user || user.role !== 'admin') return callback?.([]);
+      if (!isSuperAdmin(user)) return callback?.([]);
       callback?.(data.users.filter(u => u.status === 'pending').map(u => ({
         username: u.username,
         displayName: u.displayName || u.username,
@@ -1710,9 +1827,9 @@ module.exports = (io, db, errorLog) => {
 
     socket.on('admin-approve-registration', async (data_, callback) => {
       const user = users.get(socket.id);
-      if (!user || user.role !== 'admin') return callback?.({ ok: false, error: 'No autorizado' });
+      if (!isSuperAdmin(user)) return callback?.({ ok: false, error: 'No autorizado' });
 
-      const target = data.users.find(u => u.username === data_?.username);
+      const target = findUser(data_?.username);
       if (!target) return callback?.({ ok: false, error: 'Usuario no encontrado' });
       if (target.status !== 'pending') return callback?.({ ok: false, error: 'Esa cuenta no está pendiente' });
 
@@ -1729,9 +1846,9 @@ module.exports = (io, db, errorLog) => {
 
     socket.on('admin-reject-registration', async (data_, callback) => {
       const user = users.get(socket.id);
-      if (!user || user.role !== 'admin') return callback?.({ ok: false, error: 'No autorizado' });
+      if (!isSuperAdmin(user)) return callback?.({ ok: false, error: 'No autorizado' });
 
-      const target = data.users.find(u => u.username === data_?.username);
+      const target = findUser(data_?.username);
       if (!target) return callback?.({ ok: false, error: 'Usuario no encontrado' });
       if (target.status !== 'pending') return callback?.({ ok: false, error: 'Esa cuenta no está pendiente' });
 
@@ -1750,35 +1867,83 @@ module.exports = (io, db, errorLog) => {
       const user = users.get(socket.id);
       if (!user || user.role !== 'admin') return callback?.({ ok: false, error: 'No autorizado' });
 
-      const { username, displayName, role, departments, email } = data_ || {};
+      const { username, displayName, role, departments, adminDepartments, email } = data_ || {};
       if (!username) return callback?.({ ok: false, error: 'Usuario requerido' });
 
-      const target = data.users.find(u => u.username === username);
+      const target = findUser(username);
       if (!target) return callback?.({ ok: false, error: 'Usuario no encontrado' });
+      if (!canManageUser(user, target)) return callback?.({ ok: false, error: 'Ese usuario no pertenece a tus departamentos' });
 
       let newEmail;
       if (email !== undefined) {
         newEmail = normalizeEmail(email) || null;
-        const editEmailError = newEmail && newEmail !== (target.email || null) ? emailError(newEmail) : null;
+        const emailChanges = newEmail !== (target.email || null);
+        // El código de ingreso llega al correo: cambiarlo da acceso a la cuenta en todos sus departamentos.
+        if (emailChanges && !canManageUserFully(user, target)) return callback?.({ ok: false, error: FULL_SCOPE_ERROR });
+        const editEmailError = newEmail && emailChanges ? emailError(newEmail) : null;
         if (editEmailError) return callback?.({ ok: false, error: editEmailError });
         if (newEmail && emailInUse(newEmail, target.username)) return callback?.({ ok: false, error: 'Ese correo ya está registrado en otra cuenta' });
       }
 
+      // Se valida todo antes de cambiar nada.
+      let cleanName;
       if (displayName !== undefined) {
-        const cleanName = str(displayName).trim().slice(0, 40);
+        cleanName = str(displayName).trim().slice(0, 40);
         if (!cleanName) return callback?.({ ok: false, error: 'Nombre requerido' });
-        target.displayName = cleanName;
       }
-      if (role !== undefined && (role === 'admin' || role === 'user')) target.role = role;
+      const newRole = role === 'admin' || role === 'user' ? role : target.role;
+      // Lista de departamentos enviada por el navegador: sin repetidos y solo departamentos que existen.
+      const readDeptList = (value) => {
+        const list = [...new Set((Array.isArray(value) ? value : []).filter(d => typeof d === 'string' && d))];
+        const unknown = list.find(d => !data.departments.find(x => x.name === d));
+        return unknown ? { error: 'Departamento no válido: ' + unknown } : { list };
+      };
+      // El admin de departamento solo asigna o quita sus propios departamentos; los demás se conservan.
+      const scope = adminScope(user);
+      const mergeInScope = (current, requested) => (scope ? [...current.filter(d => !scope.includes(d)), ...requested] : requested);
+
+      let newDepartments = target.departments || [];
       if (departments !== undefined) {
-        const deptList = Array.isArray(departments) ? departments.filter(Boolean) : [];
-        for (const d of deptList) {
-          if (!data.departments.find(x => x.name === d)) {
-            return callback?.({ ok: false, error: 'Departamento no válido: ' + d });
-          }
-        }
-        target.departments = deptList;
+        const parsed = readDeptList(departments);
+        if (parsed.error) return callback?.({ ok: false, error: parsed.error });
+        if (scope && parsed.list.some(d => !scope.includes(d))) return callback?.({ ok: false, error: 'Solo puedes asignar tus departamentos' });
+        newDepartments = mergeInScope(target.departments || [], parsed.list);
       }
+
+      // Departamentos donde es administrador: en los demás de sus departamentos es un usuario normal.
+      let newAdminDepartments = [];
+      if (newRole === 'admin') {
+        if (adminDepartments !== undefined) {
+          const parsed = readDeptList(adminDepartments);
+          if (parsed.error) return callback?.({ ok: false, error: parsed.error });
+          if (scope && parsed.list.some(d => !scope.includes(d))) return callback?.({ ok: false, error: 'Solo puedes dar administración de tus departamentos' });
+          newAdminDepartments = mergeInScope(adminDeptsOf(target), parsed.list);
+        } else {
+          // Sin indicarlo: conserva los que ya tenía o, si recién pasa a admin, todos los que este admin puede dar.
+          newAdminDepartments = target.role === 'admin' ? adminDeptsOf(target) : newDepartments.filter(d => !scope || scope.includes(d));
+        }
+        newAdminDepartments = newAdminDepartments.filter(d => newDepartments.includes(d));
+        if (newDepartments.length > 0 && newAdminDepartments.length === 0) {
+          return callback?.({ ok: false, error: 'Marca al menos un departamento donde sea administrador' });
+        }
+      }
+      if (!isSuperAdmin(user)) {
+        const sameList = (a, b) => a.length === b.length && a.every(d => b.includes(d));
+        const unchanged = newRole === target.role && sameList(newDepartments, target.departments || []) &&
+          sameList(newAdminDepartments, adminDeptsOf(target));
+        if (target.username === user.username && !unchanged) {
+          return callback?.({ ok: false, error: 'No puedes cambiar tu propio rol ni tus departamentos' });
+        }
+        // Un admin sin departamentos sería administrador general: eso solo lo decide el general.
+        if (newRole === 'admin' && newDepartments.length === 0) {
+          return callback?.({ ok: false, error: 'Un administrador debe tener al menos un departamento' });
+        }
+      }
+
+      if (cleanName !== undefined) target.displayName = cleanName;
+      target.role = newRole;
+      target.departments = newDepartments;
+      target.adminDepartments = newAdminDepartments;
       if (newEmail !== undefined && newEmail !== (target.email || null)) {
         // Correo nuevo = hay que volver a verificarlo: el doble factor se reactiva en el próximo ingreso.
         target.email = newEmail;
@@ -1792,38 +1957,43 @@ module.exports = (io, db, errorLog) => {
         return callback?.({ ok: false, error: 'Error al guardar en la base de datos' });
       }
 
-      for (const [sid, u] of users) {
-        if (u.username === username) {
-          const prevRoom = visibilityRoomFor(u);
-          if (role !== undefined) u.role = target.role;
-          if (departments !== undefined) {
-            u.departments = target.departments;
-            if (u.department && !u.departments.includes(u.department)) {
-              u.department = u.departments[0] || null;
-            }
+      {
+        const sid = onlineSid(username);
+        const u = sid && users.get(sid);
+        if (u) {
+          const prevRooms = visibilityRoomsFor(u);
+          u.role = target.role;
+          u.departments = target.departments;
+          u.adminDepartments = target.adminDepartments;
+          if (u.department && !u.departments.includes(u.department)) {
+            u.department = u.departments[0] || null;
           }
-          const newRoom = visibilityRoomFor(u);
-          if (newRoom !== prevRoom) {
-            const targetSocket = io.sockets.sockets.get(sid);
-            if (targetSocket) {
-              targetSocket.leave(prevRoom);
-              targetSocket.join(newRoom);
-            }
+          const newRooms = visibilityRoomsFor(u);
+          const targetSocket = io.sockets.sockets.get(sid);
+          if (targetSocket) {
+            for (const r of prevRooms) if (!newRooms.includes(r)) targetSocket.leave(r);
+            targetSocket.join(newRooms);
           }
+          leaveRoomIfNoAccess(sid, u);
           const deptRecord = u.department ? data.departments.find(d => d.name === u.department) : null;
           io.to(sid).emit('profile-updated', {
             role: u.role,
+            superAdmin: isSuperAdmin(u),
             department: u.department,
             departmentDisplayName: deptRecord?.displayName || u.department,
             departments: departmentOptions(u.departments || []),
-            rooms: getAllRooms(u.department, u.role)
+            adminDepartments: adminDeptsOf(u),
+            rooms: getAllRooms(u)
           });
-          break;
         }
       }
 
-      broadcastAllUsers();
-      emitToViewersOf({ role: target.role, department: (target.departments && target.departments[0]) || null }, 'display-name-updated', { username, displayName: target.displayName || username });
+      // Un cambio de rol o departamento cambia quién ve a quién: se reenvían las listas (acción poco frecuente).
+      if (role !== undefined || departments !== undefined || adminDepartments !== undefined) broadcastAllUsers();
+      const onlineTarget = onlineSid(username) && users.get(onlineSid(username));
+      if (onlineTarget) onlineTarget.displayName = target.displayName || username;
+      io.to(presenceRooms(onlineTarget || { role: target.role, department: (target.departments || [])[0] || null, departments: target.departments || [], adminDepartments: target.adminDepartments || [] }))
+        .emit('user-updated', { username, displayName: target.displayName || username, avatar: target.avatar || null });
 
       callback?.({ ok: true });
     });
@@ -1840,6 +2010,7 @@ module.exports = (io, db, errorLog) => {
       if (roomName === 'general') return callback?.({ ok: false, error: 'No puedes eliminar la sala general' });
 
       const room = data.rooms[idx];
+      if (!inAdminScope(user, room.department)) return callback?.({ ok: false, error: 'Esa sala no pertenece a tus departamentos' });
       try {
         const fileUrls = await getRoomFileUrls(roomName);
         await deleteRoom(roomName);
@@ -1852,6 +2023,7 @@ module.exports = (io, db, errorLog) => {
       data.rooms = data.rooms.filter(r => r !== room);
 
       emitToViewersOfRoom(room, 'room-deleted', { name: roomName });
+      emptyRoom(roomName);
       callback?.({ ok: true });
     });
 
@@ -1865,6 +2037,7 @@ module.exports = (io, db, errorLog) => {
 
       const room = data.rooms.find(r => r.name === name);
       if (!room) return callback?.({ ok: false, error: 'Sala no existe' });
+      if (!inAdminScope(user, room.department)) return callback?.({ ok: false, error: 'Esa sala no pertenece a tus departamentos' });
 
       room.password = str(password) ? await hashPassword(str(password)) : null;
       try {
@@ -1881,18 +2054,31 @@ module.exports = (io, db, errorLog) => {
     socket.on('get-stats', async (callback) => {
       const user = users.get(socket.id);
       if (!user || user.role !== 'admin') return;
-      const byDepartment = data.departments.map(d => ({
-        name: d.name,
-        displayName: d.displayName,
-        users: data.users.filter(u => (u.departments || []).includes(d.name)).length,
-        online: Array.from(users.values()).filter(u => u.department === d.name).length,
-        rooms: data.rooms.filter(r => r.department === d.name).length
-      }));
-      callback({
-        totalUsers: data.users.length,
-        connectedUsers: users.size,
-        totalMessages: await countMessages(),
-        totalRooms: data.rooms.length,
+      // Una sola pasada por cuentas, conectados y salas (antes se recorrían todas por cada departamento).
+      const scope = adminScope(user);
+      const visibleDepts = scope ? data.departments.filter(d => scope.includes(d.name)) : data.departments;
+      const counts = new Map(visibleDepts.map(d => [d.name, { users: 0, online: 0, rooms: 0 }]));
+      for (const u of data.users) for (const d of u.departments || []) if (counts.has(d)) counts.get(d).users++;
+      for (const [, u] of users) if (counts.has(u.department)) counts.get(u.department).online++;
+      for (const r of data.rooms) if (counts.has(r.department)) counts.get(r.department).rooms++;
+      const byDepartment = visibleDepts.map(d => ({ name: d.name, displayName: d.displayName, ...counts.get(d.name) }));
+      if (!scope) {
+        return callback?.({
+          totalUsers: data.users.length,
+          connectedUsers: users.size,
+          totalMessages: await countMessages(),
+          totalRooms: data.rooms.length,
+          departments: byDepartment
+        });
+      }
+      // Admin de departamento: solo sus departamentos (el total de mensajes no se calcula por departamento).
+      let connected = 0;
+      for (const [, u] of users) if (canManageUser(user, u) || u.username === user.username) connected++;
+      callback?.({
+        totalUsers: data.users.filter(u => canManageUser(user, u)).length,
+        connectedUsers: connected,
+        totalMessages: null,
+        totalRooms: data.rooms.filter(r => r.department && scope.includes(r.department)).length,
         departments: byDepartment
       });
     });
@@ -1907,8 +2093,10 @@ module.exports = (io, db, errorLog) => {
       if (username === user.username) return callback?.({ ok: false, error: 'No puedes cambiar tu propia contraseña aquí' });
       if (!newPassword || newPassword.length < 3) return callback?.({ ok: false, error: 'Mínimo 3 caracteres' });
 
-      const target = data.users.find(u => u.username === username);
+      const target = findUser(username);
       if (!target) return callback?.({ ok: false, error: 'Usuario no encontrado' });
+      if (!canManageUser(user, target)) return callback?.({ ok: false, error: 'Ese usuario no pertenece a tus departamentos' });
+      if (!canManageUserFully(user, target)) return callback?.({ ok: false, error: FULL_SCOPE_ERROR });
 
       target.password = await hashPassword(String(newPassword));
       clearFailures('login-user:' + target.username); // el admin le da una contraseña nueva: se quita el bloqueo por intentos
@@ -1935,23 +2123,22 @@ module.exports = (io, db, errorLog) => {
       if (delUsername === user.username) return callback?.({ ok: false, error: 'No puedes eliminarte a ti mismo' });
       if (delUsername === 'admin') return callback?.({ ok: false, error: 'No puedes eliminar al usuario admin' });
 
-      const idx = data.users.findIndex(u => u.username === delUsername);
-      if (idx === -1) return callback?.({ ok: false, error: 'Usuario no encontrado' });
+      const target = findUser(delUsername);
+      if (!target) return callback?.({ ok: false, error: 'Usuario no encontrado' });
+      if (!canManageUser(user, target)) return callback?.({ ok: false, error: 'Ese usuario no pertenece a tus departamentos' });
+      if (!canManageUserFully(user, target)) return callback?.({ ok: false, error: FULL_SCOPE_ERROR });
 
-      data.users.splice(idx, 1);
       try {
         await deleteUser(delUsername);
       } catch (err) {
         console.error('deleteUser error:', err);
         return callback?.({ ok: false, error: 'Error al guardar en la base de datos' });
       }
+      // filter (y no splice): el índice de cuentas se rehace al cambiar la lista.
+      data.users = data.users.filter(u => u !== target);
       const removedFriendUsernames = getAcceptedFriendUsernames(delUsername);
       data.friends = data.friends.filter(f => f.requester !== delUsername && f.recipient !== delUsername);
-      for (const [sid, u] of users) {
-        if (removedFriendUsernames.includes(u.username)) {
-          io.to(sid).emit('friend-removed', { username: delUsername });
-        }
-      }
+      for (const friend of removedFriendUsernames) emitToUsername(friend, 'friend-removed', { username: delUsername });
 
       for (const m of data.groupMembers.filter(x => x.username === delUsername)) {
         const group = findGroup(m.group_id);
@@ -1964,8 +2151,6 @@ module.exports = (io, db, errorLog) => {
       }
 
       kickUser(delUsername, 'Tu cuenta ha sido eliminada por un administrador');
-
-      broadcastAllUsers();
       callback?.({ ok: true });
     });
 
@@ -1978,8 +2163,10 @@ module.exports = (io, db, errorLog) => {
       if (username === user.username) return callback?.({ ok: false, error: 'No puedes bloquearte a ti mismo' });
       if (username === 'admin') return callback?.({ ok: false, error: 'No puedes bloquear al usuario admin' });
 
-      const target = data.users.find(u => u.username === username);
+      const target = findUser(username);
       if (!target) return callback?.({ ok: false, error: 'Usuario no encontrado' });
+      if (!canManageUser(user, target)) return callback?.({ ok: false, error: 'Ese usuario no pertenece a tus departamentos' });
+      if (!canManageUserFully(user, target)) return callback?.({ ok: false, error: FULL_SCOPE_ERROR });
       if (blocked && target.status !== 'active') return callback?.({ ok: false, error: 'Solo se pueden bloquear cuentas activas' });
       if (!blocked && target.status !== 'blocked') return callback?.({ ok: false, error: 'Esa cuenta no está bloqueada' });
 
@@ -2008,7 +2195,9 @@ module.exports = (io, db, errorLog) => {
       const user = users.get(socket.id);
       if (!user || user.role !== 'admin') return callback?.({ ok: false, error: 'No autorizado' });
       const username = data_?.username;
-      if (!username || !data.users.some(u => u.username === username)) return callback?.({ ok: false, error: 'Usuario no encontrado' });
+      const target = findUser(username);
+      if (!target) return callback?.({ ok: false, error: 'Usuario no encontrado' });
+      if (!canManageUser(user, target)) return callback?.({ ok: false, error: 'Ese usuario no pertenece a tus departamentos' });
       if (username === user.username) return callback?.({ ok: false, error: 'Para cerrar tu propia sesión usa el botón Salir' });
       try {
         await revokeUserSessions(username, 'Un administrador cerró tu sesión. Vuelve a ingresar.');
@@ -2021,7 +2210,7 @@ module.exports = (io, db, errorLog) => {
 
     socket.on('admin-create-department', async (data_, callback) => {
       const user = users.get(socket.id);
-      if (!user || user.role !== 'admin') return callback?.({ ok: false, error: 'No autorizado' });
+      if (!isSuperAdmin(user)) return callback?.({ ok: false, error: 'No autorizado' });
 
       const name = str(data_?.name).trim().toLowerCase().replace(/\s+/g, '-');
       const displayName = str(data_?.displayName).trim() || name;
@@ -2073,7 +2262,7 @@ module.exports = (io, db, errorLog) => {
 
     socket.on('admin-delete-department', async (data_, callback) => {
       const user = users.get(socket.id);
-      if (!user || user.role !== 'admin') return callback?.({ ok: false, error: 'No autorizado' });
+      if (!isSuperAdmin(user)) return callback?.({ ok: false, error: 'No autorizado' });
 
       const name = data_?.name;
       if (!name) return callback?.({ ok: false, error: 'Nombre requerido' });
@@ -2096,7 +2285,7 @@ module.exports = (io, db, errorLog) => {
       }
       for (const room of deptRooms) {
         emitToViewersOfRoom(room, 'room-deleted', { name: room.name });
-        roomUsers.delete(room.name);
+        emptyRoom(room.name);
       }
       data.rooms = data.rooms.filter(r => r.department !== name);
       data.departments = data.departments.filter(d => d.name !== name);
@@ -2117,9 +2306,19 @@ module.exports = (io, db, errorLog) => {
       callback?.({ ok: true });
     });
 
-    socket.on('panic-alert', () => {
+    socket.on('panic-alert', (callback) => {
       const user = users.get(socket.id);
       if (!user) return;
+      if (typeof callback !== 'function') callback = null;
+      // La alerta es para un departamento: sin uno (p. ej. el administrador general) no se puede enviar.
+      if (!user.department) return callback?.({ ok: false, error: 'Debes pertenecer a un departamento para enviar una alerta' });
+
+      // Una alerta cada 30 segundos por persona: la primera ya avisó, repetirla solo hace ruido (spam).
+      const last = lastPanicAt.get(user.username) || 0;
+      const waitMs = PANIC_COOLDOWN_MS - (Date.now() - last);
+      if (waitMs > 0) return callback?.({ ok: false, waitSeconds: Math.ceil(waitMs / 1000) });
+      lastPanicAt.set(user.username, Date.now());
+      setTimeout(() => lastPanicAt.delete(user.username), PANIC_COOLDOWN_MS).unref();
 
       const deptRecord = user.department ? data.departments.find(d => d.name === user.department) : null;
       const timestamp = new Date().toISOString();
@@ -2132,15 +2331,8 @@ module.exports = (io, db, errorLog) => {
         timestamp
       };
 
-      for (const [sid, u] of users) {
-        if (sid === socket.id) continue;
-        const sameDept = !!(user.department && u.department === user.department);
-        const senderIsGlobal = !user.department;
-        const recipientIsAdmin = u.role === 'admin';
-        if (sameDept || senderIsGlobal || recipientIsAdmin) {
-          io.to(sid).emit('panic-alert', payload);
-        }
-      }
+      // Le llega a su departamento y a los administradores generales (menos a quien la envía).
+      socket.to([departmentRoom(user.department), ADMIN_ROOM]).emit('panic-alert', payload);
 
       saveAlert({
         username: user.username,
@@ -2152,11 +2344,12 @@ module.exports = (io, db, errorLog) => {
       }).catch(err => console.error('saveAlert error:', err));
 
       sendPanicAlertEmail(payload).catch(err => console.error('sendPanicAlertEmail error:', err));
+      callback?.({ ok: true, waitSeconds: PANIC_COOLDOWN_MS / 1000 });
     });
 
     socket.on('get-error-log', async (data_, callback) => {
       const user = users.get(socket.id);
-      if (!user || user.role !== 'admin') return callback?.({ ok: false, errors: [], hasMore: false, pendingCount: 0 });
+      if (!isSuperAdmin(user)) return callback?.({ ok: false, errors: [], hasMore: false, pendingCount: 0 });
       const offset = Math.max(0, Math.floor(Number(data_?.offset) || 0));
       const rows = await getErrorLog(ERROR_LOG_PAGE_SIZE + 1, offset, !!data_?.onlyPending);
       callback?.({
@@ -2169,13 +2362,13 @@ module.exports = (io, db, errorLog) => {
 
     socket.on('get-error-count', async (callback) => {
       const user = users.get(socket.id);
-      if (!user || user.role !== 'admin') return callback?.({ pendingCount: 0 });
+      if (!isSuperAdmin(user)) return callback?.({ pendingCount: 0 });
       callback?.({ pendingCount: await countPendingErrors() });
     });
 
     socket.on('admin-resolve-error', async (data_, callback) => {
       const user = users.get(socket.id);
-      if (!user || user.role !== 'admin') return callback?.({ ok: false, error: 'No autorizado' });
+      if (!isSuperAdmin(user)) return callback?.({ ok: false, error: 'No autorizado' });
       const id = Number(data_?.id);
       if (!Number.isInteger(id)) return callback?.({ ok: false, error: 'Error no válido' });
       await setErrorResolved(id, !!data_?.resolved, user.username);
@@ -2202,9 +2395,10 @@ module.exports = (io, db, errorLog) => {
       if (!user || user.role !== 'admin') return callback?.({ alerts: [], hasMore: false });
 
       const limit = 50;
-      const offset = data_?.offset || 0;
+      const offset = Math.max(0, Math.floor(Number(data_?.offset) || 0));
       try {
-        const rows = await getAlertHistory(limit + 1, offset);
+        // El admin de departamento ve solo las alertas de sus departamentos.
+        const rows = await getAlertHistory(limit + 1, offset, adminScope(user));
         const hasMore = rows.length > limit;
         callback?.({ alerts: rows.slice(0, limit), hasMore });
       } catch (err) {
@@ -2223,7 +2417,7 @@ module.exports = (io, db, errorLog) => {
       }
 
       user.location = location;
-      const record = data.users.find(u => u.username === user.username);
+      const record = findUser(user.username);
       if (record) {
         record.location = location || null;
         saveUser(record).catch(err => console.error('saveUser error:', err));
@@ -2478,7 +2672,8 @@ module.exports = (io, db, errorLog) => {
         return callback?.({ messages: page.messages, hasMore: page.hasMore });
       }
       if (room) {
-        if (room !== user.currentRoom) {
+        const roomRecord = data.rooms.find(r => r.name === room);
+        if (room !== user.currentRoom || !roomRecord || !canViewRoom(roomRecord, user)) {
           return callback?.({ messages: [], hasMore: false });
         }
         const page = await getRoomHistory(room, beforeId);
@@ -2498,25 +2693,16 @@ module.exports = (io, db, errorLog) => {
       if (user.uploadToken) uploadTokens.delete(user.uploadToken);
       const oldRoom = user.currentRoom;
 
-      for (const [roomName, sockets] of roomUsers) {
-        if (sockets.has(socket.id)) {
-          sockets.delete(socket.id);
-          if (sockets.size === 0) {
-            roomUsers.delete(roomName);
-          } else {
-            io.to(roomName).emit('users-update', {
-              room: roomName,
-              users: getOnlineUsers(roomName)
-            });
-          }
-        }
+      const sockets = oldRoom && roomUsers.get(oldRoom);
+      if (sockets) {
+        sockets.delete(socket.id);
+        if (sockets.size === 0) roomUsers.delete(oldRoom);
+        else if (!isGlobalRoom(oldRoom)) io.to(oldRoom).emit('room-user-left', { room: oldRoom, username: user.username });
       }
 
-      if (user.username && roomUnreads[user.username]) {
-        delete roomUnreads[user.username];
-      }
       users.delete(socket.id);
-      broadcastAllUsers();
+      if (socketIdByUsername.get(user.username) === socket.id) socketIdByUsername.delete(user.username);
+      announceOffline(user);
       notifyFriendsOfStatusChange(user.username);
 
       if (user.sessionHash && !user.sessionRemember) scheduleSessionClose(user.sessionHash);

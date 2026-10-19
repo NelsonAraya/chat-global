@@ -809,8 +809,10 @@
         <div style="margin-top:12px;">
           <label style="font-size:14px;font-weight:500;display:block;margin-bottom:6px;">Departamentos/Centros (puede tener varios)</label>
           <div id="admin-edit-departments" class="admin-edit-dept-checklist"></div>
+          <p id="admin-edit-admin-hint" class="create-modal-info hidden"><i class="fas fa-info-circle"></i> Marca «Admin» solo en los departamentos que administra: en los demás será un usuario normal.</p>
         </div>
-        <div class="admin-edit-pwd-section">
+        <p id="admin-edit-limited-note" class="create-modal-info hidden"><i class="fas fa-info-circle"></i> Este usuario también pertenece a departamentos que no administras: solo el administrador general puede cambiar su contraseña o correo, bloquearlo o eliminarlo.</p>
+        <div id="admin-edit-pwd-section" class="admin-edit-pwd-section">
           <label class="admin-edit-section-label"><i class="fas fa-key"></i> Cambiar contraseña (opcional)</label>
           <div class="input-group" style="margin-bottom:8px;">
             <i class="fas fa-lock input-icon"></i>
@@ -948,7 +950,7 @@
 
   <div id="toast-container"></div>
 
-  <script src="https://cdn.socket.io/4.8.0/socket.io.min.js"></script>
+  <script src="/socket.io/socket.io.min.js"></script>
   <script src="app.js"></script>
 </body>
 </html>

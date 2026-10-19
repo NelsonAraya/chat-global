@@ -1356,6 +1356,23 @@ body {
   background: var(--bg-hover);
 }
 
+.admin-edit-dept-checklist .admin-edit-dept-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.admin-edit-dept-checklist .admin-edit-dept-row > label:first-child {
+  flex: 1;
+  min-width: 0;
+}
+
+.admin-edit-dept-checklist label.dept-admin-toggle {
+  font-size: 12px;
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+
 .admin-edit-dept-checklist .admin-edit-dept-empty {
   padding: 10px 12px;
   font-size: 13px;
@@ -3183,4 +3200,12 @@ a.cert-btn:hover {
   white-space: pre-wrap;
   word-break: break-word;
   color: var(--text-primary);
+}
+
+/* Canales globales: no se muestra la lista de quienes están en la sala. */
+.room-users-hidden-note {
+  padding: 8px 12px;
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1.4;
 }

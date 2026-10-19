@@ -20,7 +20,9 @@ module.exports = (async () => {
     password: DB_PASSWORD,
     database: DB_NAME,
     waitForConnections: true,
-    connectionLimit: 10,
+    // Cada ingreso hace varias consultas (sesión, conversaciones, historial): con 10 conexiones la hora punta
+    // hacía cola. MySQL acepta 151 por defecto.
+    connectionLimit: Number(process.env.DB_POOL_SIZE) || 30,
     charset: 'utf8mb4_unicode_ci'
   });
 
@@ -43,6 +45,10 @@ module.exports = (async () => {
   // Migración: correo de registro y estado del doble factor (código por correo).
   try { await pool.query('ALTER TABLE users ADD COLUMN email VARCHAR(255)'); } catch {}
   try { await pool.query('ALTER TABLE users ADD COLUMN two_factor_enabled TINYINT(1) DEFAULT 0'); } catch {}
+  // Migración: departamentos donde la cuenta es administradora (en el resto de sus departamentos es usuario).
+  // Los administradores que ya existían lo siguen siendo en todos sus departamentos.
+  try { await pool.query('ALTER TABLE users ADD COLUMN admin_departments TEXT'); } catch {}
+  await pool.query("UPDATE users SET admin_departments = COALESCE(departments, '[]') WHERE admin_departments IS NULL AND role = 'admin'");
 
   await pool.query(`CREATE TABLE IF NOT EXISTS rooms (
     name VARCHAR(64) PRIMARY KEY,
@@ -82,6 +88,30 @@ module.exports = (async () => {
   try { await pool.query('ALTER TABLE messages ADD INDEX idx_messages_room_id (room_name, id)'); } catch {}
   try { await pool.query('ALTER TABLE messages ADD INDEX idx_messages_group_id (group_id, id)'); } catch {}
   try { await pool.query('ALTER TABLE messages ADD INDEX idx_messages_pair_id (sender, recipient, id)'); } catch {}
+
+  // Conversaciones privadas: una fila por usuario y persona con quien conversa, con el id de su último mensaje.
+  // Así la lista de conversaciones se lee directo, sin recorrer todos los mensajes privados del usuario.
+  await pool.query(`CREATE TABLE IF NOT EXISTS conversations (
+    username VARCHAR(64) NOT NULL,
+    other VARCHAR(64) NOT NULL,
+    last_message_id DOUBLE NOT NULL,
+    PRIMARY KEY (username, other),
+    INDEX idx_conversations_user_last (username, last_message_id)
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
+  // Migración (solo la primera vez): se arma a partir de los mensajes privados que ya existen.
+  const [[{ hasConversations }]] = await pool.query('SELECT EXISTS(SELECT 1 FROM conversations) AS hasConversations');
+  if (!hasConversations) {
+    await pool.query(
+      `INSERT INTO conversations (username, other, last_message_id)
+       SELECT sender, recipient, MAX(id) FROM messages WHERE recipient IS NOT NULL GROUP BY sender, recipient
+       ON DUPLICATE KEY UPDATE last_message_id = GREATEST(last_message_id, VALUES(last_message_id))`
+    );
+    await pool.query(
+      `INSERT INTO conversations (username, other, last_message_id)
+       SELECT recipient, sender, MAX(id) FROM messages WHERE recipient IS NOT NULL GROUP BY recipient, sender
+       ON DUPLICATE KEY UPDATE last_message_id = GREATEST(last_message_id, VALUES(last_message_id))`
+    );
+  }
 
   await pool.query(`CREATE TABLE IF NOT EXISTS chat_groups (
     id INT AUTO_INCREMENT PRIMARY KEY,
@@ -184,12 +214,14 @@ module.exports = (async () => {
     ['general', 'sistema', now, null, 0]
   );
 
+  const parseList = (text) => {
+    if (!text) return [];
+    try { return JSON.parse(text) || []; } catch { return []; }
+  };
   const mapUser = (r) => {
-    let departments = [];
-    if (r.departments) {
-      try { departments = JSON.parse(r.departments) || []; } catch { departments = []; }
-    }
-    return { username: r.username, password: r.password, displayName: r.display_name, avatar: r.avatar, role: r.role, location: r.location, departments, status: r.status || 'active', email: r.email || null, twoFactorEnabled: !!r.two_factor_enabled, created_at: r.created_at };
+    const departments = parseList(r.departments);
+    const adminDepartments = r.role === 'admin' ? parseList(r.admin_departments).filter(d => departments.includes(d)) : [];
+    return { username: r.username, password: r.password, displayName: r.display_name, avatar: r.avatar, role: r.role, location: r.location, departments, adminDepartments, status: r.status || 'active', email: r.email || null, twoFactorEnabled: !!r.two_factor_enabled, created_at: r.created_at };
   };
   const mapRoom = (r) => ({ name: r.name, created_by: r.created_by, created_at: r.created_at, password: r.password, temporary: !!r.temporary, department: r.department || null });
   const mapDepartment = (r) => ({ name: r.name, displayName: r.display_name, created_at: r.created_at });
@@ -227,12 +259,12 @@ module.exports = (async () => {
 
   const saveUser = async (u) => {
     await pool.query(
-      `INSERT INTO users (username, password, display_name, avatar, role, location, departments, status, email, two_factor_enabled, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `INSERT INTO users (username, password, display_name, avatar, role, location, departments, admin_departments, status, email, two_factor_enabled, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON DUPLICATE KEY UPDATE password=VALUES(password), display_name=VALUES(display_name), avatar=VALUES(avatar),
-         role=VALUES(role), location=VALUES(location), departments=VALUES(departments), status=VALUES(status),
-         email=VALUES(email), two_factor_enabled=VALUES(two_factor_enabled)`,
-      [u.username, u.password, u.displayName || null, u.avatar || null, u.role || 'user', u.location || null, JSON.stringify(u.departments || []), u.status || 'active', u.email || null, u.twoFactorEnabled ? 1 : 0, u.created_at || null]
+         role=VALUES(role), location=VALUES(location), departments=VALUES(departments), admin_departments=VALUES(admin_departments),
+         status=VALUES(status), email=VALUES(email), two_factor_enabled=VALUES(two_factor_enabled)`,
+      [u.username, u.password, u.displayName || null, u.avatar || null, u.role || 'user', u.location || null, JSON.stringify(u.departments || []), JSON.stringify(u.adminDepartments || []), u.status || 'active', u.email || null, u.twoFactorEnabled ? 1 : 0, u.created_at || null]
     );
   };
 
@@ -265,14 +297,37 @@ module.exports = (async () => {
         JSON.stringify(m.reactions || {}),
         m.created_at || null, m.recipient || null, m.type || 'room', m.group_id || null]
     );
+    adjustMessageCount(1);
+    if (m.recipient) {
+      // Mantiene al día la lista de conversaciones de ambos.
+      await pool.query(
+        `INSERT INTO conversations (username, other, last_message_id) VALUES (?, ?, ?), (?, ?, ?)
+         ON DUPLICATE KEY UPDATE last_message_id = GREATEST(last_message_id, VALUES(last_message_id))`,
+        [m.sender, m.recipient, m.id, m.recipient, m.sender, m.id]
+      );
+    }
   };
+
+  // ===== Total de mensajes =====
+  // COUNT(*) recorre toda la tabla (segundos con millones de filas). Se cuenta una sola vez al arrancar, en
+  // segundo plano, y luego se lleva la cuenta en memoria con cada mensaje guardado o borrado.
+  let messageCount = null;
+  let messageCountDelta = 0; // cambios ocurridos mientras se hacía el conteo inicial
+  const adjustMessageCount = (delta) => {
+    if (messageCount === null) messageCountDelta += delta;
+    else messageCount += delta;
+  };
+  pool.query('SELECT COUNT(*) AS n FROM messages')
+    .then(([[row]]) => { messageCount = Number(row.n) + messageCountDelta; })
+    .catch(err => console.error('countMessages error:', err));
 
   const updateMessageReactions = async (id, reactions) => {
     await pool.query('UPDATE messages SET reactions = ? WHERE id = ?', [JSON.stringify(reactions || {}), id]);
   };
 
   const deleteMessagesByRoom = async (roomName) => {
-    await pool.query('DELETE FROM messages WHERE room_name = ?', [roomName]);
+    const [result] = await pool.query('DELETE FROM messages WHERE room_name = ?', [roomName]);
+    adjustMessageCount(-result.affectedRows);
   };
 
   // ===== Lectura del historial: se consulta a la base solo la página que se necesita =====
@@ -307,12 +362,11 @@ module.exports = (async () => {
   // Último mensaje de cada conversación privada del usuario (para la lista de conversaciones).
   const getLastPrivateMessages = async (username) => {
     const [rows] = await pool.query(
-      `SELECT m.* FROM messages m
-       JOIN (SELECT IF(sender = ?, recipient, sender) AS other, MAX(id) AS max_id
-             FROM messages WHERE recipient IS NOT NULL AND (sender = ? OR recipient = ?) GROUP BY other) t
-         ON m.id = t.max_id
-       ORDER BY m.id DESC`,
-      [username, username, username]
+      `SELECT m.* FROM conversations c
+       JOIN messages m ON m.id = c.last_message_id
+       WHERE c.username = ?
+       ORDER BY c.last_message_id DESC`,
+      [username]
     );
     return rows.map(mapMessage);
   };
@@ -338,9 +392,13 @@ module.exports = (async () => {
     return rows.map(r => r.file_url);
   };
 
+  // Mientras el conteo inicial no termina se usa la estimación de MySQL (instantánea, aproximada).
   const countMessages = async () => {
-    const [[row]] = await pool.query('SELECT COUNT(*) AS n FROM messages');
-    return Number(row.n);
+    if (messageCount !== null) return messageCount;
+    const [[row]] = await pool.query(
+      "SELECT TABLE_ROWS AS n FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'messages'"
+    );
+    return Number(row?.n) || 0;
   };
 
   const saveDepartment = async (d) => {
@@ -387,7 +445,8 @@ module.exports = (async () => {
 
   // Borra el grupo, sus miembros y sus mensajes.
   const deleteGroup = async (id) => {
-    await pool.query('DELETE FROM messages WHERE group_id = ?', [id]);
+    const [result] = await pool.query('DELETE FROM messages WHERE group_id = ?', [id]);
+    adjustMessageCount(-result.affectedRows);
     await pool.query('DELETE FROM group_members WHERE group_id = ?', [id]);
     await pool.query('DELETE FROM chat_groups WHERE id = ?', [id]);
   };
@@ -484,10 +543,13 @@ module.exports = (async () => {
     await pool.query('DELETE FROM error_log WHERE resolved = 1 AND last_at < ?', [beforeIso]);
   };
 
-  const getAlertHistory = async (limit, offset) => {
+  // `departments`: null = todas las alertas (administrador general); una lista = solo las de esos departamentos.
+  const getAlertHistory = async (limit, offset, departments = null) => {
+    if (Array.isArray(departments) && departments.length === 0) return [];
+    const filter = departments ? 'WHERE department IN (?)' : '';
     const [rows] = await pool.query(
-      'SELECT * FROM alerts ORDER BY created_at DESC LIMIT ? OFFSET ?',
-      [limit, offset]
+      `SELECT * FROM alerts ${filter} ORDER BY created_at DESC LIMIT ? OFFSET ?`,
+      departments ? [departments, limit, offset] : [limit, offset]
     );
     return rows.map(r => ({
       id: r.id,

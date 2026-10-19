@@ -12,6 +12,8 @@ let groups = [];
 let groupInvitations = [];
 let groupUnreadCounts = {};
 let lastRoomUsers = [];
+let roomUsersHidden = false; // salas globales: el servidor no envía quiénes están (ni cuántos)
+let allOnlineUsers = []; // lista "Conectados": llega completa al entrar y luego solo con cambios
 let rooms = [];
 let conversations = [];
 let unreadCounts = {};
@@ -21,12 +23,15 @@ let pendingPasswordRoom = null;
 let sidebarTab = 'rooms';
 let roomPasswords = {};
 let currentRole = 'user';
+// Administrador general (admin sin departamentos asignados). Un admin con departamentos solo administra los suyos.
+let currentSuperAdmin = false;
 let currentDepartment = null;
 let currentDepartmentDisplayName = null;
 let pendingFile = null;
 let replyingTo = null;
 let departments = [];
 let myDepartments = [];
+let myAdminDepartments = []; // departamentos donde este usuario es admin (en los demás es usuario normal)
 let friends = [];
 let friendRequestsIncoming = [];
 let pendingRegistrations = [];
@@ -311,8 +316,9 @@ function updateHeaderDepartment() {
     panicBtn.title = 'La alerta solo la verán los usuarios de ' + currentDepartmentDisplayName + ' y los administradores';
   } else {
     headerDepartment.classList.add('hidden');
-    panicBtn.title = 'La alerta se enviará a todos los usuarios conectados';
   }
+  // La alerta va a un departamento: quien no tiene uno no puede enviarla.
+  panicBtn.classList.toggle('hidden', !currentDepartment);
   switchDeptBtn.classList.toggle('hidden', myDepartments.length <= 1);
 }
 
@@ -659,9 +665,11 @@ function showChatAfterLogin(username, res, opts) {
   currentAvatar = res.avatar || null;
   currentLocation = res.location || '';
   currentRole = res.role || 'user';
+  currentSuperAdmin = !!res.superAdmin;
   currentDepartment = res.department || null;
   currentDepartmentDisplayName = res.departmentDisplayName || null;
   myDepartments = res.departments || [];
+  myAdminDepartments = res.adminDepartments || [];
   rooms = res.rooms || [];
   loginScreen.classList.add('hidden');
   chatScreen.classList.remove('hidden');
@@ -670,6 +678,7 @@ function showChatAfterLogin(username, res, opts) {
   updateHeaderAvatar();
   if (currentRole === 'admin') {
     adminTab.classList.remove('hidden');
+    applyAdminScopeUi();
     refreshErrorCount();
   } else {
     adminTab.classList.add('hidden');
@@ -677,7 +686,7 @@ function showChatAfterLogin(username, res, opts) {
   if (res.sessionToken) storeSession(res.sessionToken, res.sessionRemember);
   initializeChat();
   socket.emit('get-room-unreads', function(counts) {
-    roomUnreadCounts = counts || {};
+    roomUnreadCounts = Object.assign(counts || {}, roomUnreadCounts); // no pisa los avisos que ya llegaron
     renderRooms();
     updateRoomTotalBadge();
   });
@@ -1202,13 +1211,64 @@ logoutBtn.addEventListener('click', () => {
   setTimeout(finish, 2000); // si el servidor no responde, igual se sale
 });
 
-panicBtn.addEventListener('click', function() {
+// Después de enviar una alerta hay que esperar 30 segundos para otra (botón y triple clic comparten la espera;
+// el servidor también la exige).
+var PANIC_COOLDOWN_MS = 30000;
+var panicLastTrigger = 0;
+var panicBtnHtml = panicBtn.innerHTML;
+var panicCountdownTimer = null;
+
+function panicSecondsLeft() {
+  return Math.max(0, Math.ceil((panicLastTrigger + PANIC_COOLDOWN_MS - Date.now()) / 1000));
+}
+
+function startPanicCountdown() {
+  clearInterval(panicCountdownTimer);
+  function tick() {
+    var left = panicSecondsLeft();
+    if (left <= 0) {
+      clearInterval(panicCountdownTimer);
+      panicBtn.disabled = false;
+      panicBtn.innerHTML = panicBtnHtml;
+      return;
+    }
+    panicBtn.disabled = true;
+    panicBtn.innerHTML = '<i class="fas fa-hourglass-half"></i> Alerta enviada (' + left + 's)';
+  }
+  tick();
+  panicCountdownTimer = setInterval(tick, 1000);
+}
+
+function sendPanicAlert() {
+  if (!currentDepartment) return false;
+  if (panicSecondsLeft() > 0) {
+    showToast('Ya enviaste una alerta. Podrás enviar otra en ' + panicSecondsLeft() + ' segundos.');
+    return false;
+  }
+  panicLastTrigger = Date.now();
+  startPanicCountdown();
   panicModalMessage.textContent = 'Has enviado una alerta de asistencia';
   panicModalLocation.innerHTML = 'Ubicación: <strong>' + escapeHtml(currentLocation || 'Indeterminada') + '</strong>';
   panicModalTime.textContent = formatTime(new Date().toISOString());
   panicModalOverlay.classList.remove('hidden');
-  socket.emit('panic-alert');
-});
+  socket.emit('panic-alert', function(res) {
+    if (res && !res.ok && res.waitSeconds) {
+      // El servidor aún cuenta una alerta anterior (p. ej. se recargó la página): esta no se envió.
+      panicLastTrigger = Date.now() + res.waitSeconds * 1000 - PANIC_COOLDOWN_MS;
+      startPanicCountdown();
+      closePanicModal();
+      showToast('Ya enviaste una alerta. Podrás enviar otra en ' + res.waitSeconds + ' segundos.');
+    } else if (res && !res.ok) {
+      panicLastTrigger = 0;
+      startPanicCountdown();
+      closePanicModal();
+      if (res.error) showToast(res.error);
+    }
+  });
+  return true;
+}
+
+panicBtn.addEventListener('click', sendPanicAlert);
 
 panicModalOk.addEventListener('click', closePanicModal);
 panicModalClose.addEventListener('click', closePanicModal);
@@ -1219,12 +1279,10 @@ panicModalOverlay.addEventListener('click', function(e) {
 // Triple clic rápido en zona gris del chat para activar alerta
 var panicClickTimes = [];
 var PANIC_CLICK_WINDOW = 800;
-var PANIC_COOLDOWN_MS = 30000;
-var panicLastTrigger = 0;
 
 document.addEventListener('click', function(e) {
-  if (!currentUser) return;
-  if (Date.now() - panicLastTrigger < PANIC_COOLDOWN_MS) return;
+  if (!currentUser || !currentDepartment) return;
+  if (panicSecondsLeft() > 0) return;
 
   var tag = e.target.tagName;
   if (tag === 'BUTTON' || tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || tag === 'A') return;
@@ -1240,18 +1298,12 @@ document.addEventListener('click', function(e) {
 
   if (panicClickTimes.length >= 3) {
     panicClickTimes = [];
-    panicLastTrigger = Date.now();
+    if (!sendPanicAlert()) return;
 
     var flash = document.createElement('div');
     flash.style.cssText = 'position:fixed;inset:0;border:6px solid #ef4444;border-radius:0;pointer-events:none;z-index:1999;animation:fadeOut 0.6s forwards;';
     document.body.appendChild(flash);
     setTimeout(function() { flash.remove(); }, 700);
-
-    panicModalMessage.textContent = 'Has enviado una alerta de asistencia';
-    panicModalLocation.innerHTML = 'Ubicación: <strong>' + escapeHtml(currentLocation || 'Indeterminada') + '</strong>';
-    panicModalTime.textContent = formatTime(new Date().toISOString());
-    panicModalOverlay.classList.remove('hidden');
-    socket.emit('panic-alert');
   }
 });
 
@@ -1382,7 +1434,7 @@ function initializeChat() {
   loadConversations();
   loadGroups();
   loadFriendRequests();
-  if (currentRole === 'admin') loadPendingRegistrations();
+  if (currentSuperAdmin) loadPendingRegistrations();
   socket.emit('get-all-users', function(users) {
     renderAllUsers(users);
   });
@@ -1494,16 +1546,57 @@ function userDepartmentsLabel(names) {
   }).join(', ');
 }
 
-function renderDepartmentCheckboxes(containerEl, selectedNames) {
-  if (departments.length === 0) {
+// Departamentos que puede administrar este admin: todos si es el general; si no, solo donde es admin.
+function adminDepartments() {
+  if (currentSuperAdmin) return departments;
+  return departments.filter(function(d) { return myAdminDepartments.indexOf(d.name) !== -1; });
+}
+
+function canAdminRoom(room) {
+  if (currentSuperAdmin) return true;
+  return !!room.department && myAdminDepartments.indexOf(room.department) !== -1;
+}
+
+// Muestra u oculta lo que solo usa el administrador general (registros, departamentos, errores).
+function applyAdminScopeUi() {
+  var errorsTabBtn = document.querySelector('.admin-subtab[data-admin-tab="errores"]');
+  if (errorsTabBtn) errorsTabBtn.classList.toggle('hidden', !currentSuperAdmin);
+  createDeptBtn.classList.toggle('hidden', !currentSuperAdmin);
+  if (!currentSuperAdmin) adminPendingSection.classList.add('hidden');
+}
+
+// Cada departamento tiene dos casillas: "pertenece" y "Admin" (esta última solo con el rol Administrador).
+function renderDepartmentCheckboxes(containerEl, selectedNames, adminNames) {
+  var list = adminDepartments();
+  if (list.length === 0) {
     containerEl.innerHTML = '<div class="admin-edit-dept-empty">No hay departamentos creados aún.</div>';
     return;
   }
-  containerEl.innerHTML = departments.map(function(d) {
+  adminNames = adminNames || [];
+  containerEl.innerHTML = list.map(function(d) {
     var checked = selectedNames.indexOf(d.name) !== -1 ? ' checked' : '';
-    return '<label><input type="checkbox" value="' + escapeHtml(d.name) + '"' + checked + ' /> ' + escapeHtml(d.displayName || d.name) + '</label>';
+    var adminChecked = adminNames.indexOf(d.name) !== -1 ? ' checked' : '';
+    return '<div class="admin-edit-dept-row">' +
+      '<label><input type="checkbox" class="dept-member" value="' + escapeHtml(d.name) + '"' + checked + ' /> ' + escapeHtml(d.displayName || d.name) + '</label>' +
+      '<label class="dept-admin-toggle"><input type="checkbox" class="dept-admin" value="' + escapeHtml(d.name) + '"' + adminChecked + ' /> Admin</label>' +
+    '</div>';
   }).join('');
+  containerEl.querySelectorAll('.admin-edit-dept-row').forEach(function(row) {
+    var member = row.querySelector('.dept-member');
+    var admin = row.querySelector('.dept-admin');
+    member.addEventListener('change', function() { if (!member.checked) admin.checked = false; });
+    admin.addEventListener('change', function() { if (admin.checked) member.checked = true; });
+  });
+  updateAdminDeptToggles();
 }
+
+// Las casillas "Admin" solo se muestran cuando el rol elegido es Administrador.
+function updateAdminDeptToggles() {
+  var isAdmin = adminEditRole.value === 'admin';
+  adminEditDepartments.querySelectorAll('.dept-admin-toggle').forEach(function(el) { el.classList.toggle('hidden', !isAdmin); });
+  $('admin-edit-admin-hint').classList.toggle('hidden', !isAdmin);
+}
+adminEditRole.addEventListener('change', updateAdminDeptToggles);
 
 function loadPendingRegistrations() {
   socket.emit('get-pending-registrations', function(list) {
@@ -1645,14 +1738,14 @@ function updateErrorsBadge(count) {
 }
 
 function refreshErrorCount() {
-  if (currentRole !== 'admin') return;
+  if (!currentSuperAdmin) return;
   socket.emit('get-error-count', function(res) {
     if (res) updateErrorsBadge(res.pendingCount || 0);
   });
 }
 
 function loadErrorLog(reset) {
-  if (loadingErrorLog || currentRole !== 'admin') return;
+  if (loadingErrorLog || !currentSuperAdmin) return;
   loadingErrorLog = true;
   adminErrorsLoadMore.disabled = true;
   socket.emit('get-error-log', { offset: reset ? 0 : errorLogItems.length, onlyPending: adminErrorsOnlyPending.checked }, function(res) {
@@ -1770,18 +1863,21 @@ window.addEventListener('unhandledrejection', function(ev) {
 });
 
 function renderAdminPanel() {
-  loadPendingRegistrations();
+  applyAdminScopeUi();
+  if (currentSuperAdmin) {
+    loadPendingRegistrations();
+    loadErrorLog(true);
+  }
   loadAlertHistory(true);
-  loadErrorLog(true);
   socket.emit('get-stats', function(stats) {
     if (stats) {
       adminStatUsers.textContent = stats.totalUsers;
       adminStatOnline.textContent = stats.connectedUsers;
-      adminStatMsgs.textContent = stats.totalMessages;
+      adminStatMsgs.textContent = stats.totalMessages === null || stats.totalMessages === undefined ? '—' : stats.totalMessages;
       adminStatRooms.textContent = stats.totalRooms;
     }
 
-    adminDepartmentsList.innerHTML = departments.map(function(d) {
+    adminDepartmentsList.innerHTML = adminDepartments().map(function(d) {
       var depStats = stats && stats.departments ? stats.departments.find(function(s) { return s.name === d.name; }) : null;
       var meta = depStats ? (depStats.users + ' usuarios · ' + depStats.online + ' conectados · ' + depStats.rooms + ' salas') : '';
       return '<div class="admin-room-item">' +
@@ -1790,7 +1886,7 @@ function renderAdminPanel() {
           '<span class="admin-room-meta">' + meta + '</span>' +
         '</div>' +
         '<div class="admin-room-actions">' +
-          '<button class="admin-dept-delete-btn btn-icon" data-dept="' + escapeHtml(d.name) + '" title="Eliminar departamento"><i class="fas fa-trash"></i></button>' +
+          (currentSuperAdmin ? '<button class="admin-dept-delete-btn btn-icon" data-dept="' + escapeHtml(d.name) + '" title="Eliminar departamento"><i class="fas fa-trash"></i></button>' : '') +
         '</div>' +
       '</div>';
     }).join('') || '<div class="admin-table-empty">Sin departamentos. Crea uno con el botón "Crear departamento".</div>';
@@ -1811,6 +1907,9 @@ function renderAdminPanel() {
   socket.emit('get-all-registered-users', function(users) {
     adminUsersList.innerHTML = users.filter(function(u) { return u.status !== 'pending'; }).map(function(u) {
       var isAdmin = u.role === 'admin';
+      var adminDepts = u.adminDepartments || [];
+      // Admin solo en algunos de sus departamentos: se indica en cuáles.
+      var roleLabel = !isAdmin ? 'User' : (adminDepts.length && adminDepts.length < (u.departments || []).length ? 'Admin de ' + userDepartmentsLabel(adminDepts) : 'Admin');
       var statusHtml = u.status === 'rejected' ? ' <span class="admin-user-role admin-status-rejected">Rechazado</span>'
         : u.status === 'blocked' ? ' <span class="admin-user-role admin-status-rejected">Bloqueado</span>' : '';
       var emailHtml = '<div class="admin-user-username"><i class="fas fa-envelope"></i> ' + escapeHtml(u.email || 'Sin correo') +
@@ -1818,10 +1917,10 @@ function renderAdminPanel() {
       return '<div class="admin-user-item">' +
         '<div class="admin-user-info">' +
           '<div class="admin-user-name">' + escapeHtml(u.displayName || u.username) + '</div>' +
-          '<div class="admin-user-username">@' + escapeHtml(u.username) + '  <span class="admin-user-role' + (isAdmin ? ' admin-role-badge' : '') + '">' + (isAdmin ? 'Admin' : 'User') + '</span> <span class="admin-user-role">' + escapeHtml(userDepartmentsLabel(u.departments)) + '</span>' + statusHtml + '</div>' +
+          '<div class="admin-user-username">@' + escapeHtml(u.username) + '  <span class="admin-user-role' + (isAdmin ? ' admin-role-badge' : '') + '">' + escapeHtml(roleLabel) + '</span> <span class="admin-user-role">' + escapeHtml(userDepartmentsLabel(u.departments)) + '</span>' + statusHtml + '</div>' +
           emailHtml +
         '</div>' +
-        '<button class="admin-user-edit-btn btn-icon" data-username="' + escapeHtml(u.username) + '" data-displayname="' + escapeHtml(u.displayName || u.username) + '" data-role="' + u.role + '" data-departments="' + escapeHtml((u.departments || []).join(',')) + '" data-email="' + escapeHtml(u.email || '') + '" data-status="' + escapeHtml(u.status || 'active') + '" title="Editar usuario"><i class="fas fa-pen"></i></button>' +
+        '<button class="admin-user-edit-btn btn-icon" data-username="' + escapeHtml(u.username) + '" data-displayname="' + escapeHtml(u.displayName || u.username) + '" data-role="' + u.role + '" data-departments="' + escapeHtml((u.departments || []).join(',')) + '" data-admin-departments="' + escapeHtml(adminDepts.join(',')) + '" data-fully-managed="' + (u.fullyManaged ? '1' : '0') + '" data-email="' + escapeHtml(u.email || '') + '" data-status="' + escapeHtml(u.status || 'active') + '" title="Editar usuario"><i class="fas fa-pen"></i></button>' +
       '</div>';
     }).join('');
 
@@ -1833,12 +1932,21 @@ function renderAdminPanel() {
         adminEditEmail.dataset.original = btn.dataset.email || '';
         adminEditRole.value = btn.dataset.role;
         var selectedDepts = btn.dataset.departments ? btn.dataset.departments.split(',') : [];
-        renderDepartmentCheckboxes(adminEditDepartments, selectedDepts);
+        var selectedAdminDepts = btn.dataset.adminDepartments ? btn.dataset.adminDepartments.split(',') : [];
+        renderDepartmentCheckboxes(adminEditDepartments, selectedDepts, selectedAdminDepts);
         adminEditPassword.value = '';
         adminEditPasswordConfirm.value = '';
         adminEditDeleteBtn.disabled = false;
         adminEditDeleteBtn.innerHTML = '<i class="fas fa-trash"></i> Eliminar usuario';
         setAdminEditBlockButton(btn.dataset.status);
+        // Si también pertenece a departamentos que este admin no administra, lo que afecta a toda la cuenta
+        // (contraseña, correo, bloquear, eliminar) queda para el administrador general.
+        var fullyManaged = btn.dataset.fullyManaged === '1';
+        $('admin-edit-limited-note').classList.toggle('hidden', fullyManaged);
+        $('admin-edit-pwd-section').classList.toggle('hidden', !fullyManaged);
+        adminEditEmail.readOnly = !fullyManaged;
+        adminEditDeleteBtn.classList.toggle('hidden', !fullyManaged);
+        adminEditBlockBtn.classList.toggle('hidden', !fullyManaged);
         $('admin-edit-sessions-btn').disabled = false;
         adminEditError.textContent = '';
         adminEditOverlay.classList.remove('hidden');
@@ -1849,7 +1957,7 @@ function renderAdminPanel() {
 
   adminRoomsList.innerHTML = rooms.map(function(r) {
     var actions = '';
-    if (r.name !== 'general') {
+    if (r.name !== 'general' && canAdminRoom(r)) {
       if (!r.temporary) {
         actions += '<button class="admin-room-lock-btn btn-icon" data-room="' + escapeHtml(r.name) + '" data-haspassword="' + r.hasPassword + '" title="' + (r.hasPassword ? 'Cambiar contraseña' : 'Poner contraseña') + '"><i class="fas ' + (r.hasPassword ? 'fa-lock' : 'fa-unlock') + '"></i></button>';
       }
@@ -1929,6 +2037,7 @@ function joinRoom(data) {
     backToRoomBtn.classList.add('hidden');
     welcomeRoom.textContent = name;
     renderRooms();
+    roomUsersHidden = !!res.hideUsers;
     renderUsers(res.users || []);
 
     renderMessages(res.history, res.hasMoreHistory);
@@ -1953,10 +2062,15 @@ $('create-room-btn').addEventListener('click', function() {
     createModalTemporary.checked = false;
     createModalTemporary.disabled = false;
     createModalInfo.classList.add('hidden');
-    createModalDepartment.innerHTML = '<option value="">Global (todos los departamentos)</option>' +
-      departments.map(function(d) {
+    // Las salas globales solo las crea el administrador general; el de departamento, en los suyos.
+    // En el departamento donde está como usuario (no admin) solo puede crear salas temporales.
+    var userDeptOption = !currentSuperAdmin && currentDepartment && myAdminDepartments.indexOf(currentDepartment) === -1
+      ? '<option value="' + escapeHtml(currentDepartment) + '">' + escapeHtml(currentDepartmentDisplayName || currentDepartment) + ' (solo temporal)</option>'
+      : '';
+    createModalDepartment.innerHTML = (currentSuperAdmin ? '<option value="">Global (todos los departamentos)</option>' : '') +
+      adminDepartments().map(function(d) {
         return '<option value="' + escapeHtml(d.name) + '">' + escapeHtml(d.displayName || d.name) + '</option>';
-      }).join('');
+      }).join('') + userDeptOption;
     createModalDeptGroup.classList.remove('hidden');
   }
   createModalInput.focus();
@@ -2015,7 +2129,10 @@ adminEditConfirm.addEventListener('click', function() {
   var displayName = adminEditDisplayname.value.trim();
   var email = adminEditEmail.value.trim();
   var role = adminEditRole.value;
-  var departments = Array.from(adminEditDepartments.querySelectorAll('input[type="checkbox"]:checked')).map(function(cb) { return cb.value; });
+  var departments = Array.from(adminEditDepartments.querySelectorAll('.dept-member:checked')).map(function(cb) { return cb.value; });
+  var adminDepartments = role === 'admin'
+    ? Array.from(adminEditDepartments.querySelectorAll('.dept-admin:checked')).map(function(cb) { return cb.value; })
+    : [];
   var newPassword = adminEditPassword.value;
   var newPasswordConfirm = adminEditPasswordConfirm.value;
 
@@ -2032,7 +2149,7 @@ adminEditConfirm.addEventListener('click', function() {
   adminEditConfirm.disabled = true;
   adminEditConfirm.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Guardando...';
 
-  socket.emit('update-user', { username, displayName, email, role, departments }, function(res) {
+  socket.emit('update-user', { username, displayName, email, role, departments, adminDepartments }, function(res) {
     if (!res.ok) {
       adminEditConfirm.disabled = false;
       adminEditConfirm.innerHTML = '<i class="fas fa-save"></i> Guardar';
@@ -3025,6 +3142,10 @@ function renderUsers(users) {
   if (!currentUser) return;
   lastRoomUsers = users;
   if (currentGroup) return; // mientras hay un grupo abierto, la lista muestra a sus miembros
+  if (roomUsersHidden) {
+    roomUsersList.innerHTML = '<div class="room-users-hidden-note">En los canales globales no se muestra quién está conectado.</div>';
+    return;
+  }
 
   var currentObj = { username: currentUser, displayName: currentDisplayName || currentUser, avatar: currentAvatar };
   var currentEl = renderUserItem(currentObj, true);
@@ -3050,6 +3171,7 @@ function renderUsers(users) {
 function renderAllUsers(users) {
   if (!users || !Array.isArray(users)) return;
   if (!currentUser) return;
+  allOnlineUsers = users;
 
   var currentObj = { username: currentUser, displayName: currentDisplayName || currentUser, avatar: currentAvatar };
   var currentEl = renderUserItem(currentObj, true);
@@ -3079,6 +3201,14 @@ socket.on('room-message', function(msg) {
 
 socket.on('room-unread-update', function(data) {
   roomUnreadCounts[data.room] = data.count;
+  renderRooms();
+  updateRoomTotalBadge();
+});
+
+// Mensaje nuevo en una sala que puedo ver pero en la que no estoy: suma uno a su contador.
+socket.on('room-unread-increment', function(data) {
+  if (!data || !data.room || data.room === currentRoom) return;
+  roomUnreadCounts[data.room] = (roomUnreadCounts[data.room] || 0) + 1;
   renderRooms();
   updateRoomTotalBadge();
 });
@@ -3136,20 +3266,70 @@ socket.on('get-all-users-response', function(users) {
   if (users) renderAllUsers(users);
 });
 
-socket.on('display-name-updated', function(data) {
-  if (data.username === currentUser) {
-    currentDisplayName = data.displayName;
-    displayName.textContent = data.displayName;
-  }
-  loadConversations();
+// ===== Presencia: el servidor avisa solo los cambios y aquí se aplican a las listas que ya se tienen =====
+// Varias llegadas seguidas (p. ej. a las 8:00, cuando entra todo el mundo) se dibujan juntas.
+var presenceRenderTimer = null;
+function schedulePresenceRender() {
+  if (presenceRenderTimer) return;
+  presenceRenderTimer = setTimeout(function() {
+    presenceRenderTimer = null;
+    renderAllUsers(allOnlineUsers);
+    renderUsers(lastRoomUsers);
+  }, 200);
+}
+
+function withoutUser(list, username) {
+  return list.filter(function(u) { return (typeof u === 'string' ? u : u.username) !== username; });
+}
+
+socket.on('user-online', function(u) {
+  if (!u || !u.username) return;
+  allOnlineUsers = withoutUser(allOnlineUsers, u.username).concat([u]);
+  schedulePresenceRender();
 });
 
-socket.on('avatar-updated', function(data) {
-  if (data.username === currentUser) {
-    currentAvatar = data.avatar;
+socket.on('user-offline', function(data) {
+  if (!data || !data.username) return;
+  allOnlineUsers = withoutUser(allOnlineUsers, data.username);
+  schedulePresenceRender();
+});
+
+socket.on('room-user-joined', function(data) {
+  if (!data || data.room !== currentRoom || !data.user) return;
+  lastRoomUsers = withoutUser(lastRoomUsers, data.user.username).concat([data.user]);
+  schedulePresenceRender();
+});
+
+socket.on('room-user-left', function(data) {
+  if (!data || data.room !== currentRoom) return;
+  lastRoomUsers = withoutUser(lastRoomUsers, data.username);
+  schedulePresenceRender();
+});
+
+// Alguien cambió su nombre o su foto: se actualiza en pantalla sin volver a pedir datos al servidor.
+socket.on('user-updated', function(u) {
+  if (!u || !u.username) return;
+  if (u.username === currentUser) {
+    currentDisplayName = u.displayName;
+    displayName.textContent = u.displayName;
+    currentAvatar = u.avatar || null;
     updateHeaderAvatar();
   }
-  loadConversations();
+  var patch = function(list) {
+    return list.map(function(x) {
+      return x && x.username === u.username ? Object.assign({}, x, { displayName: u.displayName, avatar: u.avatar || null }) : x;
+    });
+  };
+  allOnlineUsers = patch(allOnlineUsers);
+  lastRoomUsers = patch(lastRoomUsers);
+  friends = patch(friends);
+  var convChanged = false;
+  conversations.forEach(function(c) {
+    if (c.with === u.username) { c.displayName = u.displayName; c.avatar = u.avatar || null; convChanged = true; }
+  });
+  if (convChanged) renderConversations();
+  renderFriends();
+  schedulePresenceRender();
 });
 
 socket.on('room-created', function(data) {
@@ -3174,12 +3354,17 @@ socket.on('department-deleted', function(data) {
 socket.on('profile-updated', function(data) {
   if (data.role !== undefined) {
     currentRole = data.role;
+    currentSuperAdmin = !!data.superAdmin;
     if (currentRole === 'admin') adminTab.classList.remove('hidden');
     else adminTab.classList.add('hidden');
   }
   if (data.departments !== undefined) {
     myDepartments = data.departments || [];
   }
+  if (data.adminDepartments !== undefined) {
+    myAdminDepartments = data.adminDepartments || [];
+  }
+  if (currentRole === 'admin') applyAdminScopeUi();
   if (data.department !== undefined) {
     currentDepartment = data.department;
     currentDepartmentDisplayName = data.departmentDisplayName || data.department;

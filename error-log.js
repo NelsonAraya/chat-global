@@ -16,6 +16,12 @@ const MAX_STACK = 8000;
 module.exports = (db) => {
   const originalConsoleError = console.error.bind(console);
   const recent = new Map(); // origen|mensaje -> { id, at }
+  // Se olvidan los errores que no se repiten hace más de REPEAT_WINDOW_MS: sin esto, cada mensaje de error
+  // distinto quedaría en memoria para siempre.
+  setInterval(() => {
+    const now = Date.now();
+    for (const [key, r] of recent) if (now - r.at >= REPEAT_WINDOW_MS) recent.delete(key);
+  }, REPEAT_WINDOW_MS).unref();
   const pending = [];
   const listeners = [];
   let flushing = false;

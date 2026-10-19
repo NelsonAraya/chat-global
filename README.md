@@ -186,22 +186,25 @@ El chat incluye un sistema de alerta (pánico) para pedir asistencia.
 |--------|------|----------------|
 | **Botón rojo** | Haz clic en **Botón Alerta** en la barra lateral izquierda | En cualquier momento |
 | **Triple clic rápido** | 3 clics ≤ 800ms en el área del chat (evitando botones, inputs y modales) | Con el chat abierto |
-| **Comando** | Escribe `Ctrl+Shift+E` (Emergencia) en cualquier parte del chat | Con el chat abierto y activo |
+
+### Quién la puede enviar
+
+Solo quien está conectado **en un departamento**. A quien no tiene departamento (por ejemplo el administrador general) no le aparece el botón, y el servidor rechaza la alerta si igual se intenta enviar.
 
 ### Quién la recibe
 
 La alerta **no le llega a todo el mundo** — queda acotada a quien tiene algo que ver:
 
-- Los usuarios conectados del **mismo departamento/centro** que la persona que la activó.
-- Todos los **administradores** conectados, sin importar su departamento (para que TI tenga visibilidad centralizada).
-- Si quien activa la alerta no tiene departamento asignado, le llega a todos los conectados.
+- Los usuarios conectados en el **mismo departamento/centro** que la persona que la activó.
+- Los **administradores de ese departamento**.
+- El **administrador general**, que recibe las de todos los departamentos (para que TI tenga visibilidad centralizada).
 
 Cada receptor ve un modal + sonido indicando quién solicita asistencia, su departamento y su ubicación.
 
 ### Otros detalles
 
 - **Ubicación:** Haz clic en el ícono 📍 en el header para asignar tu ubicación actual (ej: "Oficina 302, Edificio Central"). Si no la configuraste, se muestra como "Indeterminada".
-- **Cooldown:** 30 segundos entre activaciones (solo para el triple clic) para evitar spam.
+- **Espera entre alertas:** cada persona puede enviar una alerta cada **30 segundos** (el botón y el triple clic comparten la espera) para evitar spam. El botón queda deshabilitado con la cuenta regresiva ("Alerta enviada (25s)"). La espera la exige también el servidor, así que recargar la página no la salta. Es por persona: otra persona puede enviar la suya sin esperar.
 - **Feedback visual:** Al activarse por triple clic aparece un borde rojo que parpadea y se desvanece.
 - El sonido de alerta se puede personalizar reemplazando `public/sounds/alerta.mp3`.
 - **Correo de notificación:** además de la alerta en pantalla, el sistema puede mandar un correo (ver [Correo del Botón de Alerta](#correo-del-botón-de-alerta) más arriba) — es opcional, se activa solo si configuras el SMTP en `.env`.
@@ -210,6 +213,20 @@ Cada receptor ve un modal + sonido indicando quién solicita asistencia, su depa
 ## Panel de Administración
 
 Los usuarios con rol **admin** ven un ícono ⚙ adicional en la barra lateral. Al entrar, el panel ocupa toda el área principal del chat (no un sidebar angosto) y se organiza en sub-pestañas: **Resumen**, **Departamentos**, **Usuarios**, **Salas**, **Alertas** y **Errores**.
+
+### Tipos de administrador
+
+| | Administrador general | Administrador de departamento |
+|---|---|---|
+| Cómo se define | Rol admin **sin departamentos** asignados (la cuenta `admin`) | Rol admin con la casilla **"Admin"** marcada en uno o más de sus departamentos |
+| Usuarios, salas, alertas y estadísticas | De todos los departamentos | Solo de los departamentos donde es admin |
+| Departamentos, solicitudes de registro y Errores | ✓ | – |
+| Crear salas globales | ✓ | – (sí salas de sus departamentos) |
+| Enviar alertas | – (no tiene departamento) | ✓ |
+
+- **Admin por departamento:** una persona puede pertenecer a varios departamentos y ser admin solo en algunos. Por ejemplo, admin en CESAM Sur y usuario normal en CESFAM Videla: en Videla solo ve a sus conectados y puede crear salas temporales, como cualquier usuario. En la lista de usuarios aparece como "Admin de CESAM Sur".
+- Un admin de departamento **no puede dar administración** de departamentos que no administra, ni administrar cuentas que son admin en otros departamentos o al administrador general.
+- **Cuentas compartidas con otros departamentos:** si una cuenta también pertenece a un departamento que el admin no administra, ese admin puede cambiarle el nombre y sus propios departamentos, pero **no** la contraseña ni el correo, ni bloquearla ni eliminarla (eso afectaría su acceso en el otro departamento). Eso queda para el administrador general; el panel oculta esas opciones y lo explica.
 
 ### Resumen
 
@@ -226,7 +243,7 @@ Crear, buscar y eliminar departamentos/centros (ver [Departamentos y Centros](#d
   - Cambiar nombre visible
   - **Cambiar el correo** del doble factor (si se cambia, el usuario debe verificar el nuevo correo con un código en su próximo ingreso)
   - Cambiar rol (Usuario / Administrador)
-  - **Asignar uno o varios departamentos** (checkboxes — un usuario puede pertenecer a más de uno)
+  - **Asignar uno o varios departamentos** (checkboxes — un usuario puede pertenecer a más de uno). Con rol Administrador aparece al lado de cada departamento una casilla **"Admin"** para marcar dónde administra (al menos uno); en los demás es usuario normal (ver [Tipos de administrador](#tipos-de-administrador))
   - **Resetear contraseña** (campo opcional — si se deja vacío no se modifica). También quita el bloqueo temporal por intentos fallidos.
   - **Cerrar sus sesiones:** lo desconecta si está conectado y anula sus sesiones recordadas en todos los equipos (ver [Sesiones](#sesiones)).
   - **Bloquear / desbloquear usuario:** al bloquear, si está conectado se le cierra la sesión al instante y no puede volver a ingresar ("Tu cuenta está bloqueada. Contacta a un administrador.") hasta que se desbloquee. No se borra nada: sus mensajes, amigos y grupos se mantienen.
@@ -240,7 +257,14 @@ Buscador por nombre. Cada sala fija (no temporal, excepto `#general`) tiene dos 
 - 🔒/🔓 — Asignar o quitar contraseña de la sala
 - 🗑 — Eliminar la sala (solo salas no temporales, excepto `#general`)
 
-Las salas temporales se eliminan automáticamente al quedar vacías. Al crear una sala fija, el admin elige a qué departamento pertenece (o "Global" para que la vean todos — ver [Departamentos y Centros](#departamentos-y-centros)).
+Las salas temporales se eliminan automáticamente con sus mensajes y archivos:
+- al quedar vacías;
+- si nadie entra en los **10 minutos** siguientes a crearlas;
+- al reiniciar el servidor (las que quedaron abiertas).
+
+Cada persona puede tener como máximo **3 salas temporales** abiertas a la vez.
+
+Al crear una sala fija, el admin elige a qué departamento pertenece (o "Global" para que la vean todos — ver [Departamentos y Centros](#departamentos-y-centros)).
 
 ### Alertas
 
@@ -284,7 +308,8 @@ Pensado para instituciones con varios centros (ej: distintos CESFAM) que compart
 
 - **Salas por departamento:** cada sala pertenece a un departamento específico (solo la ven sus usuarios + los admins) o es **"Global"** (la ve todo el mundo, sin importar su departamento — se identifica con una etiqueta azul "Global" en la sala y en la barra superior). `#general` es global por defecto.
 - **Alerta acotada por departamento:** ver [Botón de Alerta](#botón-de-alerta).
-- **Directorio de usuarios acotado:** en "Conectados" solo ves a la gente de tu mismo departamento (más los administradores, que son visibles para todos).
+- **Directorio de usuarios acotado:** en "Conectados → En el sistema" solo ves a la gente de tu departamento activo (más el administrador general, que es visible para todos). El admin de departamento ve además a los de los departamentos que administra, y el administrador general ve a todos.
+- **Canales globales sin lista:** en las salas globales (que pueden tener a todos los conectados) no se muestra ni se envía quién está dentro, para no cargar el navegador ni el servidor. En las salas de departamento sí se ve la lista.
 - **Un usuario puede pertenecer a varios departamentos.** El administrador se los asigna desde Admin → Usuarios.
   - Si solo tiene uno, entra directo a ese contexto al iniciar sesión.
   - Si tiene varios, al iniciar sesión se le pide elegir con cuál entrar.
@@ -370,6 +395,8 @@ Conversaciones privadas entre varias personas elegidas — a diferencia de las s
   - **Subida:** la autorización va en la cabecera `X-Upload-Token` y se revisa **antes** de recibir el archivo, así nadie sin sesión puede escribir en el disco del servidor.
   - Al eliminar una sala (temporal o fija), un grupo o un departamento, sus archivos también se borran del disco.
 - **Datos mal formados:** el servidor valida el tipo de cada dato que recibe, y un error dentro de cualquier evento se registra (ver [Errores](#errores)) sin botar el servidor ni desconectar a los demás.
+- **Acceso a salas:** el permiso se revisa en cada mensaje, no solo al entrar. Si a alguien le cambian el departamento (o se cambia él) y ya no puede ver la sala donde está, el servidor lo saca. Al eliminar una sala se saca a todos los que estaban dentro, así nadie recibe los mensajes de otra sala que se cree después con el mismo nombre.
+- **Cabeceras de seguridad:** la página se sirve con `Content-Security-Policy` (solo scripts del propio servidor), `X-Frame-Options: DENY` (no se puede mostrar dentro de otra página), `nosniff` y `Referrer-Policy`.
 - **Reacciones:** solo se aceptan los emojis que ofrece el selector del chat.
 - **Citas (responder un mensaje):** el texto citado lo arma el servidor a partir del mensaje original, y solo si es de la misma conversación. Nadie puede atribuirle a otro un texto que no escribió.
 - **Mensajes:** se guardan primero en la base y solo después se envían a los demás. Si la base falla, nadie lo recibe y quien lo envió ve "No se pudo enviar el mensaje" (el texto vuelve al cuadro para no perderlo).
@@ -432,7 +459,7 @@ Cada aceptación de TyC queda registrada en la base de datos con:
 
 ## Persistencia de datos
 
-- **MySQL**: base de datos (ver "Configuración de MySQL" arriba) con las tablas `users`, `rooms`, `messages`, `departments`, `friends`, `alerts`, `consent_log`, `chat_groups`, `group_members`, `sessions` y `error_log`. Las columnas, tablas e índices nuevos (correo y doble factor en `users`, grupos, registro de errores, índices del historial) se agregan solos al iniciar el servidor, sin perder datos. Cada acción (mensaje, reacción, cambio de nombre, etc.) escribe solo la fila que cambió — no se reescribe la base completa en cada operación.
+- **MySQL**: base de datos (ver "Configuración de MySQL" arriba) con las tablas `users`, `rooms`, `messages`, `conversations`, `departments`, `friends`, `alerts`, `consent_log`, `chat_groups`, `group_members`, `sessions` y `error_log`. Las columnas, tablas e índices nuevos (correo, doble factor y departamentos de administración en `users`, lista de conversaciones privadas, grupos, registro de errores, índices del historial) se agregan solos al iniciar el servidor, sin perder datos. Cada acción (mensaje, reacción, cambio de nombre, etc.) escribe solo la fila que cambió — no se reescribe la base completa en cada operación.
 - Los archivos adjuntos se guardan en `uploads/`
 - El certificado SSL se guarda en `certs/` (se genera automáticamente al iniciar con la IP actual)
 - Si la base de datos está vacía, se crea automáticamente con los datos por defecto (usuario `admin` y sala `general`) al iniciar
