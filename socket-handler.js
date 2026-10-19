@@ -94,15 +94,16 @@ module.exports = (io, db, errorLog) => {
   // enseguida con la misma sesión; si nadie la retoma (se cerró la pestaña o la ventana), se borra. Así no
   // sirve que el navegador restaure la pestaña con su sessionStorage.
   const SESSION_CLOSE_GRACE_MS = 60 * 1000;
-  const isSessionInUse = (tokenHash) => {
-    for (const [, u] of users) {
-      if (u.sessionHash === tokenHash) return true;
-    }
-    for (const [, s] of io.sockets.sockets) {
-      if (s.resumedSessionHash === tokenHash) return true; // reanudando (p. ej. eligiendo departamento)
-    }
-    return false;
+  // Cada conexión que usa una sesión (conectada o reanudándola, p. ej. eligiendo departamento) está en la sala
+  // interna 'session:<hash>'. Saber si una sesión sigue en uso es mirar esa sala, sin recorrer a todos los
+  // conectados. Socket.IO la deja sola al desconectarse.
+  const sessionRoom = (tokenHash) => 'session:' + tokenHash;
+  const setSocketSession = (socket, tokenHash) => {
+    if (socket.chatSessionRoom) socket.leave(socket.chatSessionRoom);
+    socket.chatSessionRoom = tokenHash ? sessionRoom(tokenHash) : null;
+    if (socket.chatSessionRoom) socket.join(socket.chatSessionRoom);
   };
+  const isSessionInUse = (tokenHash) => (io.sockets.adapter.rooms.get(sessionRoom(tokenHash))?.size || 0) > 0;
   const scheduleSessionClose = (tokenHash) => {
     setTimeout(() => {
       if (!isSessionInUse(tokenHash)) {
@@ -276,6 +277,10 @@ module.exports = (io, db, errorLog) => {
   const usersIndex = lazyIndex(() => data.users, list => new Map(list.map(u => [u.username, u])));
   const findUser = (username) => (typeof username === 'string' ? usersIndex().get(username) : undefined);
 
+  // Salas por nombre: se buscan varias veces por cada mensaje, entrada o reacción.
+  const roomsIndex = lazyIndex(() => data.rooms, list => new Map(list.map(r => [r.name, r])));
+  const findRoom = (name) => roomsIndex().get(name);
+
   const friendsIndex = lazyIndex(() => data.friends, list => {
     const byUser = new Map();
     const add = (username, row) => {
@@ -348,11 +353,24 @@ module.exports = (io, db, errorLog) => {
     .filter(r => canViewRoom(r, viewer))
     .map(r => ({ name: r.name, hasPassword: !!r.password, temporary: !!r.temporary, department: r.department || null })) : []);
 
+  // Conectados que ve alguien. Antes se revisaba a los 2000 conectados por cada ingreso; ahora solo a los que
+  // están en las salas internas de sus departamentos (y a los administradores generales), que Socket.IO ya
+  // mantiene al día (ver visibilityRoomsFor). canViewUser se sigue aplicando como control final.
   const getAllUsers = (viewer) => {
     if (!viewer) return [];
     const list = [];
-    for (const [, u] of users) {
-      if (canViewUser(u, viewer)) list.push({ username: u.username, displayName: u.displayName || u.username, avatar: u.avatar || null });
+    const add = (u) => { if (u && canViewUser(u, viewer)) list.push({ username: u.username, displayName: u.displayName || u.username, avatar: u.avatar || null }); };
+    if (isSuperAdmin(viewer)) {
+      for (const [, u] of users) add(u);
+      return list;
+    }
+    const seen = new Set();
+    for (const r of [...deptsOf(viewer).map(departmentRoom), ADMIN_ROOM]) {
+      for (const sid of io.sockets.adapter.rooms.get(r) || []) {
+        if (seen.has(sid)) continue;
+        seen.add(sid);
+        add(users.get(sid));
+      }
     }
     return list;
   };
@@ -416,7 +434,7 @@ module.exports = (io, db, errorLog) => {
   // quiénes (ni cuántos) están en ellas. Así no viaja una lista de ~200 KB a cada persona que entra, ni se
   // avisa a todos cada entrada y salida.
   const isGlobalRoom = (roomName) => {
-    const room = data.rooms.find(r => r.name === roomName);
+    const room = findRoom(roomName);
     return !!room && !room.department;
   };
 
@@ -511,15 +529,12 @@ module.exports = (io, db, errorLog) => {
   };
 
   const cleanupTemporaryRoom = async (roomName) => {
-    const room = data.rooms.find(r => r.name === roomName);
+    const room = findRoom(roomName);
     if (!room || !room.temporary) return false;
     if (!isRoomEmpty(roomName)) return false;
 
     const fileUrls = await getRoomFileUrls(roomName);
-    const idx = data.rooms.findIndex(r => r.name === roomName);
-    if (idx !== -1) {
-      data.rooms.splice(idx, 1);
-    }
+    data.rooms = data.rooms.filter(r => r !== room); // filter (y no splice): el índice de salas se rehace
     await deleteRoom(roomName);
     await deleteMessagesByRoom(roomName);
     fileUrls.forEach(deleteUploadedFile);
@@ -547,7 +562,7 @@ module.exports = (io, db, errorLog) => {
   // leyendo y escribiendo en la sala. Esto lo saca si ya no puede verla.
   const leaveRoomIfNoAccess = (sid, u) => {
     if (!u.currentRoom) return;
-    const room = data.rooms.find(r => r.name === u.currentRoom);
+    const room = findRoom(u.currentRoom);
     if (room && canViewRoom(room, u)) return;
     const left = leaveCurrentRoom(sid, u);
     if (left) cleanupTemporaryRoom(left).catch(err => console.error('cleanupTemporaryRoom error:', err));
@@ -567,6 +582,24 @@ module.exports = (io, db, errorLog) => {
   // Salas temporales: cada usuario puede tener pocas abiertas a la vez, y una que nadie usa no se queda
   // para siempre (antes solo se borraba al salir la última persona, así que una sala creada y nunca usada
   // quedaba en la lista de todo el departamento).
+  // "+N no leídos" para quienes pueden ver una sala y no están en ella (cada navegador lleva su cuenta).
+  // En una sala global activa, avisar cada mensaje eran miles de avisos por mensaje: se juntan y se envía
+  // uno por sala cada UNREAD_FLUSH_MS con el total.
+  const UNREAD_FLUSH_MS = 1500;
+  const pendingUnread = new Map(); // sala -> mensajes nuevos aún no avisados
+  let unreadFlushTimer = null;
+  const flushUnread = () => {
+    unreadFlushTimer = null;
+    for (const [room, count] of pendingUnread) {
+      if (findRoom(room.name) === room) io.to(roomViewerRooms(room)).except(room.name).emit('room-unread-increment', { room: room.name, count });
+    }
+    pendingUnread.clear();
+  };
+  const queueUnreadIncrement = (room) => {
+    pendingUnread.set(room, (pendingUnread.get(room) || 0) + 1);
+    if (!unreadFlushTimer) unreadFlushTimer = setTimeout(flushUnread, UNREAD_FLUSH_MS);
+  };
+
   const PANIC_COOLDOWN_MS = 30 * 1000;
   const lastPanicAt = new Map(); // username -> hora de su última alerta (se borra al pasar la espera)
 
@@ -575,7 +608,7 @@ module.exports = (io, db, errorLog) => {
   const scheduleUnusedTemporaryRoomCleanup = (room) => {
     setTimeout(() => {
       // Solo si sigue siendo la misma sala (pudo borrarse y crearse otra con el mismo nombre) y está vacía.
-      if (!data.rooms.includes(room)) return;
+      if (findRoom(room.name) !== room) return;
       cleanupTemporaryRoom(room.name).catch(err => console.error('cleanupTemporaryRoom error:', err));
     }, TEMP_ROOM_UNUSED_MS).unref();
   };
@@ -618,6 +651,7 @@ module.exports = (io, db, errorLog) => {
     const kicked = io.sockets.sockets.get(sid);
     if (kicked) {
       kicked.leave(AUTH_ROOM);
+      setSocketSession(kicked, null);
       for (const r of visibilityRoomsFor(u)) kicked.leave(r);
       if (u.currentRoom) kicked.leave(u.currentRoom);
     }
@@ -667,8 +701,10 @@ module.exports = (io, db, errorLog) => {
     socket.loginRemember = false;
 
     if (isOnline(userRecord.username)) {
+      setSocketSession(socket, null);
       return callback?.({ ok: false, error: 'Ese usuario ya está conectado' });
     }
+    setSocketSession(socket, sessionHash);
 
     const uploadToken = crypto.randomUUID();
     uploadTokens.set(uploadToken, socket.id);
@@ -711,15 +747,34 @@ module.exports = (io, db, errorLog) => {
   const GROUP_NAME_MAX = 60;
   const GROUP_MAX_MEMBERS = 100;
 
-  const findGroup = (id) => data.groups.find(g => g.id === id);
-  const groupMembership = (groupId, username) => data.groupMembers.find(m => m.group_id === groupId && m.username === username);
+  // Índices de grupos y membresías: cada mensaje de grupo buscaba en la lista completa de membresías de todo el
+  // sistema (miles de filas) para saber quién es miembro; ahora se miran solo las filas de ese grupo.
+  const groupsIndex = lazyIndex(() => data.groups, list => new Map(list.map(g => [g.id, g])));
+  const groupMembersIndex = lazyIndex(() => data.groupMembers, list => {
+    const byGroup = new Map();
+    const byUser = new Map();
+    const add = (map, key, row) => {
+      if (!map.has(key)) map.set(key, []);
+      map.get(key).push(row);
+    };
+    for (const m of list) {
+      add(byGroup, m.group_id, m);
+      add(byUser, m.username, m);
+    }
+    return { byGroup, byUser };
+  });
+  const groupRowsOf = (groupId) => groupMembersIndex().byGroup.get(groupId) || [];
+  const groupRowsOfUser = (username) => groupMembersIndex().byUser.get(username) || [];
+
+  const findGroup = (id) => groupsIndex().get(id);
+  const groupMembership = (groupId, username) => groupRowsOf(groupId).find(m => m.username === username);
   const isGroupMember = (groupId, username) => groupMembership(groupId, username)?.status === 'member';
   const canManageGroup = (groupId, username) => {
     const m = groupMembership(groupId, username);
     return m?.status === 'member' && (m.role === 'owner' || m.role === 'admin');
   };
-  const groupMemberUsernames = (groupId) => data.groupMembers
-    .filter(m => m.group_id === groupId && m.status === 'member')
+  const groupMemberUsernames = (groupId) => groupRowsOf(groupId)
+    .filter(m => m.status === 'member')
     .map(m => m.username);
 
   const emitToUsername = (username, event, payload) => {
@@ -749,7 +804,7 @@ module.exports = (io, db, errorLog) => {
 
   // Parte común de la vista de un grupo (igual para todos sus miembros).
   const groupBaseView = (group) => {
-    const rows = data.groupMembers.filter(m => m.group_id === group.id);
+    const rows = groupRowsOf(group.id);
     return {
       rows,
       view: {
@@ -790,7 +845,7 @@ module.exports = (io, db, errorLog) => {
   };
 
   const destroyGroup = async (group) => {
-    const notify = data.groupMembers.filter(m => m.group_id === group.id).map(m => m.username);
+    const notify = groupRowsOf(group.id).map(m => m.username);
     const fileUrls = await getGroupFileUrls(group.id);
     data.groupMembers = data.groupMembers.filter(m => m.group_id !== group.id);
     data.groups = data.groups.filter(g => g.id !== group.id);
@@ -808,7 +863,7 @@ module.exports = (io, db, errorLog) => {
     data.groupMembers = data.groupMembers.filter(x => x !== m);
     await deleteGroupMember(group.id, username);
     if (m.status === 'member') {
-      const remaining = data.groupMembers.filter(x => x.group_id === group.id && x.status === 'member');
+      const remaining = groupRowsOf(group.id).filter(x => x.status === 'member');
       if (remaining.length === 0) {
         await destroyGroup(group);
         return 'deleted';
@@ -828,7 +883,7 @@ module.exports = (io, db, errorLog) => {
       if (!name || name === inviter || groupMembership(group.id, name)) continue;
       const target = findUser(name);
       if (!target || target.status !== 'active') continue;
-      if (data.groupMembers.filter(m => m.group_id === group.id).length >= GROUP_MAX_MEMBERS) break;
+      if (groupRowsOf(group.id).length >= GROUP_MAX_MEMBERS) break;
       const m = { group_id: group.id, username: name, role: 'member', status: 'invited', invited_by: inviter, created_at: new Date().toISOString() };
       data.groupMembers.push(m);
       try {
@@ -864,7 +919,7 @@ module.exports = (io, db, errorLog) => {
   // Quién puede ver (y reaccionar a) un mensaje.
   const canSeeMessage = (msg, user) => {
     if (msg.room_name) {
-      const room = data.rooms.find(r => r.name === msg.room_name);
+      const room = findRoom(msg.room_name);
       return !!room && canViewRoom(room, user);
     }
     if (msg.group_id) return isGroupMember(msg.group_id, user.username);
@@ -1051,6 +1106,7 @@ module.exports = (io, db, errorLog) => {
       // La primera vez (doble factor aún no activado) este mismo paso lo activa.
       socket.pendingUser = null;
       socket.resumedSessionHash = null;
+      setSocketSession(socket, null);
       const setup = !userRecord.twoFactorEnabled;
       if (!userRecord.email) {
         // Cuentas antiguas sin correo: el usuario debe indicar uno antes de recibir el código.
@@ -1236,6 +1292,7 @@ module.exports = (io, db, errorLog) => {
 
       socket.twoFactor = null;
       socket.resumedSessionHash = tokenHash;
+      setSocketSession(socket, tokenHash);
       socket.resumedSessionRemember = session.remember;
       const assignedDepartments = userRecord.departments || [];
       if (session.department && assignedDepartments.includes(session.department)) {
@@ -1334,7 +1391,7 @@ module.exports = (io, db, errorLog) => {
 
       if (!roomName) return;
 
-      const room = data.rooms.find(r => r.name === roomName);
+      const room = findRoom(roomName);
       if (!room) return callback?.({ ok: false, error: 'La sala no existe' });
 
       if (!canViewRoom(room, user)) {
@@ -1396,7 +1453,7 @@ module.exports = (io, db, errorLog) => {
       if (!user?.currentRoom) return;
       const roomName = user.currentRoom;
       // El permiso se vuelve a revisar en cada mensaje, no solo al entrar.
-      const room = data.rooms.find(r => r.name === roomName);
+      const room = findRoom(roomName);
       if (!room || !canViewRoom(room, user)) {
         leaveRoomIfNoAccess(socket.id, user);
         return callback?.({ ok: false, error: 'Ya no tienes acceso a esta sala' });
@@ -1404,8 +1461,8 @@ module.exports = (io, db, errorLog) => {
 
       const content = sanitizeContent(data_?.content);
       const file = sanitizeFile(data_?.file);
+      if (!content && !file) return; // antes de consultar la base por la cita
       const reply = await buildReply(data_?.reply, m => m.room_name === roomName && !m.recipient);
-      if (!content && !file) return;
 
       const msg = {
         id: nextMessageId(),
@@ -1430,8 +1487,7 @@ module.exports = (io, db, errorLog) => {
       }
       io.to(roomName).emit('room-message', msg);
 
-      // "+1 no leído" solo para quienes pueden ver la sala y no están en ella (cada navegador lleva su cuenta).
-      if (data.rooms.includes(room)) io.to(roomViewerRooms(room)).except(roomName).emit('room-unread-increment', { room: roomName });
+      queueUnreadIncrement(room);
 
       callback?.({ ok: true });
     });
@@ -1443,9 +1499,9 @@ module.exports = (io, db, errorLog) => {
       const recipient = data_?.recipient;
       const content = sanitizeContent(data_?.content);
       const file = sanitizeFile(data_?.file);
+      if (typeof recipient !== 'string' || !findUser(recipient) || (!content && !file)) return; // antes de consultar la base por la cita
       const reply = await buildReply(data_?.reply, m => !!m.recipient &&
         ((m.sender === user.username && m.recipient === recipient) || (m.sender === recipient && m.recipient === user.username)));
-      if (typeof recipient !== 'string' || !findUser(recipient) || (!content && !file)) return;
 
       const msg = {
         id: nextMessageId(),
@@ -1589,7 +1645,7 @@ module.exports = (io, db, errorLog) => {
         return callback?.({ ok: false, error: 'Solo letras, números y guiones' });
       }
 
-      if (data.rooms.find(r => r.name === name)) {
+      if (findRoom(name)) {
         return callback?.({ ok: false, error: 'Esa sala ya existe' });
       }
 
@@ -2005,11 +2061,10 @@ module.exports = (io, db, errorLog) => {
       const roomName = data_?.name;
       if (!roomName) return callback?.({ ok: false, error: 'Nombre requerido' });
 
-      const idx = data.rooms.findIndex(r => r.name === roomName);
-      if (idx === -1) return callback?.({ ok: false, error: 'Sala no existe' });
+      const room = findRoom(roomName);
+      if (!room) return callback?.({ ok: false, error: 'Sala no existe' });
       if (roomName === 'general') return callback?.({ ok: false, error: 'No puedes eliminar la sala general' });
 
-      const room = data.rooms[idx];
       if (!inAdminScope(user, room.department)) return callback?.({ ok: false, error: 'Esa sala no pertenece a tus departamentos' });
       try {
         const fileUrls = await getRoomFileUrls(roomName);
@@ -2035,7 +2090,7 @@ module.exports = (io, db, errorLog) => {
       if (!name) return callback?.({ ok: false, error: 'Nombre requerido' });
       if (name === 'general') return callback?.({ ok: false, error: 'No puedes cambiar la contraseña de la sala general' });
 
-      const room = data.rooms.find(r => r.name === name);
+      const room = findRoom(name);
       if (!room) return callback?.({ ok: false, error: 'Sala no existe' });
       if (!inAdminScope(user, room.department)) return callback?.({ ok: false, error: 'Esa sala no pertenece a tus departamentos' });
 
@@ -2140,7 +2195,7 @@ module.exports = (io, db, errorLog) => {
       data.friends = data.friends.filter(f => f.requester !== delUsername && f.recipient !== delUsername);
       for (const friend of removedFriendUsernames) emitToUsername(friend, 'friend-removed', { username: delUsername });
 
-      for (const m of data.groupMembers.filter(x => x.username === delUsername)) {
+      for (const m of [...groupRowsOfUser(delUsername)]) {
         const group = findGroup(m.group_id);
         if (!group) continue;
         try {
@@ -2226,7 +2281,7 @@ module.exports = (io, db, errorLog) => {
       data.departments.push(newDept);
 
       let roomName = 'general-' + name;
-      if (data.rooms.find(r => r.name === roomName)) {
+      if (findRoom(roomName)) {
         roomName = roomName + '-' + Date.now();
       }
       const defaultRoom = {
@@ -2430,7 +2485,7 @@ module.exports = (io, db, errorLog) => {
     socket.on('get-groups', (callback) => {
       const user = users.get(socket.id);
       if (!user) return callback?.({ groups: [], invitations: [] });
-      const mine = data.groupMembers.filter(m => m.username === user.username);
+      const mine = groupRowsOfUser(user.username);
       const groups = mine.filter(m => m.status === 'member')
         .map(m => findGroup(m.group_id)).filter(Boolean)
         .map(g => groupView(g, user.username));
@@ -2611,8 +2666,8 @@ module.exports = (io, db, errorLog) => {
 
       const content = sanitizeContent(data_?.content);
       const file = sanitizeFile(data_?.file);
+      if (!content && !file) return; // antes de consultar la base por la cita
       const reply = await buildReply(data_?.reply, m => m.group_id === group.id);
-      if (!content && !file) return;
 
       const msg = {
         id: nextMessageId(),
@@ -2672,7 +2727,7 @@ module.exports = (io, db, errorLog) => {
         return callback?.({ messages: page.messages, hasMore: page.hasMore });
       }
       if (room) {
-        const roomRecord = data.rooms.find(r => r.name === room);
+        const roomRecord = findRoom(room);
         if (room !== user.currentRoom || !roomRecord || !canViewRoom(roomRecord, user)) {
           return callback?.({ messages: [], hasMore: false });
         }

@@ -347,9 +347,21 @@ module.exports = (async () => {
   const getRoomMessages = (roomName, beforeId, limit) =>
     pageOfMessages('room_name = ? AND recipient IS NULL', [roomName], beforeId, limit);
 
-  const getPrivateMessages = (userA, userB, beforeId, limit) =>
-    pageOfMessages('recipient IS NOT NULL AND ((sender = ? AND recipient = ?) OR (sender = ? AND recipient = ?))',
-      [userA, userB, userB, userA], beforeId, limit);
+  // Con "(A→B) OR (B→A)" MySQL puede no usar bien el índice (sender, recipient, id) y revisar muchas más filas.
+  // Se piden los dos sentidos por separado (cada uno lee solo su página por el índice) y se juntan.
+  const getPrivateMessages = async (userA, userB, beforeId, limit) => {
+    if (userA === userB) return pageOfMessages('sender = ? AND recipient = ?', [userA, userA], beforeId, limit);
+    const before = Number(beforeId);
+    const useBefore = beforeId !== undefined && beforeId !== null && Number.isFinite(before);
+    const oneWay = `(SELECT * FROM messages WHERE sender = ? AND recipient = ?${useBefore ? ' AND id < ?' : ''} ORDER BY id DESC LIMIT ?)`;
+    const params = (from, to) => [from, to, ...(useBefore ? [before] : []), limit + 1];
+    const [rows] = await pool.query(
+      `SELECT * FROM (${oneWay} UNION ALL ${oneWay}) t ORDER BY id DESC LIMIT ?`,
+      [...params(userA, userB), ...params(userB, userA), limit + 1]
+    );
+    const hasMore = rows.length > limit;
+    return { messages: rows.slice(0, limit).reverse().map(mapMessage), hasMore };
+  };
 
   const getGroupMessages = (groupId, beforeId, limit) =>
     pageOfMessages('group_id = ?', [groupId], beforeId, limit);

@@ -3205,10 +3205,10 @@ socket.on('room-unread-update', function(data) {
   updateRoomTotalBadge();
 });
 
-// Mensaje nuevo en una sala que puedo ver pero en la que no estoy: suma uno a su contador.
+// Mensajes nuevos en una sala que puedo ver pero en la que no estoy: el servidor los junta y avisa el total.
 socket.on('room-unread-increment', function(data) {
   if (!data || !data.room || data.room === currentRoom) return;
-  roomUnreadCounts[data.room] = (roomUnreadCounts[data.room] || 0) + 1;
+  roomUnreadCounts[data.room] = (roomUnreadCounts[data.room] || 0) + (data.count || 1);
   renderRooms();
   updateRoomTotalBadge();
 });

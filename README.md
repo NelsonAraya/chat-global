@@ -403,7 +403,7 @@ Conversaciones privadas entre varias personas elegidas — a diferencia de las s
 
 ## Notificaciones no leídas
 
-- Cada sala muestra un badge 🔴 con la cantidad de mensajes no leídos
+- Cada sala muestra un badge 🔴 con la cantidad de mensajes no leídos. El servidor junta los mensajes nuevos de cada sala y avisa el total cada 1,5 segundos (en una sala global activa, avisar uno por uno serían miles de avisos por mensaje)
 - La pestaña **Salas** suma todos los no leídos en un badge general
 - Al hacer clic en una sala o al volver a la pestaña del navegador, los contadores se reinician
 - Los mensajes privados también muestran badge 🔴 en la pestaña **Privados**
