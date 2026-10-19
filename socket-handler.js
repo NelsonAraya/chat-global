@@ -19,7 +19,7 @@ module.exports = (io, db, errorLog) => {
     saveAlert, getAlertHistory,
     getErrorLog, countPendingErrors, setErrorResolved, deleteOldResolvedErrors
   } = db;
-  const TERMS_VERSION = '1.0';
+  const TERMS_VERSION = '1.1';
   const users = new Map();
   const roomUsers = new Map();
   const uploadTokens = new Map(); // token -> socket.id, solo usuarios autenticados pueden subir archivos
@@ -227,10 +227,13 @@ module.exports = (io, db, errorLog) => {
   // de un proxy en el mismo equipo (Nginx), la conexión llega desde 127.0.0.1 y la IP real viene en
   // X-Forwarded-For: se toma la última, que es la que agregó el proxy (las anteriores las puede inventar
   // cualquiera). Si la conexión no viene del propio equipo, la cabecera se ignora.
+  // Si el proxy está en otro equipo, su IP va en PROXY_IPS (.env, separadas por comas).
+  const TRUSTED_PROXY_IPS = (process.env.PROXY_IPS || '').split(',').map(s => s.trim()).filter(Boolean);
   const clientIp = (socket) => {
     const addr = socket.handshake.address || '';
     const forwarded = socket.handshake.headers?.['x-forwarded-for'];
-    if (forwarded && /^(127\.|::1$|::ffff:127\.)/.test(addr)) {
+    const fromProxy = /^(127\.|::1$|::ffff:127\.)/.test(addr) || TRUSTED_PROXY_IPS.includes(addr.replace(/^::ffff:/, ''));
+    if (forwarded && fromProxy) {
       const last = String(forwarded).split(',').map(s => s.trim()).filter(Boolean).pop();
       if (last) return last.slice(0, 64);
     }
@@ -289,6 +292,11 @@ module.exports = (io, db, errorLog) => {
     codeSends.set(userRecord.username, [...(codeSends.get(userRecord.username) || []), Date.now()]);
     loginCodes.set(userRecord.username, { hash: hashCode(code), email, expiresAt: Date.now() + OTP_TTL_MS, attempts: 0, sentAt: Date.now() });
     const sent = await sendLoginCodeEmail(email, code, userRecord.displayName || userRecord.username, OTP_TTL_MINUTES);
+    if (!sent && process.env.MODO_WEB === 'true') {
+      // En la web el código nunca se deja en la consola: queda registrado el error (sin el código) en el panel.
+      loginCodes.delete(userRecord.username);
+      throw new Error('No se pudo enviar el código de acceso a ' + userRecord.username + ': el correo (SMTP) no está configurado en .env');
+    }
     if (!sent) {
       // Sin SMTP configurado no hay forma de entregar el código: se deja en la consola del servidor
       // para que el administrador pueda dárselo al usuario.

@@ -35,7 +35,8 @@ async function sendPanicAlertEmail(payload) {
 
   const dept = payload.departmentDisplayName || 'Global / sin departamento';
   const loc = payload.location && payload.location.trim() ? payload.location : 'Indeterminada';
-  const when = new Date(payload.timestamp || Date.now()).toLocaleString('es-CL');
+  // Hora de Chile aunque el servidor esté en otra zona horaria (en la nube suele estar en UTC).
+  const when = new Date(payload.timestamp || Date.now()).toLocaleString('es-CL', { timeZone: process.env.ZONA_HORARIA || 'America/Santiago' });
   const who = payload.displayName || payload.username;
 
   await transporter.sendMail({

@@ -15,6 +15,29 @@ const multer = require('multer');
 const forge = require('node-forge');
 const compression = require('compression');
 
+// ===== Modo de funcionamiento =====
+// Red local (por defecto): el chat sirve HTTPS con un certificado propio en HTTPS_PORT y redirige HTTP_PORT a él.
+// Web (MODO_WEB=true): el chat queda detrás de Nginx, que tiene el certificado real; escucha HTTP solo dentro
+// del servidor (WEB_HOST:WEB_PORT), no genera certificado ni ofrece descargarlo. Ver README → "Publicar en internet".
+const WEB_MODE = process.env.MODO_WEB === 'true';
+const DOMAIN = (process.env.DOMINIO || '').trim().toLowerCase();
+const WEB_HOST = process.env.WEB_HOST || '127.0.0.1';
+const WEB_PORT = Number(process.env.WEB_PORT) || 3000;
+
+// ¿La conexión viene del propio sitio? Los navegadores mandan la cabecera Origin; los programas que no son
+// navegador no la mandan y se aceptan (igual deben iniciar sesión). En la web se compara con DOMINIO; si no,
+// con el sitio por el que se entró (Host).
+const isAllowedOrigin = (req) => {
+  const origin = req.headers.origin;
+  if (!origin) return true;
+  try {
+    const expected = (WEB_MODE && DOMAIN) || String(req.headers.host || '').toLowerCase();
+    return new URL(origin).host.toLowerCase() === expected;
+  } catch {
+    return false;
+  }
+};
+
 const app = express();
 app.disable('x-powered-by');
 
@@ -157,7 +180,8 @@ app.use('/uploads', express.static(UPLOADS_DIR, {
 
 app.get('/api/cert', (req, res) => {
   const CERT_PATH = path.join(__dirname, 'certs', 'cert.pem');
-  if (fs.existsSync(CERT_PATH)) {
+  // En la web el certificado es el real de Nginx: nunca se ofrece instalar uno propio.
+  if (!WEB_MODE && fs.existsSync(CERT_PATH)) {
     res.download(CERT_PATH, 'Chat-CORMUDESI-cert.cer');
   } else {
     res.status(404).json({ error: 'Certificado no disponible' });
@@ -192,6 +216,25 @@ const start = async () => {
     if (res.headersSent) return next(err);
     res.status(500).json({ error: 'Error interno del servidor' });
   });
+
+  // Socket.IO: los mensajes del chat nunca pasan de unos KB (el tope por defecto es 1 MB), y solo se aceptan
+  // conexiones abiertas desde el propio sitio: otra página web no puede conectarse en nombre del visitante.
+  const io = new Server({
+    maxHttpBufferSize: 100 * 1024,
+    allowRequest: (req, callback) => callback(null, isAllowedOrigin(req))
+  });
+
+  if (WEB_MODE) {
+    // Detrás de Nginx: HTTP solo dentro del servidor; el certificado y el puerto 443 los maneja Nginx.
+    const webServer = http.createServer(app);
+    io.attach(webServer);
+    socketHandlers = require('./socket-handler')(io, db, errorLog);
+    webServer.listen(WEB_PORT, WEB_HOST, () => {
+      console.log(`[WEB] Chat escuchando en http://${WEB_HOST}:${WEB_PORT}` + (DOMAIN ? ` (publicado por Nginx en https://${DOMAIN})` : ''));
+      if (!DOMAIN) console.warn('[WEB] Falta DOMINIO en .env: se aceptan conexiones del mismo sitio por el que se entra.');
+    });
+    return;
+  }
 
   const CERTS_DIR = path.join(__dirname, 'certs');
   const KEY_PATH = path.join(CERTS_DIR, 'key.pem');
@@ -261,7 +304,6 @@ const start = async () => {
 
   // Servidor HTTPS: sirve la app + Socket.IO
   const httpsServer = https.createServer(httpsOptions, app);
-  const io = new Server();
   io.attach(httpsServer);
 
   socketHandlers = require('./socket-handler')(io, db, errorLog);
@@ -295,4 +337,8 @@ const start = async () => {
   });
 };
 
-start();
+// Si no puede arrancar (p. ej. falta configurar algo en .env), se explica y se termina.
+start().catch((err) => {
+  console.error('[Inicio] No se pudo iniciar el chat: ' + err.message);
+  process.exit(1);
+});

@@ -201,10 +201,27 @@ module.exports = (async () => {
   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
 
   const now = new Date().toISOString();
-  await pool.query(
-    'INSERT IGNORE INTO users (username, password, display_name, role, created_at) VALUES (?, ?, ?, ?, ?)',
-    ['admin', await hashPassword('admin'), 'admin', 'admin', now]
-  );
+  // Cuenta "admin" (administrador general). En una instalación nueva se crea con ADMIN_PASSWORD_INICIAL y,
+  // si se indica, ADMIN_EMAIL_INICIAL (el código de doble factor llega ahí y nadie más puede elegir el correo).
+  // En la web no se acepta la contraseña "admin": sería lo primero que alguien probaría.
+  const webMode = process.env.MODO_WEB === 'true';
+  const [[adminRow]] = await pool.query("SELECT password FROM users WHERE username = 'admin'");
+  if (!adminRow) {
+    const initialPassword = process.env.ADMIN_PASSWORD_INICIAL || '';
+    if (webMode && initialPassword.length < 8) {
+      throw new Error('en modo web, define ADMIN_PASSWORD_INICIAL en .env (8 caracteres o más) para crear la cuenta admin');
+    }
+    const initialEmail = (process.env.ADMIN_EMAIL_INICIAL || '').trim().toLowerCase() || null;
+    await pool.query(
+      'INSERT IGNORE INTO users (username, password, display_name, role, email, created_at) VALUES (?, ?, ?, ?, ?, ?)',
+      ['admin', await hashPassword(initialPassword || 'admin'), 'admin', 'admin', initialEmail, now]
+    );
+  } else if (await verifyPassword('admin', adminRow.password)) {
+    if (webMode) {
+      throw new Error('la cuenta admin todavía tiene la contraseña "admin". Cámbiala (en modo red local, desde el chat) antes de publicarlo en internet');
+    }
+    console.warn('[Seguridad] La cuenta admin todavía tiene la contraseña "admin". Cámbiala antes de publicar el chat en internet.');
+  }
   await pool.query(
     'INSERT IGNORE INTO consent_log (username, terms_version, accepted_at, ip_address) VALUES (?, ?, ?, ?)',
     ['admin', '1.0', now, '127.0.0.1']

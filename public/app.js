@@ -960,7 +960,7 @@ registerConfirm.addEventListener('keydown', (e) => {
   if (e.key === 'Enter') registerBtn.click();
 });
 
-const TERMS_VERSION = '1.0';
+const TERMS_VERSION = '1.1';
 let pendingRegistration = null;
 
 const termsOverlay = $('terms-modal-overlay');
@@ -4055,6 +4055,9 @@ const certModalOk = $('cert-modal-ok');
 
 function showCertBannerIfNeeded() {
   if (location.protocol !== 'https:') return;
+  // Solo en la red local (se entra por IP, con el certificado propio del chat). En la web, con dominio y
+  // certificado real, nunca se pide instalar un certificado.
+  if (!/^(\d{1,3}\.){3}\d{1,3}$/.test(location.hostname) && location.hostname !== 'localhost') return;
   if (localStorage.getItem('cert_dismissed')) return;
   certBanner.classList.remove('hidden');
 }

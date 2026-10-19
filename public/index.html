@@ -32,7 +32,7 @@
       <div class="login-logo">
         <img src="img/logo.png" alt="Cormudesi" class="login-logo-img" />
         <h1>Chat Cormudesi</h1>
-        <p class="login-subtitle">Red interna de comunicación</p>
+        <p class="login-subtitle">Comunicación interna</p>
       </div>
       <div class="login-tabs">
         <button class="login-tab active" data-form="login">Ingresar</button>
@@ -248,8 +248,9 @@
           <p>CORMUDESI implementa las siguientes medidas conforme a la <strong>Ley N° 21.663</strong> (Marco de Ciberseguridad):</p>
           <ul>
             <li>Conexión cifrada mediante HTTPS con certificado SSL/TLS</li>
-            <li>Contraseñas almacenadas con hash SHA-256</li>
-            <li>Almacenamiento local en servidor interno de la red LAN</li>
+            <li>Contraseñas almacenadas con scrypt con sal (nunca en texto legible)</li>
+            <li>Acceso con doble factor: además de la contraseña, un código enviado al correo</li>
+            <li>Almacenamiento en un servidor dedicado del sistema, accesible solo mediante conexión cifrada</li>
             <li>Registro de acceso y trazabilidad de eventos</li>
           </ul>
 

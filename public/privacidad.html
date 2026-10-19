@@ -157,9 +157,10 @@
     <h2>9. Medidas de Seguridad</h2>
     <p>CORMUDESI implementa las siguientes medidas técnicas y organizativas para proteger los datos personales, conforme a la Ley N° 21.663 y al principio de seguridad establecido en la Ley N° 21.719:</p>
     <ul>
-      <li>Conexión cifrada mediante <strong>HTTPS</strong> con certificado SSL/TLS autogenerado</li>
-      <li>Contraseñas almacenadas exclusivamente en <strong>hash SHA-256</strong></li>
-      <li>Almacenamiento local en servidor interno de la <strong>red LAN corporativa</strong></li>
+      <li>Conexión cifrada mediante <strong>HTTPS</strong> con certificado SSL/TLS</li>
+      <li>Contraseñas almacenadas exclusivamente con <strong>scrypt con sal</strong> (nunca en texto legible)</li>
+      <li>Acceso con <strong>doble factor</strong>: además de la contraseña, un código temporal enviado al correo</li>
+      <li>Almacenamiento en un <strong>servidor dedicado</strong> del sistema, accesible solo mediante conexión cifrada</li>
       <li>Registro de acceso y <strong>trazabilidad</strong> de eventos</li>
       <li>Separación de datos: usuarios y salas en tabla independiente del historial de mensajes</li>
       <li>Límite de tamaño de archivos adjuntos (2 MB) para prevenir abusos</li>
@@ -182,7 +183,7 @@
     <h2>13. Actualizaciones de esta Política</h2>
     <p>Esta política puede ser actualizada periódicamente para reflejar cambios en la normativa o en las prácticas de tratamiento de datos. Los usuarios serán notificados de cambios significativos y deberán aceptar la nueva versión para continuar usando el sistema.</p>
 
-    <p class="last-updated">Última actualización: junio 2026 — Versión 1.0</p>
+    <p class="last-updated">Última actualización: octubre 2026 — Versión 1.1</p>
 
     <div class="footer">
       <p><a href="/"><i class="fas fa-comments"></i> Volver al Chat CORMUDESI</a></p>
