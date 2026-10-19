@@ -299,7 +299,7 @@ Desde que se agregó este flujo, **crear una cuenta ya no da acceso inmediato al
    - **Aceptada:** el usuario ya puede entrar al chat. En su primer ingreso activa el doble factor con un código enviado a ese correo. El admin le asigna su(s) departamento(s) desde el mismo panel (editar usuario → checkboxes de departamentos).
    - **Rechazada:** el usuario no puede entrar ("Tu solicitud de cuenta fue rechazada. Contacta a un administrador."). La cuenta queda marcada como rechazada (no se borra sola); el admin puede eliminarla del todo si quiere.
 
-**Límites para evitar solicitudes falsas:** máximo **5 registros por hora desde un mismo equipo** (IP) y como máximo **150 solicitudes pendientes** en total. Pasado cualquiera de los dos, el registro responde "Inténtalo más tarde" hasta que pase la hora o un administrador apruebe/rechace solicitudes.
+**Límites para evitar solicitudes falsas:** máximo **30 registros por hora** en total y como máximo **150 solicitudes pendientes**. Pasado cualquiera de los dos, el registro responde "Inténtalo más tarde" hasta que pase la hora o un administrador apruebe/rechace solicitudes.
 
 Las cuentas que ya existían antes de este cambio no se vieron afectadas — quedaron activas automáticamente.
 
@@ -385,8 +385,8 @@ Conversaciones privadas entre varias personas elegidas — a diferencia de las s
 - **Contraseñas** guardadas con **scrypt con sal** (archivo `passwords.js`). Las contraseñas del formato anterior (SHA-256 sin sal) siguen funcionando y se convierten solas al formato nuevo la próxima vez que esa persona inicia sesión (lo mismo para las salas con contraseña).
 - **Límite de intentos:**
   - 5 contraseñas incorrectas seguidas bloquean esa cuenta por 15 minutos.
-  - 20 intentos fallidos desde un mismo equipo (IP) bloquean ese equipo por 15 minutos.
-  - 10 contraseñas de sala incorrectas desde un mismo equipo lo bloquean 15 minutos.
+  - 10 contraseñas de sala incorrectas bloquean a ese usuario 15 minutos para entrar a salas con contraseña.
+  - Se bloquea la **cuenta**, nunca la IP: detrás de un proxy o de la salida a internet de un centro, todos comparten la misma IP, y bloquearla dejaría a todos sin poder entrar.
   - Cambiar la propia contraseña también queda limitado a 5 intentos fallidos.
   - El login responde siempre "Usuario o contraseña incorrectos", sin revelar qué usuarios existen.
   - Los bloqueos viven en memoria: reiniciar el servidor los borra. El admin puede desbloquear antes a alguien poniéndole una contraseña nueva.
@@ -394,7 +394,11 @@ Conversaciones privadas entre varias personas elegidas — a diferencia de las s
 - **Archivos subidos:** se sirven aislados (`Content-Security-Policy: sandbox`, `nosniff`) para que un `.html` o `.svg` no pueda ejecutar código en el sitio. Solo imágenes, audio, video y PDF se abren en el navegador; el resto se descarga.
   - **Solo con sesión:** al ingresar, el navegador canjea su autorización por una cookie (`HttpOnly`, solo para `/uploads`). Sin sesión, abrir el enlace de un archivo responde "Debes iniciar sesión". La autorización deja de valer al desconectarse, al ser bloqueado o eliminado. El navegador no guarda copia de los archivos (útil en equipos compartidos).
   - **Subida:** la autorización va en la cabecera `X-Upload-Token` y se revisa **antes** de recibir el archivo, así nadie sin sesión puede escribir en el disco del servidor.
+  - **Cada archivo es de quien lo subió:** solo esa persona puede adjuntarlo, y a un solo mensaje (o como foto de perfil, si es una imagen). Así nadie puede adjuntar el archivo de otro en una sala propia y hacer que se borre al cerrarla. El nombre, el tamaño y el tipo que se muestran son los que registró el servidor al recibirlo.
+  - Lo que se sube y no se envía en 1 hora se borra del disco.
   - Al eliminar una sala (temporal o fija), un grupo o un departamento, sus archivos también se borran del disco.
+- **Límite de velocidad por persona:** hasta 8 mensajes seguidos y luego 1 por segundo; las reacciones y el resto de las acciones tienen su propio límite. Pasado el límite, el chat responde "Vas muy rápido" (el texto vuelve al cuadro). Una persona escribiendo normal no lo alcanza; evita que un script inunde el chat. El botón de alerta nunca se frena por este límite.
+- **Detrás de un proxy** (p. ej. Nginx en el mismo servidor): la IP real de cada persona se toma de la cabecera `X-Forwarded-For`, solo si la conexión viene del propio equipo (`127.0.0.1`). Se usa para el registro de consentimiento y de sesiones.
 - **Datos mal formados:** el servidor valida el tipo de cada dato que recibe, y un error dentro de cualquier evento se registra (ver [Errores](#errores)) sin botar el servidor ni desconectar a los demás.
 - **Acceso a salas:** el permiso se revisa en cada mensaje, no solo al entrar. Si a alguien le cambian el departamento (o se cambia él) y ya no puede ver la sala donde está, el servidor lo saca. Al eliminar una sala se saca a todos los que estaban dentro, así nadie recibe los mensajes de otra sala que se cree después con el mismo nombre.
 - **Cabeceras de seguridad:** la página se sirve con `Content-Security-Policy` (solo scripts del propio servidor), `X-Frame-Options: DENY` (no se puede mostrar dentro de otra página), `nosniff` y `Referrer-Policy`.

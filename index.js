@@ -94,12 +94,18 @@ app.post('/api/upload', (req, res, next) => {
   if (!req.file) {
     return res.status(400).json({ error: 'No se recibió archivo' });
   }
-  res.json({
+  const fileInfo = {
     url: '/uploads/' + req.file.filename,
     name: fixUploadName(req.file.originalname),
     size: req.file.size,
     type: req.file.mimetype
-  });
+  };
+  // Queda registrado a nombre de quien lo subió: solo esa persona puede adjuntarlo (ver socket-handler.js).
+  if (!socketHandlers.registerUpload(req.get('X-Upload-Token'), fileInfo)) {
+    fs.promises.unlink(req.file.path).catch(() => {});
+    return res.status(401).json({ error: 'No autorizado' });
+  }
+  res.json(fileInfo);
 });
 
 // Los archivos subidos solo los ven usuarios con sesión abierta en el chat. Como <img>, <audio> y los

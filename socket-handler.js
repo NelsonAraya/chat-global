@@ -42,6 +42,46 @@ module.exports = (io, db, errorLog) => {
     };
   };
 
+  // ===== Archivos subidos: de quién son =====
+  // Antes un mensaje aceptaba cualquier /uploads/...: alguien podía adjuntar el archivo de otra persona en una
+  // sala temporal suya y, al cerrarse la sala, el archivo se borraba para todos. Ahora el servidor recuerda
+  // quién subió cada archivo y solo esa persona puede usarlo, una sola vez (un archivo pertenece a un único
+  // mensaje o foto de perfil). Los datos del archivo (nombre, tamaño, tipo) son los que registró el servidor.
+  // Lo que se sube y no se usa en UPLOAD_CLAIM_MS se borra del disco.
+  const UPLOAD_CLAIM_MS = 60 * 60 * 1000;
+  const FILE_ERROR = 'El archivo no es válido o ya se usó. Vuelve a adjuntarlo.';
+  const pendingUploads = new Map(); // url -> { username, file, at }
+  const registerUpload = (token, fileInfo) => {
+    const sid = uploadTokens.get(token);
+    const u = sid && users.get(sid);
+    const file = sanitizeFile(fileInfo);
+    if (!u || !file) return false;
+    pendingUploads.set(file.url, { username: u.username, file, at: Date.now() });
+    return true;
+  };
+  const takeUpload = (url, username) => {
+    const entry = typeof url === 'string' ? pendingUploads.get(url) : null;
+    if (!entry || entry.username !== username) return null;
+    pendingUploads.delete(url);
+    return entry;
+  };
+  const returnUpload = (entry) => { if (entry) pendingUploads.set(entry.file.url, entry); };
+  // Adjunto de un mensaje: { upload } (null si no trae archivo) o { error }.
+  const claimMessageFile = (fileData, username) => {
+    if (!fileData) return { upload: null };
+    const upload = takeUpload(fileData?.url, username);
+    return upload ? { upload } : { error: FILE_ERROR };
+  };
+  setInterval(() => {
+    const limit = Date.now() - UPLOAD_CLAIM_MS;
+    for (const [url, entry] of pendingUploads) {
+      if (entry.at < limit) {
+        pendingUploads.delete(url);
+        deleteUploadedFile(url);
+      }
+    }
+  }, 10 * 60 * 1000).unref();
+
   // La cita de una respuesta se arma en el servidor a partir del mensaje original (el navegador solo indica
   // cuál responde): así nadie puede atribuirle a otro un texto que no escribió. El original debe ser de la
   // misma conversación; si no, la cita se descarta.
@@ -131,12 +171,13 @@ module.exports = (io, db, errorLog) => {
   setInterval(hourlyCleanup, 60 * 60 * 1000).unref();
 
   // ===== Límite de intentos fallidos (en memoria) =====
-  // Frena la fuerza bruta: tras varios fallos, esa cuenta / esa IP queda bloqueada un rato.
+  // Frena la fuerza bruta: tras varios fallos, esa cuenta queda bloqueada un rato. Se bloquea la cuenta y no
+  // la IP: detrás de un proxy (o de la salida a internet de un centro) todos comparten la misma IP, y unos
+  // pocos errores de cualquiera dejaban a todos sin poder entrar.
   const LOGIN_FAIL_WINDOW_MS = 15 * 60 * 1000;
   const LOGIN_LOCK_MS = 15 * 60 * 1000;
   const LOGIN_MAX_FAILS_PER_USER = 5;
-  const LOGIN_MAX_FAILS_PER_IP = 20;
-  const ROOM_MAX_FAILS_PER_IP = 10;
+  const ROOM_MAX_FAILS_PER_USER = 10;
   const failBuckets = new Map(); // clave -> { count, resetAt, lockedUntil }
 
   const lockMinutesLeft = (key) => {
@@ -170,17 +211,30 @@ module.exports = (io, db, errorLog) => {
   const OTP_SENDS_WINDOW_MS = 15 * 60 * 1000;
   const loginCodes = new Map(); // username -> { hash, email, expiresAt, attempts, sentAt }
 
-  // Registro: máximo de solicitudes por equipo (IP) por hora y tope de cuentas esperando aprobación,
-  // para que nadie llene el panel del administrador con solicitudes falsas.
-  const REGISTER_MAX_PER_IP = 5;
+  // Registro: máximo de solicitudes por hora (en total, no por IP: ver arriba) y tope de cuentas esperando
+  // aprobación, para que nadie llene el panel del administrador con solicitudes falsas.
+  const REGISTER_MAX_PER_HOUR = 30;
   const REGISTER_WINDOW_MS = 60 * 60 * 1000;
   const MAX_PENDING_REGISTRATIONS = 150;
-  const registrationsByIp = new Map(); // ip -> [timestamps de registro]
-  const recentRegistrations = (ip) => {
+  let registrationTimes = [];
+  const recentRegistrationCount = () => {
     const now = Date.now();
-    const recent = (registrationsByIp.get(ip) || []).filter(t => now - t < REGISTER_WINDOW_MS);
-    registrationsByIp.set(ip, recent);
-    return recent;
+    registrationTimes = registrationTimes.filter(t => now - t < REGISTER_WINDOW_MS);
+    return registrationTimes.length;
+  };
+
+  // IP real de quien se conecta (para registrar el consentimiento y las sesiones, no para bloquear). Detrás
+  // de un proxy en el mismo equipo (Nginx), la conexión llega desde 127.0.0.1 y la IP real viene en
+  // X-Forwarded-For: se toma la última, que es la que agregó el proxy (las anteriores las puede inventar
+  // cualquiera). Si la conexión no viene del propio equipo, la cabecera se ignora.
+  const clientIp = (socket) => {
+    const addr = socket.handshake.address || '';
+    const forwarded = socket.handshake.headers?.['x-forwarded-for'];
+    if (forwarded && /^(127\.|::1$|::ffff:127\.)/.test(addr)) {
+      const last = String(forwarded).split(',').map(s => s.trim()).filter(Boolean).pop();
+      if (last) return last.slice(0, 64);
+    }
+    return addr;
   };
   const codeSends = new Map(); // username -> [timestamps de envío]
 
@@ -201,7 +255,6 @@ module.exports = (io, db, errorLog) => {
     for (const [k, b] of failBuckets) if (b.resetAt <= now && b.lockedUntil <= now) failBuckets.delete(k);
     for (const [k, e] of loginCodes) if (e.expiresAt <= now) loginCodes.delete(k);
     for (const [k, list] of codeSends) if (!list.some(t => now - t < OTP_SENDS_WINDOW_MS)) codeSends.delete(k);
-    for (const [k, list] of registrationsByIp) if (!list.some(t => now - t < REGISTER_WINDOW_MS)) registrationsByIp.delete(k);
   }, 10 * 60 * 1000).unref();
   // Solo correos institucionales o Gmail, con formato estricto: letras, números y . _ % + - antes de la @,
   // sin puntos al inicio/fin ni seguidos. Se configura con ALLOWED_EMAIL_DOMAINS en .env.
@@ -685,7 +738,7 @@ module.exports = (io, db, errorLog) => {
           remember: sessionRemember,
           created_at: new Date().toISOString(),
           expiresAt: Date.now() + (sessionRemember ? SESSION_REMEMBER_MS : SESSION_TTL_MS),
-          ip: socket.handshake.address,
+          ip: clientIp(socket),
           userAgent: socket.handshake.headers?.['user-agent']
         });
       } catch (err) {
@@ -956,12 +1009,49 @@ module.exports = (io, db, errorLog) => {
     }
   };
 
+  // ===== Límite de velocidad por persona =====
+  // Sin esto, un script podía mandar cientos de mensajes por segundo (cada uno se guarda y llega a todos los
+  // de la sala). Cada persona (o cada conexión, antes de iniciar sesión) tiene una "cubeta" por tipo de
+  // acción: puede hacer `burst` seguidas y recupera `perSecond` por segundo. Una persona escribiendo normal
+  // nunca llega al límite. La alerta tiene su propia espera y nunca se frena aquí.
+  const RATE_LIMITS = {
+    message: { burst: 8, perSecond: 1 },   // mensajes de sala, privados y de grupo
+    reaction: { burst: 10, perSecond: 2 },
+    other: { burst: 40, perSecond: 4 }     // todo lo demás (al entrar el navegador pide varias cosas a la vez)
+  };
+  const RATE_CATEGORY = { 'room-message': 'message', 'private-message': 'message', 'group-message': 'message', 'add-reaction': 'reaction' };
+  const RATE_EXEMPT = new Set(['disconnect', 'disconnecting', 'panic-alert', 'client-error']);
+  const RATE_ERROR = 'Vas muy rápido. Espera un momento e inténtalo de nuevo.';
+  const rateBuckets = new Map(); // "persona|tipo" -> { tokens, at }
+  const allowEvent = (socket, event) => {
+    if (RATE_EXEMPT.has(event)) return true;
+    const category = RATE_CATEGORY[event] || 'other';
+    const { burst, perSecond } = RATE_LIMITS[category];
+    const key = (users.get(socket.id)?.username || 'sid:' + socket.id) + '|' + category;
+    const now = Date.now();
+    const b = rateBuckets.get(key) || { tokens: burst, at: now };
+    b.tokens = Math.min(burst, b.tokens + ((now - b.at) / 1000) * perSecond);
+    b.at = now;
+    rateBuckets.set(key, b);
+    if (b.tokens < 1) return false;
+    b.tokens -= 1;
+    return true;
+  };
+  setInterval(() => {
+    const idle = Date.now() - 60 * 1000; // en un minuto sin uso cualquier cubeta ya está llena
+    for (const [key, b] of rateBuckets) if (b.at < idle) rateBuckets.delete(key);
+  }, 5 * 60 * 1000).unref();
+
   io.on('connection', (socket) => {
     // Un error en un evento (p. ej. datos mal formados enviados a propósito) no debe botar el servidor:
     // se registra en la consola y, si el navegador espera respuesta, se le responde con un error.
     const on = socket.on.bind(socket);
     socket.on = (event, handler) => on(event, (...args) => {
       const ack = typeof args[args.length - 1] === 'function' ? args[args.length - 1] : null;
+      if (!allowEvent(socket, event)) {
+        try { ack?.({ ok: false, error: RATE_ERROR }); } catch {}
+        return;
+      }
       const fail = (err) => {
         const username = users.get(socket.id)?.username || null;
         if (errorLog) errorLog.report(err, { source: 'evento ' + event, username });
@@ -1004,9 +1094,8 @@ module.exports = (io, db, errorLog) => {
       if (!terms_version) {
         return callback?.({ ok: false, error: 'Debes aceptar los Términos y Condiciones' });
       }
-      const ip = socket.handshake.address;
-      if (recentRegistrations(ip).length >= REGISTER_MAX_PER_IP) {
-        return callback?.({ ok: false, error: 'Se alcanzó el límite de registros desde este equipo. Inténtalo más tarde.' });
+      if (recentRegistrationCount() >= REGISTER_MAX_PER_HOUR) {
+        return callback?.({ ok: false, error: 'Hay muchas solicitudes de registro en este momento. Inténtalo más tarde.' });
       }
       if (data.users.filter(u => u.status === 'pending').length >= MAX_PENDING_REGISTRATIONS) {
         return callback?.({ ok: false, error: 'Hay muchas solicitudes en revisión. Inténtalo más tarde.' });
@@ -1024,16 +1113,19 @@ module.exports = (io, db, errorLog) => {
         twoFactorEnabled: false,
         created_at: new Date().toISOString()
       };
+      // Mientras se calculaba la contraseña pudo registrarse alguien con el mismo nombre o correo.
+      if (findUser(name)) return callback?.({ ok: false, error: 'Ese usuario ya existe' });
+      if (emailInUse(email)) return callback?.({ ok: false, error: 'Ese correo ya está registrado en otra cuenta' });
       data.users.push(newUser);
       try {
         await saveUser(newUser);
-        await saveConsent(name, terms_version, new Date().toISOString(), socket.handshake.address);
+        await saveConsent(name, terms_version, new Date().toISOString(), clientIp(socket));
       } catch (err) {
         console.error('register error:', err);
         data.users = data.users.filter(u => u !== newUser);
         return callback?.({ ok: false, error: 'Error al guardar en la base de datos' });
       }
-      recentRegistrations(ip).push(Date.now());
+      registrationTimes.push(Date.now());
 
       io.to(ADMIN_ROOM).emit('registration-pending', { username: name, displayName: name, email, created_at: newUser.created_at });
 
@@ -1064,8 +1156,7 @@ module.exports = (io, db, errorLog) => {
       }
       const name = username.trim().toLowerCase();
       const userKey = 'login-user:' + name;
-      const ipKey = 'login-ip:' + socket.handshake.address;
-      const lockedFor = Math.max(lockMinutesLeft(userKey), lockMinutesLeft(ipKey));
+      const lockedFor = lockMinutesLeft(userKey);
       if (lockedFor > 0) {
         return callback?.({ ok: false, error: lockedError(lockedFor) });
       }
@@ -1074,8 +1165,7 @@ module.exports = (io, db, errorLog) => {
       const userRecord = findUser(name);
       if (!userRecord || !(await verifyPassword(String(password), userRecord.password))) {
         registerFailure(userKey, LOGIN_MAX_FAILS_PER_USER);
-        registerFailure(ipKey, LOGIN_MAX_FAILS_PER_IP);
-        const nowLocked = Math.max(lockMinutesLeft(userKey), lockMinutesLeft(ipKey));
+        const nowLocked = lockMinutesLeft(userKey);
         return callback?.({ ok: false, error: nowLocked > 0 ? lockedError(nowLocked) : 'Usuario o contraseña incorrectos' });
       }
       clearFailures(userKey);
@@ -1401,11 +1491,11 @@ module.exports = (io, db, errorLog) => {
         if (!password) {
           return callback?.({ ok: false, requirePassword: true });
         }
-        const roomIpKey = 'room-ip:' + socket.handshake.address;
-        const roomLocked = lockMinutesLeft(roomIpKey);
+        const roomUserKey = 'room-user:' + user.username;
+        const roomLocked = lockMinutesLeft(roomUserKey);
         if (roomLocked > 0) return callback?.({ ok: false, error: lockedError(roomLocked) });
         if (!(await verifyPassword(String(password), room.password))) {
-          registerFailure(roomIpKey, ROOM_MAX_FAILS_PER_IP);
+          registerFailure(roomUserKey, ROOM_MAX_FAILS_PER_USER);
           return callback?.({ ok: false, error: 'Contraseña incorrecta' });
         }
         if (isLegacyHash(room.password)) {
@@ -1459,9 +1549,11 @@ module.exports = (io, db, errorLog) => {
       }
 
       const content = sanitizeContent(data_?.content);
-      const file = sanitizeFile(data_?.file);
-      if (!content && !file) return; // antes de consultar la base por la cita
+      if (!content && !data_?.file) return; // antes de consultar la base por la cita
       const reply = await buildReply(data_?.reply, m => m.room_name === roomName && !m.recipient);
+      const claim = claimMessageFile(data_?.file, user.username);
+      if (claim.error) return callback?.({ ok: false, error: claim.error });
+      const file = claim.upload?.file || null;
 
       const msg = {
         id: nextMessageId(),
@@ -1482,6 +1574,7 @@ module.exports = (io, db, errorLog) => {
         await saveMessage(msg);
       } catch (err) {
         console.error('saveMessage error:', err);
+        returnUpload(claim.upload); // puede volver a intentarlo con el mismo archivo
         return callback?.({ ok: false, error: SEND_ERROR });
       }
       io.to(roomName).emit('room-message', msg);
@@ -1497,10 +1590,12 @@ module.exports = (io, db, errorLog) => {
 
       const recipient = data_?.recipient;
       const content = sanitizeContent(data_?.content);
-      const file = sanitizeFile(data_?.file);
-      if (typeof recipient !== 'string' || !findUser(recipient) || (!content && !file)) return; // antes de consultar la base por la cita
+      if (typeof recipient !== 'string' || !findUser(recipient) || (!content && !data_?.file)) return; // antes de consultar la base por la cita
       const reply = await buildReply(data_?.reply, m => !!m.recipient &&
         ((m.sender === user.username && m.recipient === recipient) || (m.sender === recipient && m.recipient === user.username)));
+      const claim = claimMessageFile(data_?.file, user.username);
+      if (claim.error) return callback?.({ ok: false, error: claim.error });
+      const file = claim.upload?.file || null;
 
       const msg = {
         id: nextMessageId(),
@@ -1520,6 +1615,7 @@ module.exports = (io, db, errorLog) => {
         await saveMessage(msg);
       } catch (err) {
         console.error('saveMessage error:', err);
+        returnUpload(claim.upload);
         return callback?.({ ok: false, error: SEND_ERROR });
       }
       emitToUsername(recipient, 'private-message', msg);
@@ -1585,8 +1681,13 @@ module.exports = (io, db, errorLog) => {
       if (!user) return callback?.({ ok: false, error: 'No autenticado' });
 
       const avatar = data_?.avatar || null;
-      if (avatar !== null && (typeof avatar !== 'string' || !UPLOAD_URL_RE.test(avatar) || avatar.includes('..'))) {
-        return callback?.({ ok: false, error: 'Imagen no válida' });
+      // La foto debe ser una imagen que subió esta misma persona (ver "Archivos subidos").
+      if (avatar !== null && avatar !== user.avatar) {
+        const upload = takeUpload(avatar, user.username);
+        if (!upload || !upload.file.type.startsWith('image/')) {
+          returnUpload(upload);
+          return callback?.({ ok: false, error: 'Imagen no válida' });
+        }
       }
       user.avatar = avatar;
       const record = findUser(user.username);
@@ -2681,9 +2782,11 @@ module.exports = (io, db, errorLog) => {
       if (!group || !isGroupMember(group.id, user.username)) return callback?.({ ok: false, error: 'No perteneces a este grupo' });
 
       const content = sanitizeContent(data_?.content);
-      const file = sanitizeFile(data_?.file);
-      if (!content && !file) return; // antes de consultar la base por la cita
+      if (!content && !data_?.file) return; // antes de consultar la base por la cita
       const reply = await buildReply(data_?.reply, m => m.group_id === group.id);
+      const claim = claimMessageFile(data_?.file, user.username);
+      if (claim.error) return callback?.({ ok: false, error: claim.error });
+      const file = claim.upload?.file || null;
 
       const msg = {
         id: nextMessageId(),
@@ -2703,6 +2806,7 @@ module.exports = (io, db, errorLog) => {
         await saveMessage(msg);
       } catch (err) {
         console.error('saveMessage error:', err);
+        returnUpload(claim.upload);
         return callback?.({ ok: false, error: SEND_ERROR });
       }
       rememberGroupMessage(msg);
@@ -2785,6 +2889,7 @@ module.exports = (io, db, errorLog) => {
   });
 
   return {
-    isValidUploadToken: (token) => uploadTokens.has(token)
+    isValidUploadToken: (token) => uploadTokens.has(token),
+    registerUpload
   };
 };
