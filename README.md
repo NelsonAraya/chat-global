@@ -46,6 +46,7 @@ Variables disponibles (si no se define alguna, usa el valor por defecto):
 | `DB_USER` | `root` | Usuario de MySQL |
 | `DB_PASSWORD` | *(vacío)* | Contraseña de MySQL |
 | `DB_NAME` | `chat_cormudesi` | Nombre de la base de datos |
+| `DB_POOL_SIZE` | `30` | Conexiones simultáneas a MySQL (opcional) |
 | `ALLOWED_EMAIL_DOMAINS` | `cormudesi.cl,gmail.com` | Dominios de correo aceptados al registrarse (separados por comas) |
 | `HTTP_PORT` | `3000` | Puerto HTTP (opcional) |
 | `HTTPS_PORT` | `3443` | Puerto HTTPS (opcional) |
@@ -239,7 +240,7 @@ Crear, buscar y eliminar departamentos/centros (ver [Departamentos y Centros](#d
 ### Usuarios
 
 - **Solicitudes de registro pendientes:** aparece arriba de todo si hay cuentas nuevas esperando aprobación, con botones para aceptar ✓ o rechazar ✗ cada una (ver [Aprobación de cuentas nuevas](#aprobación-de-cuentas-nuevas)).
-- **Lista de usuarios:** buscador por nombre; cada usuario muestra su correo y si tiene el doble factor activo o pendiente (y la etiqueta "Bloqueado" si corresponde). Al hacer clic en ✏ junto a un usuario se abre un modal para:
+- **Lista de usuarios:** se carga de a 50 con un botón "Cargar más", y el buscador (por usuario, nombre o correo) busca en el servidor, así el panel no descarga todas las cuentas de una vez. Cada usuario muestra su correo y si tiene el doble factor activo o pendiente (y la etiqueta "Bloqueado" si corresponde). Al hacer clic en ✏ junto a un usuario se abre un modal para:
   - Cambiar nombre visible
   - **Cambiar el correo** del doble factor (si se cambia, el usuario debe verificar el nuevo correo con un código en su próximo ingreso)
   - Cambiar rol (Usuario / Administrador)

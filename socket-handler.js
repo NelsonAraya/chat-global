@@ -6,7 +6,7 @@ const { sendPanicAlertEmail, sendLoginCodeEmail } = require('./mailer');
 module.exports = (io, db, errorLog) => {
   const {
     data, hashPassword, verifyPassword, isLegacyHash,
-    saveUser, deleteUser,
+    saveUser, saveUserFields, deleteUser,
     saveRoom, deleteRoom,
     saveMessage, updateMessageReactions, deleteMessagesByRoom,
     getRoomMessages, getPrivateMessages, getGroupMessages, getMessage, getLastPrivateMessages, getLastGroupMessages,
@@ -75,10 +75,11 @@ module.exports = (io, db, errorLog) => {
   // Solo se aceptan las reacciones que ofrece el selector del chat (misma lista que REACTION_EMOJIS en app.js).
   const REACTION_EMOJIS = new Set(['👍', '👎', '❤️', '😄', '😮', '😢', '😡', '🎉', '🔥', '✅']);
 
-  // Borra del disco un archivo subido (los mensajes guardan su URL /uploads/<nombre>).
+  // Borra del disco un archivo subido (los mensajes guardan su URL /uploads/<nombre>). En segundo plano:
+  // borrarlos de a uno esperando cada uno congelaba el chat de todos al eliminar una sala con muchos archivos.
   const deleteUploadedFile = (url) => {
     if (typeof url !== 'string' || !url.startsWith('/uploads/')) return;
-    try { fs.unlinkSync(path.join(__dirname, 'uploads', path.basename(url))); } catch {}
+    fs.promises.unlink(path.join(__dirname, 'uploads', path.basename(url))).catch(() => {});
   };
 
   // ===== Sesiones =====
@@ -390,18 +391,6 @@ module.exports = (io, db, errorLog) => {
     return depts.length ? depts.map(departmentRoom) : [departmentRoom(null)];
   };
 
-  // Reenvía la lista completa de conectados (solo cuando cambian roles o departamentos, algo poco frecuente).
-  // Primero una lista por departamento; luego, a cada admin de departamento, la suya (puede tener varios).
-  const broadcastAllUsers = () => {
-    for (const d of [...data.departments.map(x => x.name), null]) {
-      io.to(departmentRoom(d)).emit('all-users', { users: getAllUsers({ role: 'user', department: d }) });
-    }
-    io.to(ADMIN_ROOM).emit('all-users', { users: getAllUsers({ role: 'admin', departments: [] }) });
-    for (const [sid, u] of users) {
-      if (isDeptAdmin(u)) io.to(sid).emit('all-users', { users: getAllUsers(u) });
-    }
-  };
-
   // ===== Presencia: se avisa solo el cambio ("entró", "salió", "cambió su nombre") =====
   // Antes cada ingreso o salida reenviaba la lista completa de conectados a todos (con 1000 usuarios,
   // ~6,5 MB por ingreso). Ahora cada navegador recibe la lista una vez al entrar y luego solo los cambios,
@@ -420,6 +409,16 @@ module.exports = (io, db, errorLog) => {
   };
   const announceOnline = (u) => io.to(presenceRooms(u)).emit('user-online', userEntry(u));
   const announceOffline = (u) => io.to(presenceRooms(u)).emit('user-offline', { username: u.username });
+  // Cambiaron los departamentos (o el rol) de alguien conectado: "salió" solo para quienes dejan de verlo y
+  // "entró" solo para quienes empiezan a verlo. Antes se reenviaba la lista completa a todos los departamentos.
+  // `prevRooms` = presenceRooms(u) antes del cambio.
+  const movePresence = (u, prevRooms) => {
+    const nextRooms = presenceRooms(u);
+    const gone = prevRooms.filter(r => !nextRooms.includes(r));
+    const added = nextRooms.filter(r => !prevRooms.includes(r));
+    if (gone.length) io.to(gone).except(nextRooms).emit('user-offline', { username: u.username });
+    if (added.length) io.to(added).except(prevRooms.filter(r => nextRooms.includes(r))).emit('user-online', userEntry(u));
+  };
   const announceUserUpdate = (u) => {
     const rooms = presenceRooms(u);
     if (u.currentRoom && !isGlobalRoom(u.currentRoom)) rooms.push(u.currentRoom); // quienes lo ven en la sala aunque sean de otro departamento
@@ -1084,7 +1083,7 @@ module.exports = (io, db, errorLog) => {
         // Actualiza la contraseña al formato seguro ahora que la conocemos.
         try {
           userRecord.password = await hashPassword(String(password));
-          await saveUser(userRecord);
+          await saveUserFields(userRecord, ['password']);
         } catch (err) {
           console.error('password upgrade error:', err);
         }
@@ -1226,7 +1225,7 @@ module.exports = (io, db, errorLog) => {
         userRecord.email = pending.email;
         userRecord.twoFactorEnabled = true;
         try {
-          await saveUser(userRecord);
+          await saveUserFields(userRecord, ['email', 'twoFactorEnabled']);
         } catch (err) {
           console.error('saveUser error:', err);
           userRecord.email = prevEmail;
@@ -1354,12 +1353,12 @@ module.exports = (io, db, errorLog) => {
       // Sale de la vista del departamento anterior y aparece en la del nuevo; recibe la lista del nuevo.
       // (Los departamentos donde es admin los sigue viendo siempre.)
       const prevRooms = visibilityRoomsFor(user);
-      announceOffline(user);
+      const prevPresence = presenceRooms(user);
       user.department = department;
       const newRooms = visibilityRoomsFor(user);
       for (const r of prevRooms) if (!newRooms.includes(r)) socket.leave(r);
       socket.join(newRooms);
-      announceOnline(user);
+      movePresence(user, prevPresence);
       io.to(socket.id).emit('all-users', { users: getAllUsers(user) });
       leaveRoomIfNoAccess(socket.id, user);
       socket.department = department;
@@ -1574,7 +1573,7 @@ module.exports = (io, db, errorLog) => {
       const record = findUser(user.username);
       if (record) {
         record.displayName = displayName;
-        saveUser(record).catch(err => console.error('saveUser error:', err));
+        saveUserFields(record, ['displayName']).catch(err => console.error('saveUser error:', err));
       }
       socket.displayName = displayName;
       announceUserUpdate(user);
@@ -1593,7 +1592,7 @@ module.exports = (io, db, errorLog) => {
       const record = findUser(user.username);
       if (record) {
         record.avatar = avatar;
-        saveUser(record).catch(err => console.error('saveUser error:', err));
+        saveUserFields(record, ['avatar']).catch(err => console.error('saveUser error:', err));
       }
       socket.avatar = avatar;
       announceUserUpdate(user);
@@ -1623,7 +1622,7 @@ module.exports = (io, db, errorLog) => {
       const previousPassword = record.password;
       record.password = await hashPassword(String(newPassword));
       try {
-        await saveUser(record);
+        await saveUserFields(record, ['password']);
       } catch (err) {
         console.error('saveUser error:', err);
         record.password = previousPassword;
@@ -1851,22 +1850,37 @@ module.exports = (io, db, errorLog) => {
       callback?.({});
     });
 
-    socket.on('get-all-registered-users', (callback) => {
+    // Lista de cuentas del panel, de a ADMIN_USERS_PAGE_SIZE y con búsqueda en el servidor: antes se enviaban
+    // las 2000 cuentas con sus correos cada vez que se abría el panel. Las pendientes van en su propia lista.
+    const ADMIN_USERS_PAGE_SIZE = 50;
+    socket.on('get-all-registered-users', (data_, callback) => {
+      if (typeof data_ === 'function') { callback = data_; data_ = {}; }
+      if (typeof callback !== 'function') return;
       const user = users.get(socket.id);
-      if (!user || user.role !== 'admin') return callback?.([]);
+      if (!user || user.role !== 'admin') return callback({ users: [], total: 0, hasMore: false });
+      const query = str(data_?.query).trim().toLowerCase().slice(0, 100);
+      const offset = Math.max(0, Math.floor(Number(data_?.offset) || 0));
+      const matches = (u) => !query || u.username.includes(query) ||
+        (u.displayName || '').toLowerCase().includes(query) || (u.email || '').includes(query);
       // El admin de departamento ve solo las cuentas que puede administrar.
-      callback?.(data.users.filter(u => isSuperAdmin(user) || canManageUser(user, u)).map(u => ({
-        username: u.username,
-        displayName: u.displayName || u.username,
-        role: u.role || 'user',
-        departments: u.departments || [],
-        adminDepartments: adminDeptsOf(u),
-        fullyManaged: canManageUserFully(user, u), // puede cambiar contraseña/correo, bloquear o eliminar
-        status: u.status || 'active',
-        email: u.email || null,
-        twoFactorEnabled: !!u.twoFactorEnabled,
-        created_at: u.created_at
-      })));
+      const found = data.users.filter(u => u.status !== 'pending' && matches(u) && (isSuperAdmin(user) || canManageUser(user, u)));
+      found.sort((a, b) => (a.username < b.username ? -1 : a.username > b.username ? 1 : 0));
+      callback({
+        users: found.slice(offset, offset + ADMIN_USERS_PAGE_SIZE).map(u => ({
+          username: u.username,
+          displayName: u.displayName || u.username,
+          role: u.role || 'user',
+          departments: u.departments || [],
+          adminDepartments: adminDeptsOf(u),
+          fullyManaged: canManageUserFully(user, u), // puede cambiar contraseña/correo, bloquear o eliminar
+          status: u.status || 'active',
+          email: u.email || null,
+          twoFactorEnabled: !!u.twoFactorEnabled,
+          created_at: u.created_at
+        })),
+        total: found.length,
+        hasMore: offset + ADMIN_USERS_PAGE_SIZE < found.length
+      });
     });
 
     // Las solicitudes de registro llegan sin departamento: solo las revisa el administrador general.
@@ -1891,7 +1905,7 @@ module.exports = (io, db, errorLog) => {
 
       target.status = 'active';
       try {
-        await saveUser(target);
+        await saveUserFields(target, ['status']);
       } catch (err) {
         console.error('admin-approve-registration error:', err);
         target.status = 'pending';
@@ -1910,7 +1924,7 @@ module.exports = (io, db, errorLog) => {
 
       target.status = 'rejected';
       try {
-        await saveUser(target);
+        await saveUserFields(target, ['status']);
       } catch (err) {
         console.error('admin-reject-registration error:', err);
         target.status = 'pending';
@@ -2007,7 +2021,7 @@ module.exports = (io, db, errorLog) => {
         loginCodes.delete(target.username);
       }
       try {
-        await saveUser(target);
+        await saveUserFields(target, ['displayName', 'role', 'departments', 'adminDepartments', 'email', 'twoFactorEnabled']);
       } catch (err) {
         console.error('saveUser error:', err);
         return callback?.({ ok: false, error: 'Error al guardar en la base de datos' });
@@ -2018,6 +2032,7 @@ module.exports = (io, db, errorLog) => {
         const u = sid && users.get(sid);
         if (u) {
           const prevRooms = visibilityRoomsFor(u);
+          const prevPresence = presenceRooms(u);
           u.role = target.role;
           u.departments = target.departments;
           u.adminDepartments = target.adminDepartments;
@@ -2030,6 +2045,9 @@ module.exports = (io, db, errorLog) => {
             for (const r of prevRooms) if (!newRooms.includes(r)) targetSocket.leave(r);
             targetSocket.join(newRooms);
           }
+          // Quién lo ve cambió: solo se avisa a quienes empiezan o dejan de verlo, y él recibe su lista nueva.
+          movePresence(u, prevPresence);
+          io.to(sid).emit('all-users', { users: getAllUsers(u) });
           leaveRoomIfNoAccess(sid, u);
           const deptRecord = u.department ? data.departments.find(d => d.name === u.department) : null;
           io.to(sid).emit('profile-updated', {
@@ -2044,8 +2062,6 @@ module.exports = (io, db, errorLog) => {
         }
       }
 
-      // Un cambio de rol o departamento cambia quién ve a quién: se reenvían las listas (acción poco frecuente).
-      if (role !== undefined || departments !== undefined || adminDepartments !== undefined) broadcastAllUsers();
       const onlineTarget = onlineSid(username) && users.get(onlineSid(username));
       if (onlineTarget) onlineTarget.displayName = target.displayName || username;
       io.to(presenceRooms(onlineTarget || { role: target.role, department: (target.departments || [])[0] || null, departments: target.departments || [], adminDepartments: target.adminDepartments || [] }))
@@ -2156,7 +2172,7 @@ module.exports = (io, db, errorLog) => {
       target.password = await hashPassword(String(newPassword));
       clearFailures('login-user:' + target.username); // el admin le da una contraseña nueva: se quita el bloqueo por intentos
       try {
-        await saveUser(target);
+        await saveUserFields(target, ['password']);
       } catch (err) {
         console.error('saveUser error:', err);
         return callback?.({ ok: false, error: 'Error al guardar en la base de datos' });
@@ -2228,7 +2244,7 @@ module.exports = (io, db, errorLog) => {
       const prevStatus = target.status;
       target.status = blocked ? 'blocked' : 'active';
       try {
-        await saveUser(target);
+        await saveUserFields(target, ['status']);
       } catch (err) {
         console.error('admin-block-user error:', err);
         target.status = prevStatus;
@@ -2475,7 +2491,7 @@ module.exports = (io, db, errorLog) => {
       const record = findUser(user.username);
       if (record) {
         record.location = location || null;
-        saveUser(record).catch(err => console.error('saveUser error:', err));
+        saveUserFields(record, ['location']).catch(err => console.error('saveUser error:', err));
       }
       callback?.({ ok: true, location });
     });

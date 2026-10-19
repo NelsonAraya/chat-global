@@ -542,7 +542,6 @@ function startRecording() {
           if (privateRecipient) {
             payload.recipient = privateRecipient;
             socket.emit('private-message', payload, onSent);
-            setTimeout(loadConversations, 100);
           } else if (currentGroup) {
             payload.groupId = currentGroup;
             socket.emit('group-message', payload, onSent);
@@ -1504,7 +1503,6 @@ function filterAdminList(listEl, query) {
 }
 
 $('admin-dept-search').addEventListener('input', function() { filterAdminList(adminDepartmentsList, this.value); });
-$('admin-users-search').addEventListener('input', function() { filterAdminList(adminUsersList, this.value); });
 $('admin-rooms-search').addEventListener('input', function() { filterAdminList(adminRoomsList, this.value); });
 
 function renderRooms() {
@@ -1520,17 +1518,19 @@ function renderRooms() {
       '<i class="' + icon + extra + '"></i>' +
       '<span class="room-name">' + escapeHtml(r.name) + '</span>' + globalHtml + badgeHtml + '</div>';
   }).join('');
-
-  roomsList.querySelectorAll('.room-item').forEach(function(el) {
-    el.addEventListener('click', function() {
-      var room = el.dataset.room;
-      if (room !== currentRoom || privateRecipient || currentGroup) {
-        cancelPrivate();
-        joinRoom({ name: room });
-      }
-    });
-  });
 }
+
+// Las listas se redibujan seguido (no leídos, entradas y salidas): un solo manejador por lista en vez de uno
+// por elemento en cada redibujo.
+roomsList.addEventListener('click', function(e) {
+  var el = e.target.closest('.room-item');
+  if (!el) return;
+  var room = el.dataset.room;
+  if (room !== currentRoom || privateRecipient || currentGroup) {
+    cancelPrivate();
+    joinRoom({ name: room });
+  }
+});
 
 function departmentLabel(name) {
   if (!name) return 'Global';
@@ -1862,6 +1862,91 @@ window.addEventListener('unhandledrejection', function(ev) {
   reportClientError(r && r.message ? r.message : String(r), r && r.stack, location.pathname);
 });
 
+// ===== Panel Admin → Usuarios: el servidor envía las cuentas de a 50 y hace la búsqueda =====
+var adminUsersOffset = 0;
+var adminUsersLoading = false;
+var adminUsersSearchTimer = null;
+
+function adminUserRowHtml(u) {
+  var isAdmin = u.role === 'admin';
+  var adminDepts = u.adminDepartments || [];
+  // Admin solo en algunos de sus departamentos: se indica en cuáles.
+  var roleLabel = !isAdmin ? 'User' : (adminDepts.length && adminDepts.length < (u.departments || []).length ? 'Admin de ' + userDepartmentsLabel(adminDepts) : 'Admin');
+  var statusHtml = u.status === 'rejected' ? ' <span class="admin-user-role admin-status-rejected">Rechazado</span>'
+    : u.status === 'blocked' ? ' <span class="admin-user-role admin-status-rejected">Bloqueado</span>' : '';
+  var emailHtml = '<div class="admin-user-username"><i class="fas fa-envelope"></i> ' + escapeHtml(u.email || 'Sin correo') +
+    (u.twoFactorEnabled ? ' <span class="admin-user-role">2FA activo</span>' : ' <span class="admin-user-role">2FA pendiente</span>') + '</div>';
+  return '<div class="admin-user-item">' +
+    '<div class="admin-user-info">' +
+      '<div class="admin-user-name">' + escapeHtml(u.displayName || u.username) + '</div>' +
+      '<div class="admin-user-username">@' + escapeHtml(u.username) + '  <span class="admin-user-role' + (isAdmin ? ' admin-role-badge' : '') + '">' + escapeHtml(roleLabel) + '</span> <span class="admin-user-role">' + escapeHtml(userDepartmentsLabel(u.departments)) + '</span>' + statusHtml + '</div>' +
+      emailHtml +
+    '</div>' +
+    '<button class="admin-user-edit-btn btn-icon" data-username="' + escapeHtml(u.username) + '" data-displayname="' + escapeHtml(u.displayName || u.username) + '" data-role="' + escapeHtml(u.role) + '" data-departments="' + escapeHtml((u.departments || []).join(',')) + '" data-admin-departments="' + escapeHtml(adminDepts.join(',')) + '" data-fully-managed="' + (u.fullyManaged ? '1' : '0') + '" data-email="' + escapeHtml(u.email || '') + '" data-status="' + escapeHtml(u.status || 'active') + '" title="Editar usuario"><i class="fas fa-pen"></i></button>' +
+  '</div>';
+}
+
+// reset = primera página (al abrir el panel o al cambiar la búsqueda); si no, agrega la siguiente.
+function loadAdminUsers(reset) {
+  if (adminUsersLoading && !reset) return;
+  if (reset) adminUsersOffset = 0;
+  adminUsersLoading = true;
+  var query = $('admin-users-search').value.trim();
+  var requestOffset = adminUsersOffset;
+  socket.emit('get-all-registered-users', { query: query, offset: requestOffset }, function(res) {
+    adminUsersLoading = false;
+    // Llegó tarde una respuesta de una búsqueda anterior: se ignora.
+    if (query !== $('admin-users-search').value.trim() || requestOffset !== adminUsersOffset) return;
+    var list = (res && res.users) || [];
+    var more = adminUsersList.querySelector('.admin-users-more');
+    if (more) more.remove();
+    var html = list.map(adminUserRowHtml).join('');
+    if (reset) adminUsersList.innerHTML = html || '<div class="admin-table-empty">' + (query ? 'Sin resultados' : 'Sin usuarios') + '</div>';
+    else adminUsersList.insertAdjacentHTML('beforeend', html);
+    adminUsersOffset = requestOffset + list.length;
+    if (res && res.hasMore) {
+      adminUsersList.insertAdjacentHTML('beforeend', '<button class="btn-secondary admin-users-more">Cargar más (' + (res.total - adminUsersOffset) + ' restantes)</button>');
+    }
+  });
+}
+
+$('admin-users-search').addEventListener('input', function() {
+  clearTimeout(adminUsersSearchTimer);
+  adminUsersSearchTimer = setTimeout(function() { loadAdminUsers(true); }, 300);
+});
+
+// Un solo manejador para toda la lista (las filas se agregan por páginas).
+adminUsersList.addEventListener('click', function(e) {
+  if (e.target.closest('.admin-users-more')) { loadAdminUsers(false); return; }
+  var btn = e.target.closest('.admin-user-edit-btn');
+  if (!btn) return;
+  adminEditUsernameDisplay.textContent = btn.dataset.username;
+  adminEditDisplayname.value = btn.dataset.displayname;
+  adminEditEmail.value = btn.dataset.email || '';
+  adminEditEmail.dataset.original = btn.dataset.email || '';
+  adminEditRole.value = btn.dataset.role;
+  var selectedDepts = btn.dataset.departments ? btn.dataset.departments.split(',') : [];
+  var selectedAdminDepts = btn.dataset.adminDepartments ? btn.dataset.adminDepartments.split(',') : [];
+  renderDepartmentCheckboxes(adminEditDepartments, selectedDepts, selectedAdminDepts);
+  adminEditPassword.value = '';
+  adminEditPasswordConfirm.value = '';
+  adminEditDeleteBtn.disabled = false;
+  adminEditDeleteBtn.innerHTML = '<i class="fas fa-trash"></i> Eliminar usuario';
+  setAdminEditBlockButton(btn.dataset.status);
+  // Si también pertenece a departamentos que este admin no administra, lo que afecta a toda la cuenta
+  // (contraseña, correo, bloquear, eliminar) queda para el administrador general.
+  var fullyManaged = btn.dataset.fullyManaged === '1';
+  $('admin-edit-limited-note').classList.toggle('hidden', fullyManaged);
+  $('admin-edit-pwd-section').classList.toggle('hidden', !fullyManaged);
+  adminEditEmail.readOnly = !fullyManaged;
+  adminEditDeleteBtn.classList.toggle('hidden', !fullyManaged);
+  adminEditBlockBtn.classList.toggle('hidden', !fullyManaged);
+  $('admin-edit-sessions-btn').disabled = false;
+  adminEditError.textContent = '';
+  adminEditOverlay.classList.remove('hidden');
+  adminEditDisplayname.focus();
+});
+
 function renderAdminPanel() {
   applyAdminScopeUi();
   if (currentSuperAdmin) {
@@ -1904,56 +1989,7 @@ function renderAdminPanel() {
     });
   });
 
-  socket.emit('get-all-registered-users', function(users) {
-    adminUsersList.innerHTML = users.filter(function(u) { return u.status !== 'pending'; }).map(function(u) {
-      var isAdmin = u.role === 'admin';
-      var adminDepts = u.adminDepartments || [];
-      // Admin solo en algunos de sus departamentos: se indica en cuáles.
-      var roleLabel = !isAdmin ? 'User' : (adminDepts.length && adminDepts.length < (u.departments || []).length ? 'Admin de ' + userDepartmentsLabel(adminDepts) : 'Admin');
-      var statusHtml = u.status === 'rejected' ? ' <span class="admin-user-role admin-status-rejected">Rechazado</span>'
-        : u.status === 'blocked' ? ' <span class="admin-user-role admin-status-rejected">Bloqueado</span>' : '';
-      var emailHtml = '<div class="admin-user-username"><i class="fas fa-envelope"></i> ' + escapeHtml(u.email || 'Sin correo') +
-        (u.twoFactorEnabled ? ' <span class="admin-user-role">2FA activo</span>' : ' <span class="admin-user-role">2FA pendiente</span>') + '</div>';
-      return '<div class="admin-user-item">' +
-        '<div class="admin-user-info">' +
-          '<div class="admin-user-name">' + escapeHtml(u.displayName || u.username) + '</div>' +
-          '<div class="admin-user-username">@' + escapeHtml(u.username) + '  <span class="admin-user-role' + (isAdmin ? ' admin-role-badge' : '') + '">' + escapeHtml(roleLabel) + '</span> <span class="admin-user-role">' + escapeHtml(userDepartmentsLabel(u.departments)) + '</span>' + statusHtml + '</div>' +
-          emailHtml +
-        '</div>' +
-        '<button class="admin-user-edit-btn btn-icon" data-username="' + escapeHtml(u.username) + '" data-displayname="' + escapeHtml(u.displayName || u.username) + '" data-role="' + u.role + '" data-departments="' + escapeHtml((u.departments || []).join(',')) + '" data-admin-departments="' + escapeHtml(adminDepts.join(',')) + '" data-fully-managed="' + (u.fullyManaged ? '1' : '0') + '" data-email="' + escapeHtml(u.email || '') + '" data-status="' + escapeHtml(u.status || 'active') + '" title="Editar usuario"><i class="fas fa-pen"></i></button>' +
-      '</div>';
-    }).join('');
-
-    adminUsersList.querySelectorAll('.admin-user-edit-btn').forEach(function(btn) {
-      btn.addEventListener('click', function() {
-        adminEditUsernameDisplay.textContent = btn.dataset.username;
-        adminEditDisplayname.value = btn.dataset.displayname;
-        adminEditEmail.value = btn.dataset.email || '';
-        adminEditEmail.dataset.original = btn.dataset.email || '';
-        adminEditRole.value = btn.dataset.role;
-        var selectedDepts = btn.dataset.departments ? btn.dataset.departments.split(',') : [];
-        var selectedAdminDepts = btn.dataset.adminDepartments ? btn.dataset.adminDepartments.split(',') : [];
-        renderDepartmentCheckboxes(adminEditDepartments, selectedDepts, selectedAdminDepts);
-        adminEditPassword.value = '';
-        adminEditPasswordConfirm.value = '';
-        adminEditDeleteBtn.disabled = false;
-        adminEditDeleteBtn.innerHTML = '<i class="fas fa-trash"></i> Eliminar usuario';
-        setAdminEditBlockButton(btn.dataset.status);
-        // Si también pertenece a departamentos que este admin no administra, lo que afecta a toda la cuenta
-        // (contraseña, correo, bloquear, eliminar) queda para el administrador general.
-        var fullyManaged = btn.dataset.fullyManaged === '1';
-        $('admin-edit-limited-note').classList.toggle('hidden', fullyManaged);
-        $('admin-edit-pwd-section').classList.toggle('hidden', !fullyManaged);
-        adminEditEmail.readOnly = !fullyManaged;
-        adminEditDeleteBtn.classList.toggle('hidden', !fullyManaged);
-        adminEditBlockBtn.classList.toggle('hidden', !fullyManaged);
-        $('admin-edit-sessions-btn').disabled = false;
-        adminEditError.textContent = '';
-        adminEditOverlay.classList.remove('hidden');
-        adminEditDisplayname.focus();
-      });
-    });
-  });
+  loadAdminUsers(true);
 
   adminRoomsList.innerHTML = rooms.map(function(r) {
     var actions = '';
@@ -2396,21 +2432,40 @@ function renderConversations() {
       '<div class="conv-meta">' + timeHtml + '</div>' +
     '</div>';
   }).join('');
+}
 
-  conversationsList.querySelectorAll('.conv-item').forEach(function(el) {
-    el.addEventListener('click', function() {
-      var user = el.dataset.user;
-      cancelPrivate();
-      openPrivateChat(user);
-      if (sidebarTab !== 'conversations') {
-        document.querySelectorAll('.sidebar-tab').forEach(function(t) { t.classList.remove('active'); });
-        document.querySelector('[data-panel="conversations"]').classList.add('active');
-        sidebarTab = 'conversations';
-        document.querySelectorAll('.sidebar-panel').forEach(function(p) { p.classList.add('hidden'); });
-        $('conversations-panel').classList.remove('hidden');
-      }
-    });
-  });
+conversationsList.addEventListener('click', function(e) {
+  var el = e.target.closest('.conv-item');
+  if (!el) return;
+  cancelPrivate();
+  openPrivateChat(el.dataset.user);
+  if (sidebarTab !== 'conversations') {
+    document.querySelectorAll('.sidebar-tab').forEach(function(t) { t.classList.remove('active'); });
+    document.querySelector('[data-panel="conversations"]').classList.add('active');
+    sidebarTab = 'conversations';
+    document.querySelectorAll('.sidebar-panel').forEach(function(p) { p.classList.add('hidden'); });
+    $('conversations-panel').classList.remove('hidden');
+  }
+});
+
+// Un mensaje privado (recibido o enviado) actualiza la lista de conversaciones aquí mismo: antes cada uno
+// volvía a pedir la lista completa al servidor (una consulta a la base por mensaje).
+function noteConversationMessage(msg) {
+  if (!msg || !msg.recipient) return;
+  var other = msg.sender === currentUser ? msg.recipient : msg.sender;
+  var idx = conversations.findIndex(function(c) { return c.with === other; });
+  var conv = idx !== -1 ? conversations.splice(idx, 1)[0] : null;
+  if (!conv) {
+    var known = allOnlineUsers.concat(friends).find(function(u) { return u && u.username === other; });
+    conv = { with: other, displayName: (known && known.displayName) || other, avatar: (known && known.avatar) || null };
+  }
+  if (msg.sender === other) {
+    conv.displayName = msg.displayName || conv.displayName;
+    conv.avatar = msg.avatar || null;
+  }
+  conv.lastMessage = { content: msg.content, created_at: msg.created_at, sender: msg.sender, file: msg.file || null };
+  conversations.unshift(conv);
+  renderConversations();
 }
 
 function updateConvTotalBadge() {
@@ -2964,11 +3019,42 @@ function buildMessageElement(msg, animate) {
 
 function renderMessage(msg, animate, lastDate) {
   var msgDate = msg.created_at ? new Date(msg.created_at).toDateString() : null;
+  if (lastDate === undefined) {
+    // Mensaje en vivo: la fecha anterior es la del último mensaje en pantalla (si no, cada uno llevaba separador).
+    var lastEl = domMessages[domMessages.length - 1];
+    lastDate = lastEl ? lastEl.dataset.messageDate : null;
+  }
   if (lastDate !== msgDate && msgDate) {
     messagesList.appendChild(buildDateDivider(msg));
   }
   messagesList.appendChild(buildMessageElement(msg, animate));
+  if (animate !== false) trimOldMessages(); // mensaje nuevo en vivo
   scrollToBottom();
+}
+
+// Una sala activa abierta todo el día juntaba miles de mensajes en pantalla y el navegador se ponía lento:
+// se dejan los últimos MAX_DOM_MESSAGES y los anteriores se vuelven a cargar al subir (como el historial).
+var MAX_DOM_MESSAGES = 300;
+var domMessages = messagesList.getElementsByClassName('message'); // lista viva
+
+function trimOldMessages() {
+  var extra = domMessages.length - MAX_DOM_MESSAGES;
+  if (extra <= 0) return;
+  var removed = 0;
+  while (messagesList.firstChild && removed < extra) {
+    var node = messagesList.firstChild;
+    if (node.classList && node.classList.contains('message')) removed++;
+    node.remove();
+  }
+  // Lo que quedó antes del primer mensaje (separadores o avisos) se quita; el primer mensaje lleva su fecha.
+  while (messagesList.firstChild && !(messagesList.firstChild.classList && messagesList.firstChild.classList.contains('message'))) {
+    messagesList.firstChild.remove();
+  }
+  var first = messagesList.firstChild;
+  if (!first) return;
+  if (first.dataset.messageDate) messagesList.insertBefore(buildDateDivider({ created_at: first.dataset.messageDate }), first);
+  historyOldestId = first.dataset.messageId || historyOldestId;
+  historyHasMore = true;
 }
 
 // Navigate to replied message on click
@@ -3024,7 +3110,6 @@ function sendMessage() {
   if (privateRecipient) {
     payload.recipient = privateRecipient;
     socket.emit('private-message', payload, onSent);
-    setTimeout(loadConversations, 100);
   } else if (currentGroup) {
     payload.groupId = currentGroup;
     socket.emit('group-message', payload, onSent);
@@ -3157,15 +3242,6 @@ function renderUsers(users) {
   }).join('');
 
   roomUsersList.innerHTML = currentEl + otherUsers;
-
-  roomUsersList.querySelectorAll('.user-item[data-user]').forEach(function(el) {
-    el.addEventListener('click', function() { openPrivateChat(el.dataset.user); });
-    var pmIcon = el.querySelector('.pm-icon');
-    if (pmIcon) pmIcon.addEventListener('click', function(e) {
-      e.stopPropagation();
-      openPrivateChat(el.dataset.user);
-    });
-  });
 }
 
 function renderAllUsers(users) {
@@ -3183,16 +3259,16 @@ function renderAllUsers(users) {
   }).join('');
 
   allUsersList.innerHTML = currentEl + otherUsers;
-
-  allUsersList.querySelectorAll('.user-item[data-user]').forEach(function(el) {
-    el.addEventListener('click', function() { openPrivateChat(el.dataset.user); });
-    var pmIcon = el.querySelector('.pm-icon');
-    if (pmIcon) pmIcon.addEventListener('click', function(e) {
-      e.stopPropagation();
-      openPrivateChat(el.dataset.user);
-    });
-  });
 }
+
+// Clic en una persona (o en su sobre) de las listas de conectados: abre el privado. Un solo manejador por
+// lista: las listas se redibujan con cada entrada y salida.
+[roomUsersList, allUsersList].forEach(function(list) {
+  list.addEventListener('click', function(e) {
+    var el = e.target.closest('.user-item[data-user]');
+    if (el) openPrivateChat(el.dataset.user);
+  });
+});
 
 socket.on('room-message', function(msg) {
   if (msg.sender !== currentUser) playNotification();
@@ -3214,6 +3290,7 @@ socket.on('room-unread-increment', function(data) {
 });
 
 socket.on('private-message', function(msg) {
+  noteConversationMessage(msg);
   var isRelevant = msg.sender === privateRecipient ||
                    (msg.recipient && msg.recipient === privateRecipient);
 
@@ -3230,7 +3307,7 @@ socket.on('private-message', function(msg) {
     if (!unreadCounts[from]) unreadCounts[from] = 0;
     unreadCounts[from]++;
     updateConvTotalBadge();
-    loadConversations();
+    renderConversations();
 
     if (privateRecipient && privateRecipient !== from) {
       showToast('Mensaje privado de ' + from);
@@ -3626,9 +3703,6 @@ function renderGroupMembersSidebar(group) {
       (isMe ? '' : '<i class="fas fa-envelope pm-icon" title="Mensaje privado"></i>') +
     '</div>';
   }).join('');
-  roomUsersList.querySelectorAll('.user-item[data-user]').forEach(function(el) {
-    el.addEventListener('click', function() { openPrivateChat(el.dataset.user); });
-  });
 }
 
 // Sale de la vista de grupo (al volver a una sala o abrir un privado).

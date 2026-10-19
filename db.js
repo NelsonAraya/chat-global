@@ -268,6 +268,30 @@ module.exports = (async () => {
     );
   };
 
+  // Guarda solo los campos indicados de una cuenta existente. saveUser reescribe la fila completa: dos
+  // guardados casi simultáneos (p. ej. el usuario cambia su foto mientras el admin lo bloquea) podían
+  // terminar en desorden y el último devolvía el valor viejo de lo que cambió el otro.
+  const USER_FIELD_COLUMNS = {
+    password: ['password', v => v],
+    displayName: ['display_name', v => v || null],
+    avatar: ['avatar', v => v || null],
+    role: ['role', v => v || 'user'],
+    location: ['location', v => v || null],
+    departments: ['departments', v => JSON.stringify(v || [])],
+    adminDepartments: ['admin_departments', v => JSON.stringify(v || [])],
+    status: ['status', v => v || 'active'],
+    email: ['email', v => v || null],
+    twoFactorEnabled: ['two_factor_enabled', v => (v ? 1 : 0)]
+  };
+  const saveUserFields = async (u, fields) => {
+    const columns = fields.map(f => USER_FIELD_COLUMNS[f]);
+    if (!columns.length || columns.some(c => !c)) throw new Error('saveUserFields: campo no válido');
+    await pool.query(
+      `UPDATE users SET ${columns.map(([col]) => col + ' = ?').join(', ')} WHERE username = ?`,
+      [...fields.map((f, i) => columns[i][1](u[f])), u.username]
+    );
+  };
+
   const deleteUser = async (username) => {
     await pool.query('DELETE FROM users WHERE username = ?', [username]);
     await pool.query('DELETE FROM sessions WHERE username = ?', [username]);
@@ -576,7 +600,7 @@ module.exports = (async () => {
 
   return {
     data, hashPassword, verifyPassword, isLegacyHash,
-    saveUser, deleteUser,
+    saveUser, saveUserFields, deleteUser,
     saveRoom, deleteRoom,
     saveMessage, updateMessageReactions, deleteMessagesByRoom,
     getRoomMessages, getPrivateMessages, getGroupMessages, getMessage, getLastPrivateMessages, getLastGroupMessages,
