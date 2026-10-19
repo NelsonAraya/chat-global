@@ -9,7 +9,7 @@ Funciona de dos formas, según el `.env`:
 | Para qué | Pruebas o uso dentro de la red | Publicarlo en internet con un dominio |
 | Certificado | Propio del chat (cada PC lo instala) | Real (Let's Encrypt), lo maneja Nginx |
 | Puertos del chat | 3000 (redirige) y 3443, en toda la red | Solo 3000 **dentro** del servidor; afuera solo Nginx en 80/443 |
-| Ver | [Acceder desde la LAN](#acceder-desde-la-lan) | [Publicar en internet](#publicar-en-internet-nginx) |
+| Ver | [Acceder desde la LAN](#acceder-desde-la-lan) | [INSTALACION-WEB.md](INSTALACION-WEB.md) |
 
 ## Requisitos
 
@@ -17,7 +17,7 @@ Funciona de dos formas, según el `.env`:
 - npm (incluido con Node.js)
 - **MySQL** (o MariaDB) corriendo y accesible desde el servidor
 - Red local: puertos **3000** y **3443** abiertos en el firewall del servidor
-- Web: un dominio, **Nginx** y los puertos **80** y **443** abiertos (ver [Publicar en internet](#publicar-en-internet-nginx))
+- Web: un dominio, **Nginx** y los puertos **80** y **443** abiertos (ver [INSTALACION-WEB.md](INSTALACION-WEB.md))
 
 ## Instalación
 
@@ -59,8 +59,8 @@ Variables disponibles (si no se define alguna, usa el valor por defecto):
 | `ALLOWED_EMAIL_DOMAINS` | `cormudesi.cl,gmail.com` | Dominios de correo aceptados al registrarse (separados por comas) |
 | `HTTP_PORT` | `3000` | Red local: puerto HTTP, redirige a HTTPS (opcional) |
 | `HTTPS_PORT` | `3443` | Red local: puerto HTTPS (opcional) |
-| `MODO_WEB` | *(apagado)* | `true` para publicarlo en internet detrás de Nginx (ver [Publicar en internet](#publicar-en-internet-nginx)) |
-| `DOMINIO` | *(vacío)* | Web: dominio del chat, ej. `chat.cormudesi.cl`. Solo se aceptan conexiones desde ahí |
+| `MODO_WEB` | *(apagado)* | `true` para publicarlo en internet detrás de Nginx (ver [INSTALACION-WEB.md](INSTALACION-WEB.md)) |
+| `DOMINIO` | *(vacío)* | Web: dominio del chat, ej. `aurora.cormudesi.cl`. Solo se aceptan conexiones desde ahí |
 | `WEB_HOST` | `127.0.0.1` | Web: dirección donde escucha el chat. No cambiarla: así nadie entra sin pasar por Nginx |
 | `WEB_PORT` | `3000` | Web: puerto interno al que Nginx envía las conexiones |
 | `PROXY_IPS` | *(vacío)* | Web: IP de Nginx **solo si está en otro equipo** (para conocer la IP real de cada usuario) |
@@ -187,160 +187,9 @@ Windows + R → "wf.msc" → Reglas de entrada → Nueva regla → Puerto
 
 ## Publicar en internet (Nginx)
 
-El chat no se expone directo a internet: **Nginx** recibe las conexiones con un certificado real (Let's Encrypt) y se las pasa al chat, que en **modo web** escucha solo dentro del servidor.
+El paso a paso completo para instalarlo en un servidor con dominio (Nginx, certificado de Let's Encrypt, MySQL, PM2, firewall, respaldos y problemas frecuentes) está en **[INSTALACION-WEB.md](INSTALACION-WEB.md)**.
 
-```
-Internet ──80/443──▶ Nginx (certificado real) ──▶ chat en 127.0.0.1:3000 (MODO_WEB=true)
-                                                    MySQL en 127.0.0.1:3306 (nunca hacia afuera)
-```
-
-### Puertos
-
-| Puerto | Quién lo usa | Abierto hacia internet |
-|---|---|---|
-| **443** | Nginx (HTTPS, el chat) | **Sí** |
-| **80** | Nginx (solo redirige a 443 y renueva el certificado) | **Sí** |
-| 22 | SSH (administración) | Solo si lo necesitas, idealmente limitado a tu IP |
-| 3000 | El chat (`WEB_PORT`), solo para Nginx | **No** (escucha en 127.0.0.1) |
-| 3306 | MySQL | **No** |
-| 3443 | No se usa en modo web | — |
-
-### 1. Instalar el chat en el servidor
-
-```bash
-git clone https://github.com/NelsonAraya/chat-global.git
-cd chat-global
-npm install
-cp .env.example .env
-```
-
-En `.env`, además de MySQL y el correo (SMTP, obligatorio en la web: sin él nadie recibe su código de acceso):
-
-```ini
-MODO_WEB=true
-DOMINIO=chat.cormudesi.cl
-WEB_PORT=3000
-ADMIN_PASSWORD_INICIAL=<una contraseña larga>    # solo se usa al crear la cuenta admin
-ADMIN_EMAIL_INICIAL=<correo del administrador>    # recibe el código del doble factor de admin
-ALLOWED_EMAIL_DOMAINS=cormudesi.cl                # quitar gmail.com si solo deben registrarse funcionarios
-```
-
-El chat **no arranca** en modo web si la cuenta `admin` quedaría (o está) con la contraseña `admin`, y lo explica en la consola. Si traes la base de una instalación en red local, cambia antes la contraseña de `admin` desde el chat.
-
-Probar que arranca: `npm start` debe mostrar `[WEB] Chat escuchando en http://127.0.0.1:3000 (publicado por Nginx en https://chat.cormudesi.cl)`.
-
-### 2. Certificado (Let's Encrypt)
-
-Con el dominio apuntando a la IP pública del servidor:
-
-```bash
-sudo apt install nginx certbot python3-certbot-nginx
-sudo certbot certonly --nginx -d chat.cormudesi.cl     # se renueva solo
-```
-
-### 3. Configuración de Nginx
-
-Archivo `/etc/nginx/sites-available/chat`:
-
-```nginx
-# Límite de subidas de archivos por IP. Ojo: los usuarios de un mismo centro pueden salir a internet con la
-# misma IP, por eso el valor es alto; el chat ya limita por persona.
-limit_req_zone $binary_remote_addr zone=chat_upload:10m rate=10r/s;
-
-server {
-    listen 80;
-    server_name chat.cormudesi.cl;
-    return 301 https://$host$request_uri;
-}
-
-server {
-    listen 443 ssl http2;
-    server_name chat.cormudesi.cl;
-
-    ssl_certificate     /etc/letsencrypt/live/chat.cormudesi.cl/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/chat.cormudesi.cl/privkey.pem;
-
-    add_header Strict-Transport-Security "max-age=31536000" always;   # el navegador ya no intenta HTTP
-    client_max_body_size 3m;                                            # archivos de hasta 2 MB + margen
-
-    # Datos que el chat necesita. X-Forwarded-For lleva la IP real de cada persona (registro de
-    # consentimiento y sesiones); el chat solo la acepta si la conexión viene de Nginx.
-    proxy_set_header Host $host;
-    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-    proxy_set_header X-Forwarded-Proto $scheme;
-
-    # Conexión en vivo (Socket.IO / WebSocket)
-    location /socket.io/ {
-        proxy_pass http://127.0.0.1:3000;
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade $http_upgrade;
-        proxy_set_header Connection "upgrade";
-        proxy_read_timeout 120s;                 # mayor que el ping de Socket.IO (25 s)
-        proxy_send_timeout 120s;
-    }
-
-    location /api/upload {
-        limit_req zone=chat_upload burst=20 nodelay;
-        proxy_pass http://127.0.0.1:3000;
-    }
-
-    location / {
-        proxy_pass http://127.0.0.1:3000;
-    }
-}
-```
-
-Activarlo:
-
-```bash
-sudo ln -s /etc/nginx/sites-available/chat /etc/nginx/sites-enabled/
-sudo nginx -t && sudo systemctl reload nginx
-```
-
-Si `DOMINIO` y `server_name` no coinciden, el chat rechaza la conexión en vivo (la página carga, pero no conecta).
-
-### 4. Firewall
-
-```bash
-sudo ufw allow OpenSSH
-sudo ufw allow 80,443/tcp
-sudo ufw enable                                 # 3000, 3306 y el resto quedan cerrados hacia fuera
-```
-
-En MySQL, `bind-address = 127.0.0.1` (en `/etc/mysql/mysql.conf.d/mysqld.cnf`) para que no escuche hacia afuera.
-
-### 5. Mantener el chat corriendo (PM2)
-
-```bash
-sudo npm install -g pm2
-pm2 start index.js --name chat                  # desde la carpeta del chat
-pm2 save && pm2 startup                         # vuelve a iniciar solo si se reinicia el servidor
-pm2 logs chat                                   # ver la consola
-```
-
-Al actualizar: `git pull && npm install && pm2 restart chat`.
-
-### 6. Respaldos
-
-Diarios, guardados **fuera** del servidor, y probar restaurar al menos una vez:
-
-```bash
-mysqldump -u <usuario> -p chat_cormudesi | gzip > respaldo-$(date +%F).sql.gz
-tar czf uploads-$(date +%F).tar.gz uploads/
-```
-
-### 7. Correo
-
-El doble factor depende del SMTP: si falla, nadie puede entrar. Usar una cuenta institucional y configurar **SPF y DKIM** en el dominio para que los códigos no lleguen a spam.
-
-### Antes de abrirlo
-
-- [ ] `npm start` muestra la línea `[WEB] ...` sin errores.
-- [ ] `https://chat.cormudesi.cl` carga con candado, **sin** el aviso "Descargar certificado".
-- [ ] Ingresar como `admin`: llega el código al correo de `ADMIN_EMAIL_INICIAL`.
-- [ ] Desde fuera, `http://<IP-pública>:3000` y el puerto 3306 **no** responden.
-- [ ] Enviar un mensaje y un archivo; activar la alerta y ver que llega el correo con la hora correcta.
-- [ ] Revisar con la unidad legal los Términos y la Política de Privacidad (dónde se alojan los datos).
+En resumen: el chat corre con `MODO_WEB=true` escuchando solo en `127.0.0.1:3000`, y Nginx lo publica en el puerto 443 con el certificado real. Hacia internet solo quedan abiertos el 80 y el 443.
 
 ## Comandos
 
@@ -656,6 +505,7 @@ chat-cormudesi/
 ├── migrate-to-mysql.js   # Migración única desde una instalación anterior con SQLite
 ├── .env                  # Configuración de MySQL y correo (no se sube a git)
 ├── .env.example          # Plantilla de .env
+├── INSTALACION-WEB.md    # Paso a paso para publicarlo en internet (Nginx, certificado, PM2, firewall)
 ├── package.json
 ├── certs/                # Certificado SSL (se genera al iniciar con la IP actual)
 ├── uploads/              # Archivos adjuntos (se crea al iniciar)
