@@ -64,6 +64,14 @@ const upload = multer({
   limits: { fileSize: 2 * 1024 * 1024 }
 });
 
+// El navegador envía el nombre del archivo en UTF-8, pero multer lo lee como latin1: "informe año.pdf" llegaba
+// como "informe aÃ±o.pdf". Se reinterpreta solo si el resultado es UTF-8 válido (si no, se deja como vino).
+const fixUploadName = (name) => {
+  if (!/[\u0080-ÿ]/.test(name) || /[^\u0000-ÿ]/.test(name)) return name;
+  const utf8 = Buffer.from(name, 'latin1').toString('utf8');
+  return utf8.includes('�') ? name : utf8;
+};
+
 let socketHandlers = null;
 
 // La autorización se revisa ANTES de recibir el archivo (va en la cabecera X-Upload-Token): así nadie sin
@@ -88,7 +96,7 @@ app.post('/api/upload', (req, res, next) => {
   }
   res.json({
     url: '/uploads/' + req.file.filename,
-    name: req.file.originalname,
+    name: fixUploadName(req.file.originalname),
     size: req.file.size,
     type: req.file.mimetype
   });
