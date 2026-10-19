@@ -93,6 +93,11 @@ const adminPendingSection = $('admin-pending-section');
 const adminPendingList = $('admin-pending-list');
 const adminPendingBadge = $('admin-pending-badge');
 const adminAlertsList = $('admin-alerts-list');
+const adminErrorsList = $('admin-errors-list');
+const adminErrorsBadge = $('admin-errors-badge');
+const adminErrorsOnlyPending = $('admin-errors-only-pending');
+const adminErrorsRefresh = $('admin-errors-refresh');
+const adminErrorsLoadMore = $('admin-errors-load-more');
 const adminAlertsLoadMore = $('admin-alerts-load-more');
 const adminRoomsList = $('admin-rooms-list');
 const adminDepartmentsList = $('admin-departments-list');
@@ -455,9 +460,8 @@ fileInput.addEventListener('change', function() {
 
   var formData = new FormData();
   formData.append('file', file);
-  formData.append('token', currentUploadToken || '');
 
-  fetch('/api/upload', { method: 'POST', body: formData })
+  fetch('/api/upload', { method: 'POST', body: formData, headers: uploadHeaders() })
     .then(function(res) { return res.json(); })
     .then(function(data) {
       if (data.error) { showToast(data.error); return; }
@@ -520,22 +524,24 @@ function startRecording() {
 
       var formData = new FormData();
       formData.append('file', blob, 'audio_' + Date.now() + '.webm');
-      formData.append('token', currentUploadToken || '');
-      fetch('/api/upload', { method: 'POST', body: formData })
+      fetch('/api/upload', { method: 'POST', body: formData, headers: uploadHeaders() })
         .then(function(res) { return res.json(); })
         .then(function(data) {
           if (data.error) { showToast(data.error); return; }
           var payload = { content: '', file: data };
           if (replyingTo) payload.reply = replyingTo;
+          var onSent = function(res) {
+            if (res && res.ok === false) showToast(res.error || 'No se pudo enviar el audio');
+          };
           if (privateRecipient) {
             payload.recipient = privateRecipient;
-            socket.emit('private-message', payload);
+            socket.emit('private-message', payload, onSent);
             setTimeout(loadConversations, 100);
           } else if (currentGroup) {
             payload.groupId = currentGroup;
-            socket.emit('group-message', payload);
+            socket.emit('group-message', payload, onSent);
           } else if (currentRoom) {
-            socket.emit('room-message', payload);
+            socket.emit('room-message', payload, onSent);
           }
           cancelReply();
           messageInput.focus();
@@ -625,7 +631,27 @@ document.querySelectorAll('.login-tab').forEach(tab => {
   });
 });
 
+// La autorización para subir va en una cabecera: así el servidor la revisa antes de recibir el archivo.
+function uploadHeaders() {
+  return { 'X-Upload-Token': currentUploadToken || '' };
+}
+
+// Los archivos (/uploads) solo se sirven con sesión: se canjea el token de subida por una cookie
+// antes de mostrar el chat, para que las imágenes y avatares carguen desde el primer momento.
 function completeLogin(username, res, opts) {
+  var token = res.uploadToken || null;
+  if (!token) return showChatAfterLogin(username, res, opts);
+  fetch('/api/file-access', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ token: token }),
+    credentials: 'same-origin'
+  }).catch(function() {}).then(function() {
+    showChatAfterLogin(username, res, opts);
+  });
+}
+
+function showChatAfterLogin(username, res, opts) {
   opts = opts || {};
   currentUser = username.toLowerCase();
   currentUploadToken = res.uploadToken || null;
@@ -644,6 +670,7 @@ function completeLogin(username, res, opts) {
   updateHeaderAvatar();
   if (currentRole === 'admin') {
     adminTab.classList.remove('hidden');
+    refreshErrorCount();
   } else {
     adminTab.classList.add('hidden');
   }
@@ -1067,8 +1094,7 @@ avatarInput.addEventListener('change', function() {
   }
   var formData = new FormData();
   formData.append('file', file);
-  formData.append('token', currentUploadToken || '');
-  fetch('/api/upload', { method: 'POST', body: formData })
+  fetch('/api/upload', { method: 'POST', body: formData, headers: uploadHeaders() })
     .then(function(res) { return res.json(); })
     .then(function(data) {
       if (data.error) { showToast(data.error); return; }
@@ -1608,9 +1634,145 @@ adminAlertsLoadMore.addEventListener('click', function() {
   loadAlertHistory(false);
 });
 
+// ===== Registro de errores del sistema (solo administradores) =====
+var errorLogItems = [];
+var errorLogHasMore = false;
+var loadingErrorLog = false;
+
+function updateErrorsBadge(count) {
+  adminErrorsBadge.textContent = count > 99 ? '99+' : String(count);
+  adminErrorsBadge.classList.toggle('hidden', !count);
+}
+
+function refreshErrorCount() {
+  if (currentRole !== 'admin') return;
+  socket.emit('get-error-count', function(res) {
+    if (res) updateErrorsBadge(res.pendingCount || 0);
+  });
+}
+
+function loadErrorLog(reset) {
+  if (loadingErrorLog || currentRole !== 'admin') return;
+  loadingErrorLog = true;
+  adminErrorsLoadMore.disabled = true;
+  socket.emit('get-error-log', { offset: reset ? 0 : errorLogItems.length, onlyPending: adminErrorsOnlyPending.checked }, function(res) {
+    loadingErrorLog = false;
+    adminErrorsLoadMore.disabled = false;
+    if (!res || !res.ok) return;
+    errorLogItems = reset ? res.errors : errorLogItems.concat(res.errors);
+    errorLogHasMore = !!res.hasMore;
+    updateErrorsBadge(res.pendingCount || 0);
+    renderErrorLog();
+  });
+}
+
+// Texto listo para pegar en un correo o mensaje a los desarrolladores.
+function errorReportText(e) {
+  return [
+    'Error del Chat CORMUDESI (#' + e.id + ')',
+    'Origen: ' + e.source,
+    'Mensaje: ' + e.message,
+    'Usuario: ' + (e.username || '—'),
+    'Primera vez: ' + formatAlertDateTime(e.created_at),
+    'Última vez: ' + formatAlertDateTime(e.last_at) + ' (' + e.occurrences + ' ' + (e.occurrences === 1 ? 'vez' : 'veces') + ')',
+    '',
+    e.stack || '(sin detalle técnico)'
+  ].join('\n');
+}
+
+function renderErrorLog() {
+  if (errorLogItems.length === 0) {
+    adminErrorsList.innerHTML = '<div class="admin-table-empty">' +
+      (adminErrorsOnlyPending.checked ? 'No hay errores pendientes. 🎉' : 'No hay errores registrados.') + '</div>';
+    adminErrorsLoadMore.classList.add('hidden');
+    return;
+  }
+  adminErrorsList.innerHTML = errorLogItems.map(function(e, i) {
+    var times = e.occurrences > 1 ? ' <span class="admin-count-badge">' + e.occurrences + ' veces</span>' : '';
+    var who = e.username ? ' &nbsp; <i class="fas fa-user"></i> ' + escapeHtml(e.username) : '';
+    var status = e.resolved
+      ? '<span class="admin-error-status"><i class="fas fa-check"></i> Revisado por ' + escapeHtml(e.resolvedBy || '—') + '</span>'
+      : '';
+    return '<div class="admin-error-item' + (e.resolved ? ' resolved' : '') + '" data-index="' + i + '">' +
+      '<div class="admin-error-head">' +
+        '<div class="admin-user-info">' +
+          '<div class="admin-error-message">' + escapeHtml(e.message) + times + '</div>' +
+          '<div class="admin-user-username"><i class="fas fa-location-crosshairs"></i> ' + escapeHtml(e.source) + who +
+            ' &nbsp; <i class="fas fa-clock"></i> ' + escapeHtml(formatAlertDateTime(e.last_at)) + '</div>' +
+          status +
+        '</div>' +
+        '<div class="admin-error-actions">' +
+          '<button class="btn-icon admin-error-toggle" title="Ver detalle"><i class="fas fa-chevron-down"></i></button>' +
+          '<button class="btn-icon admin-error-copy" title="Copiar para los desarrolladores"><i class="fas fa-copy"></i></button>' +
+          '<button class="btn-icon admin-error-resolve" title="' + (e.resolved ? 'Volver a pendiente' : 'Marcar revisado') + '">' +
+            '<i class="fas ' + (e.resolved ? 'fa-rotate-left' : 'fa-check') + '"></i></button>' +
+        '</div>' +
+      '</div>' +
+      '<pre class="admin-error-stack hidden">' + escapeHtml(errorReportText(e)) + '</pre>' +
+    '</div>';
+  }).join('');
+  adminErrorsLoadMore.classList.toggle('hidden', !errorLogHasMore);
+}
+
+adminErrorsList.addEventListener('click', function(ev) {
+  var item = ev.target.closest('.admin-error-item');
+  if (!item) return;
+  var e = errorLogItems[Number(item.dataset.index)];
+  if (!e) return;
+  if (ev.target.closest('.admin-error-toggle')) {
+    item.querySelector('.admin-error-stack').classList.toggle('hidden');
+  } else if (ev.target.closest('.admin-error-copy')) {
+    var text = errorReportText(e);
+    if (navigator.clipboard) {
+      navigator.clipboard.writeText(text).then(function() { showToast('Detalle copiado'); }, function() { showToast('No se pudo copiar'); });
+    } else {
+      showToast('Tu navegador no permite copiar automáticamente');
+    }
+  } else if (ev.target.closest('.admin-error-resolve')) {
+    socket.emit('admin-resolve-error', { id: e.id, resolved: !e.resolved }, function(res) {
+      if (!res || !res.ok) { showToast((res && res.error) || 'No se pudo actualizar'); return; }
+      updateErrorsBadge(res.pendingCount || 0);
+      loadErrorLog(true);
+    });
+  }
+});
+
+adminErrorsOnlyPending.addEventListener('change', function() { loadErrorLog(true); });
+adminErrorsRefresh.addEventListener('click', function() { loadErrorLog(true); });
+adminErrorsLoadMore.addEventListener('click', function() { loadErrorLog(false); });
+
+// El servidor avisa que se registró un error nuevo: se actualiza el contador (y la lista si está abierta).
+socket.on('error-logged', function() {
+  if (currentRole !== 'admin') return;
+  if (!$('admin-subtab-errores').classList.contains('hidden') && !adminView.classList.contains('hidden')) {
+    loadErrorLog(true);
+  } else {
+    refreshErrorCount();
+  }
+});
+
+// Errores de esta página en el navegador: se informan al servidor (como mucho una vez cada mensaje).
+var reportedClientErrors = {};
+function reportClientError(message, stack, where) {
+  if (!currentUser || !socket.connected) return;
+  var key = String(message).slice(0, 200);
+  if (reportedClientErrors[key] || Object.keys(reportedClientErrors).length > 20) return;
+  reportedClientErrors[key] = true;
+  socket.emit('client-error', { message: String(message || ''), stack: String(stack || ''), where: String(where || '') });
+}
+window.addEventListener('error', function(ev) {
+  if (!ev.error && !ev.message) return; // p. ej. una imagen que no cargó
+  reportClientError(ev.message, ev.error && ev.error.stack, (ev.filename || '') + ':' + (ev.lineno || 0) + ':' + (ev.colno || 0));
+});
+window.addEventListener('unhandledrejection', function(ev) {
+  var r = ev.reason;
+  reportClientError(r && r.message ? r.message : String(r), r && r.stack, location.pathname);
+});
+
 function renderAdminPanel() {
   loadPendingRegistrations();
   loadAlertHistory(true);
+  loadErrorLog(true);
   socket.emit('get-stats', function(stats) {
     if (stats) {
       adminStatUsers.textContent = stats.totalUsers;
@@ -2734,15 +2896,23 @@ function sendMessage() {
     payload.reply = replyingTo;
   }
 
+  // Si el servidor no pudo guardar el mensaje, avisa y devuelve el texto al cuadro para no perderlo.
+  var onSent = function(res) {
+    if (res && res.ok === false) {
+      showToast(res.error || 'No se pudo enviar el mensaje');
+      if (content && !messageInput.value) messageInput.value = content;
+    }
+  };
+
   if (privateRecipient) {
     payload.recipient = privateRecipient;
-    socket.emit('private-message', payload);
+    socket.emit('private-message', payload, onSent);
     setTimeout(loadConversations, 100);
   } else if (currentGroup) {
     payload.groupId = currentGroup;
-    socket.emit('group-message', payload);
+    socket.emit('group-message', payload, onSent);
   } else if (currentRoom) {
-    socket.emit('room-message', payload);
+    socket.emit('room-message', payload, onSent);
   }
 
   messageInput.value = '';

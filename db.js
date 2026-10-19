@@ -78,6 +78,10 @@ module.exports = (async () => {
   // Migración: mensajes de grupo.
   try { await pool.query('ALTER TABLE messages ADD COLUMN group_id INT'); } catch {}
   try { await pool.query('ALTER TABLE messages ADD INDEX idx_messages_group (group_id)'); } catch {}
+  // Migración: índices para leer el historial por páginas directo de la base (sin cargarlo entero en memoria).
+  try { await pool.query('ALTER TABLE messages ADD INDEX idx_messages_room_id (room_name, id)'); } catch {}
+  try { await pool.query('ALTER TABLE messages ADD INDEX idx_messages_group_id (group_id, id)'); } catch {}
+  try { await pool.query('ALTER TABLE messages ADD INDEX idx_messages_pair_id (sender, recipient, id)'); } catch {}
 
   await pool.query(`CREATE TABLE IF NOT EXISTS chat_groups (
     id INT AUTO_INCREMENT PRIMARY KEY,
@@ -138,6 +142,23 @@ module.exports = (async () => {
     INDEX idx_friends_recipient (recipient)
   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
 
+  // Errores del sistema (servidor y navegador) para que los administradores los revisen en el panel.
+  await pool.query(`CREATE TABLE IF NOT EXISTS error_log (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    source VARCHAR(120),
+    message TEXT,
+    stack TEXT,
+    username VARCHAR(64),
+    occurrences INT DEFAULT 1,
+    created_at VARCHAR(40),
+    last_at VARCHAR(40),
+    resolved TINYINT(1) DEFAULT 0,
+    resolved_by VARCHAR(64),
+    resolved_at VARCHAR(40),
+    INDEX idx_error_log_last (last_at),
+    INDEX idx_error_log_resolved (resolved)
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
+
   await pool.query(`CREATE TABLE IF NOT EXISTS alerts (
     id INT AUTO_INCREMENT PRIMARY KEY,
     username VARCHAR(64) NOT NULL,
@@ -187,16 +208,15 @@ module.exports = (async () => {
 
   const [userRows] = await pool.query('SELECT * FROM users ORDER BY username');
   const [roomRows] = await pool.query('SELECT * FROM rooms ORDER BY name');
-  const [messageRows] = await pool.query('SELECT * FROM messages ORDER BY created_at');
   const [deptRows] = await pool.query('SELECT * FROM departments ORDER BY name');
   const [friendRows] = await pool.query('SELECT * FROM friends ORDER BY id');
   const [groupRows] = await pool.query('SELECT * FROM chat_groups ORDER BY id');
   const [groupMemberRows] = await pool.query('SELECT * FROM group_members ORDER BY created_at');
+  const [[{ maxMessageId }]] = await pool.query('SELECT MAX(id) AS maxMessageId FROM messages');
 
   let data = {
     users: userRows.map(mapUser),
     rooms: roomRows.map(mapRoom),
-    messages: messageRows.map(mapMessage),
     departments: deptRows.map(mapDepartment),
     friends: friendRows.map(mapFriend),
     groups: groupRows.map(mapGroup),
@@ -253,6 +273,74 @@ module.exports = (async () => {
 
   const deleteMessagesByRoom = async (roomName) => {
     await pool.query('DELETE FROM messages WHERE room_name = ?', [roomName]);
+  };
+
+  // ===== Lectura del historial: se consulta a la base solo la página que se necesita =====
+  // Devuelve hasta `limit` mensajes anteriores a `beforeId` (o los más recientes), en orden cronológico,
+  // y si quedan más antiguos por cargar.
+  const pageOfMessages = async (where, params, beforeId, limit) => {
+    const before = Number(beforeId);
+    const useBefore = beforeId !== undefined && beforeId !== null && Number.isFinite(before);
+    const [rows] = await pool.query(
+      `SELECT * FROM messages WHERE ${where}${useBefore ? ' AND id < ?' : ''} ORDER BY id DESC LIMIT ?`,
+      [...params, ...(useBefore ? [before] : []), limit + 1]
+    );
+    const hasMore = rows.length > limit;
+    return { messages: rows.slice(0, limit).reverse().map(mapMessage), hasMore };
+  };
+
+  const getRoomMessages = (roomName, beforeId, limit) =>
+    pageOfMessages('room_name = ? AND recipient IS NULL', [roomName], beforeId, limit);
+
+  const getPrivateMessages = (userA, userB, beforeId, limit) =>
+    pageOfMessages('recipient IS NOT NULL AND ((sender = ? AND recipient = ?) OR (sender = ? AND recipient = ?))',
+      [userA, userB, userB, userA], beforeId, limit);
+
+  const getGroupMessages = (groupId, beforeId, limit) =>
+    pageOfMessages('group_id = ?', [groupId], beforeId, limit);
+
+  const getMessage = async (id) => {
+    const [rows] = await pool.query('SELECT * FROM messages WHERE id = ?', [id]);
+    return rows[0] ? mapMessage(rows[0]) : null;
+  };
+
+  // Último mensaje de cada conversación privada del usuario (para la lista de conversaciones).
+  const getLastPrivateMessages = async (username) => {
+    const [rows] = await pool.query(
+      `SELECT m.* FROM messages m
+       JOIN (SELECT IF(sender = ?, recipient, sender) AS other, MAX(id) AS max_id
+             FROM messages WHERE recipient IS NOT NULL AND (sender = ? OR recipient = ?) GROUP BY other) t
+         ON m.id = t.max_id
+       ORDER BY m.id DESC`,
+      [username, username, username]
+    );
+    return rows.map(mapMessage);
+  };
+
+  // Último mensaje de cada grupo (se carga una vez al arrancar y luego se mantiene en memoria).
+  const getLastGroupMessages = async () => {
+    const [rows] = await pool.query(
+      `SELECT m.* FROM messages m
+       JOIN (SELECT group_id, MAX(id) AS max_id FROM messages WHERE group_id IS NOT NULL GROUP BY group_id) t
+         ON m.id = t.max_id`
+    );
+    return rows.map(mapMessage);
+  };
+
+  // URLs de los archivos adjuntos de una sala o grupo (para borrarlos del disco junto con los mensajes).
+  const getRoomFileUrls = async (roomName) => {
+    const [rows] = await pool.query('SELECT file_url FROM messages WHERE room_name = ? AND file_url IS NOT NULL', [roomName]);
+    return rows.map(r => r.file_url);
+  };
+
+  const getGroupFileUrls = async (groupId) => {
+    const [rows] = await pool.query('SELECT file_url FROM messages WHERE group_id = ? AND file_url IS NOT NULL', [groupId]);
+    return rows.map(r => r.file_url);
+  };
+
+  const countMessages = async () => {
+    const [[row]] = await pool.query('SELECT COUNT(*) AS n FROM messages');
+    return Number(row.n);
   };
 
   const saveDepartment = async (d) => {
@@ -355,6 +443,47 @@ module.exports = (async () => {
     );
   };
 
+  // ===== Registro de errores =====
+  const saveErrorLog = async (e) => {
+    const [result] = await pool.query(
+      'INSERT INTO error_log (source, message, stack, username, occurrences, created_at, last_at) VALUES (?, ?, ?, ?, 1, ?, ?)',
+      [e.source, e.message, e.stack || null, e.username || null, e.created_at, e.created_at]
+    );
+    return result.insertId;
+  };
+
+  // El mismo error se repitió: suma una ocurrencia (y si estaba marcado como revisado, vuelve a pendiente).
+  const bumpErrorLog = async (id, at) => {
+    await pool.query('UPDATE error_log SET occurrences = occurrences + 1, last_at = ?, resolved = 0, resolved_by = NULL, resolved_at = NULL WHERE id = ?', [at, id]);
+  };
+
+  const getErrorLog = async (limit, offset, onlyPending) => {
+    const [rows] = await pool.query(
+      `SELECT * FROM error_log ${onlyPending ? 'WHERE resolved = 0' : ''} ORDER BY last_at DESC, id DESC LIMIT ? OFFSET ?`,
+      [limit, offset]
+    );
+    return rows.map(r => ({
+      id: r.id, source: r.source, message: r.message, stack: r.stack, username: r.username,
+      occurrences: Number(r.occurrences) || 1, created_at: r.created_at, last_at: r.last_at,
+      resolved: !!r.resolved, resolvedBy: r.resolved_by, resolvedAt: r.resolved_at
+    }));
+  };
+
+  const countPendingErrors = async () => {
+    const [[row]] = await pool.query('SELECT COUNT(*) AS n FROM error_log WHERE resolved = 0');
+    return Number(row.n);
+  };
+
+  const setErrorResolved = async (id, resolved, by) => {
+    await pool.query('UPDATE error_log SET resolved = ?, resolved_by = ?, resolved_at = ? WHERE id = ?',
+      [resolved ? 1 : 0, resolved ? by : null, resolved ? new Date().toISOString() : null, id]);
+  };
+
+  // Limpieza: los errores revisados se borran después de un tiempo.
+  const deleteOldResolvedErrors = async (beforeIso) => {
+    await pool.query('DELETE FROM error_log WHERE resolved = 1 AND last_at < ?', [beforeIso]);
+  };
+
   const getAlertHistory = async (limit, offset) => {
     const [rows] = await pool.query(
       'SELECT * FROM alerts ORDER BY created_at DESC LIMIT ? OFFSET ?',
@@ -376,11 +505,15 @@ module.exports = (async () => {
     saveUser, deleteUser,
     saveRoom, deleteRoom,
     saveMessage, updateMessageReactions, deleteMessagesByRoom,
+    getRoomMessages, getPrivateMessages, getGroupMessages, getMessage, getLastPrivateMessages, getLastGroupMessages,
+    getRoomFileUrls, getGroupFileUrls, countMessages,
     saveDepartment, deleteDepartment,
     saveConsent,
     saveFriendRequest, updateFriendStatus, deleteFriendRow,
     saveGroup, renameGroup, deleteGroup, saveGroupMember, deleteGroupMember,
     saveSession, getSession, updateSessionDepartment, deleteSession, deleteUserSessions, deleteExpiredSessions,
-    saveAlert, getAlertHistory
+    saveAlert, getAlertHistory,
+    saveErrorLog, bumpErrorLog, getErrorLog, countPendingErrors, setErrorResolved, deleteOldResolvedErrors,
+    maxMessageId: Number(maxMessageId) || 0
   };
 })();

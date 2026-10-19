@@ -3,18 +3,21 @@ const path = require('path');
 const crypto = require('crypto');
 const { sendPanicAlertEmail, sendLoginCodeEmail } = require('./mailer');
 
-module.exports = (io, db) => {
+module.exports = (io, db, errorLog) => {
   const {
     data, hashPassword, verifyPassword, isLegacyHash,
     saveUser, deleteUser,
     saveRoom, deleteRoom,
     saveMessage, updateMessageReactions, deleteMessagesByRoom,
+    getRoomMessages, getPrivateMessages, getGroupMessages, getMessage, getLastPrivateMessages, getLastGroupMessages,
+    getRoomFileUrls, getGroupFileUrls, countMessages,
     saveDepartment, deleteDepartment,
     saveConsent,
     saveFriendRequest, updateFriendStatus, deleteFriendRow,
     saveGroup, renameGroup, deleteGroup, saveGroupMember, deleteGroupMember,
     saveSession, getSession, updateSessionDepartment, deleteSession, deleteUserSessions, deleteExpiredSessions,
-    saveAlert, getAlertHistory
+    saveAlert, getAlertHistory,
+    getErrorLog, countPendingErrors, setErrorResolved, deleteOldResolvedErrors
   } = db;
   const TERMS_VERSION = '1.0';
   const users = new Map();
@@ -40,17 +43,44 @@ module.exports = (io, db) => {
     };
   };
 
-  const sanitizeReply = (reply) => {
-    if (!reply || typeof reply !== 'object') return null;
-    const id = Number(reply.id);
+  // La cita de una respuesta se arma en el servidor a partir del mensaje original (el navegador solo indica
+  // cuál responde): así nadie puede atribuirle a otro un texto que no escribió. El original debe ser de la
+  // misma conversación; si no, la cita se descarta.
+  const buildReply = async (reply, belongsHere) => {
+    const id = Number(reply?.id);
+    if (!Number.isFinite(id)) return null;
+    const original = await getMessage(id);
+    if (!original || !belongsHere(original)) return null;
     return {
-      id: Number.isFinite(id) ? id : null,
-      sender: String(reply.sender || '').slice(0, 64),
-      content: String(reply.content || '').slice(0, 500)
+      id: original.id,
+      sender: original.sender,
+      content: (original.content || (original.file ? '[Archivo]' : '')).slice(0, 500)
     };
   };
 
+  const SEND_ERROR = 'No se pudo enviar el mensaje. Intenta de nuevo.';
+
+  // El id de un mensaje es su marca de tiempo (ms) y define el orden del historial: siempre crece, aunque
+  // lleguen dos mensajes en el mismo milisegundo o el reloj del equipo retroceda.
+  let lastMessageId = db.maxMessageId || 0;
+  const nextMessageId = () => {
+    lastMessageId = Math.max(Date.now(), Math.floor(lastMessageId) + 1);
+    return lastMessageId;
+  };
+
   const sanitizeContent = (content) => (typeof content === 'string' ? content.trim().slice(0, 5000) : '');
+
+  // Texto recibido del navegador: si no es un string (número, objeto, lista...) se trata como vacío.
+  const str = (value) => (typeof value === 'string' ? value : '');
+
+  // Solo se aceptan las reacciones que ofrece el selector del chat (misma lista que REACTION_EMOJIS en app.js).
+  const REACTION_EMOJIS = new Set(['👍', '👎', '❤️', '😄', '😮', '😢', '😡', '🎉', '🔥', '✅']);
+
+  // Borra del disco un archivo subido (los mensajes guardan su URL /uploads/<nombre>).
+  const deleteUploadedFile = (url) => {
+    if (typeof url !== 'string' || !url.startsWith('/uploads/')) return;
+    try { fs.unlinkSync(path.join(__dirname, 'uploads', path.basename(url))); } catch {}
+  };
 
   // ===== Sesiones =====
   // Tras el login (contraseña + código) el navegador recibe un token de sesión; con él puede recargar la
@@ -61,6 +91,27 @@ module.exports = (io, db) => {
   const SESSION_TOKEN_RE = /^[A-Za-z0-9_-]{43}$/;
   const hashToken = (token) => crypto.createHash('sha256').update(token).digest('hex');
 
+  // Sin "Recordar este equipo", al cortarse la conexión se espera un momento: una recarga vuelve a conectar
+  // enseguida con la misma sesión; si nadie la retoma (se cerró la pestaña o la ventana), se borra. Así no
+  // sirve que el navegador restaure la pestaña con su sessionStorage.
+  const SESSION_CLOSE_GRACE_MS = 60 * 1000;
+  const isSessionInUse = (tokenHash) => {
+    for (const [, u] of users) {
+      if (u.sessionHash === tokenHash) return true;
+    }
+    for (const [, s] of io.sockets.sockets) {
+      if (s.resumedSessionHash === tokenHash) return true; // reanudando (p. ej. eligiendo departamento)
+    }
+    return false;
+  };
+  const scheduleSessionClose = (tokenHash) => {
+    setTimeout(() => {
+      if (!isSessionInUse(tokenHash)) {
+        deleteSession(tokenHash).catch(err => console.error('deleteSession error:', err));
+      }
+    }, SESSION_CLOSE_GRACE_MS).unref();
+  };
+
   // Cierra todas las sesiones guardadas de un usuario (y su conexión activa, si se indica un motivo).
   const revokeUserSessions = async (username, kickReason) => {
     await deleteUserSessions(username);
@@ -70,10 +121,14 @@ module.exports = (io, db) => {
     }
   };
 
-  deleteExpiredSessions().catch(err => console.error('deleteExpiredSessions error:', err));
-  setInterval(() => {
+  const ERROR_LOG_KEEP_RESOLVED_MS = 90 * 24 * 60 * 60 * 1000;
+  const hourlyCleanup = () => {
     deleteExpiredSessions().catch(err => console.error('deleteExpiredSessions error:', err));
-  }, 60 * 60 * 1000).unref();
+    deleteOldResolvedErrors(new Date(Date.now() - ERROR_LOG_KEEP_RESOLVED_MS).toISOString())
+      .catch(err => console.error('deleteOldResolvedErrors error:', err));
+  };
+  hourlyCleanup();
+  setInterval(hourlyCleanup, 60 * 60 * 1000).unref();
 
   // ===== Límite de intentos fallidos (en memoria) =====
   // Frena la fuerza bruta: tras varios fallos, esa cuenta / esa IP queda bloqueada un rato.
@@ -114,6 +169,19 @@ module.exports = (io, db) => {
   const OTP_MAX_SENDS = 5;
   const OTP_SENDS_WINDOW_MS = 15 * 60 * 1000;
   const loginCodes = new Map(); // username -> { hash, email, expiresAt, attempts, sentAt }
+
+  // Registro: máximo de solicitudes por equipo (IP) por hora y tope de cuentas esperando aprobación,
+  // para que nadie llene el panel del administrador con solicitudes falsas.
+  const REGISTER_MAX_PER_IP = 5;
+  const REGISTER_WINDOW_MS = 60 * 60 * 1000;
+  const MAX_PENDING_REGISTRATIONS = 150;
+  const registrationsByIp = new Map(); // ip -> [timestamps de registro]
+  const recentRegistrations = (ip) => {
+    const now = Date.now();
+    const recent = (registrationsByIp.get(ip) || []).filter(t => now - t < REGISTER_WINDOW_MS);
+    registrationsByIp.set(ip, recent);
+    return recent;
+  };
   const codeSends = new Map(); // username -> [timestamps de envío]
 
   // Minutos que faltan para poder enviar otro código (0 = se puede).
@@ -133,6 +201,7 @@ module.exports = (io, db) => {
     for (const [k, b] of failBuckets) if (b.resetAt <= now && b.lockedUntil <= now) failBuckets.delete(k);
     for (const [k, e] of loginCodes) if (e.expiresAt <= now) loginCodes.delete(k);
     for (const [k, list] of codeSends) if (!list.some(t => now - t < OTP_SENDS_WINDOW_MS)) codeSends.delete(k);
+    for (const [k, list] of registrationsByIp) if (!list.some(t => now - t < REGISTER_WINDOW_MS)) registrationsByIp.delete(k);
   }, 10 * 60 * 1000).unref();
   // Solo correos institucionales o Gmail, con formato estricto: letras, números y . _ % + - antes de la @,
   // sin puntos al inicio/fin ni seguidos. Se configura con ALLOWED_EMAIL_DOMAINS en .env.
@@ -273,52 +342,22 @@ module.exports = (io, db) => {
 
   const HISTORY_PAGE_SIZE = 50;
 
-  // Devuelve una página de mensajes: los HISTORY_PAGE_SIZE anteriores a `beforeId`
-  // (o los más recientes si no se pasa beforeId), en orden cronológico, junto con
-  // si quedan más mensajes más viejos por cargar.
-  const paginate = (msgs, beforeId) => {
-    let endIdx = msgs.length;
-    if (beforeId !== undefined && beforeId !== null) {
-      const idx = msgs.findIndex(m => m.id === beforeId);
-      if (idx !== -1) endIdx = idx;
-    }
-    const startIdx = Math.max(0, endIdx - HISTORY_PAGE_SIZE);
-    return {
-      messages: msgs.slice(startIdx, endIdx),
-      hasMore: startIdx > 0
-    };
-  };
-
-  const getRoomHistory = (roomName, beforeId) => {
-    const msgs = data.messages.filter(m => m.room_name === roomName && !m.recipient);
-    const page = paginate(msgs, beforeId);
+  // El historial no se guarda en memoria: cada página (los HISTORY_PAGE_SIZE mensajes anteriores a
+  // `beforeId`, o los más recientes) se pide a la base cuando se necesita.
+  const getRoomHistory = async (roomName, beforeId) => {
+    const page = await getRoomMessages(roomName, beforeId, HISTORY_PAGE_SIZE);
     return { messages: page.messages.map(m => ({ ...m, type: 'room' })), hasMore: page.hasMore };
   };
 
-  const getPrivateHistory = (userA, userB, beforeId) => {
-    const msgs = data.messages.filter(m =>
-      m.recipient &&
-      ((m.sender === userA && m.recipient === userB) ||
-       (m.sender === userB && m.recipient === userA))
-    );
-    const page = paginate(msgs, beforeId);
+  const getPrivateHistory = async (userA, userB, beforeId) => {
+    const page = await getPrivateMessages(userA, userB, beforeId, HISTORY_PAGE_SIZE);
     return { messages: page.messages.map(m => ({ ...m, type: 'private' })), hasMore: page.hasMore };
   };
 
-  const getConversations = (username) => {
-    const convMap = new Map();
-    const msgs = data.messages.filter(m =>
-      m.recipient && (m.sender === username || m.recipient === username)
-    );
-    for (const m of msgs) {
-      const other = m.sender === username ? m.recipient : m.sender;
-      const existing = convMap.get(other);
-      if (!existing || new Date(m.created_at) > new Date(existing.created_at)) {
-        convMap.set(other, m);
-      }
-    }
+  const getConversations = async (username) => {
     const conversations = [];
-    for (const [other, msg] of convMap) {
+    for (const msg of await getLastPrivateMessages(username)) {
+      const other = msg.sender === username ? msg.recipient : msg.sender;
       const uc = data.users.find(u => u.username === other);
       conversations.push({
         with: other,
@@ -331,10 +370,7 @@ module.exports = (io, db) => {
         }
       });
     }
-    conversations.sort((a, b) =>
-      new Date(b.lastMessage.created_at) - new Date(a.lastMessage.created_at)
-    );
-    return conversations;
+    return conversations; // ya vienen de la más reciente a la más antigua
   };
 
   // ===================== AMIGOS =====================
@@ -400,22 +436,14 @@ module.exports = (io, db) => {
     if (!room || !room.temporary) return false;
     if (!isRoomEmpty(roomName)) return false;
 
-    const roomMessages = data.messages.filter(m => m.room_name === roomName);
-    for (const m of roomMessages) {
-      if (m.file?.url && m.file.url.startsWith('/uploads/')) {
-        const filename = path.basename(m.file.url);
-        const filePath = path.join(__dirname, 'uploads', filename);
-        try { fs.unlinkSync(filePath); } catch {}
-      }
-    }
-
+    const fileUrls = await getRoomFileUrls(roomName);
     const idx = data.rooms.findIndex(r => r.name === roomName);
     if (idx !== -1) {
       data.rooms.splice(idx, 1);
     }
-    data.messages = data.messages.filter(m => m.room_name !== roomName);
     await deleteRoom(roomName);
     await deleteMessagesByRoom(roomName);
+    fileUrls.forEach(deleteUploadedFile);
     emitToViewersOfRoom(room, 'room-deleted', { name: roomName });
     roomUsers.delete(roomName);
     return true;
@@ -493,7 +521,7 @@ module.exports = (io, db) => {
 
     const uploadToken = crypto.randomUUID();
     uploadTokens.set(uploadToken, socket.id);
-    users.set(socket.id, { username: userRecord.username, currentRoom: null, displayName: userRecord.displayName || userRecord.username, avatar: userRecord.avatar || null, location: userRecord.location || '', role, department, departments: assignedDepartments, uploadToken, sessionHash });
+    users.set(socket.id, { username: userRecord.username, currentRoom: null, displayName: userRecord.displayName || userRecord.username, avatar: userRecord.avatar || null, location: userRecord.location || '', role, department, departments: assignedDepartments, uploadToken, sessionHash, sessionRemember });
     socket.username = userRecord.username;
     socket.displayName = userRecord.displayName || userRecord.username;
     socket.avatar = userRecord.avatar || null;
@@ -549,11 +577,19 @@ module.exports = (io, db) => {
     return { username, displayName: r?.displayName || username, avatar: r?.avatar || null };
   };
 
+  // Último mensaje de cada grupo (para la lista de grupos). Se carga al arrancar y se actualiza al enviar.
+  const lastGroupMessages = new Map(); // group_id -> mensaje
+  const rememberGroupMessage = (msg) => {
+    const prev = lastGroupMessages.get(msg.group_id);
+    if (!prev || prev.id <= msg.id) lastGroupMessages.set(msg.group_id, msg);
+  };
+  getLastGroupMessages()
+    .then(rows => rows.forEach(rememberGroupMessage))
+    .catch(err => console.error('getLastGroupMessages error:', err));
+
   const groupLastMessage = (groupId) => {
-    for (let i = data.messages.length - 1; i >= 0; i--) {
-      if (data.messages[i].group_id === groupId) return { ...data.messages[i], type: 'group' };
-    }
-    return null;
+    const msg = lastGroupMessages.get(groupId);
+    return msg ? { ...msg, type: 'group' } : null;
   };
 
   const groupView = (group, viewer) => {
@@ -585,22 +621,19 @@ module.exports = (io, db) => {
     }
   };
 
-  const getGroupHistory = (groupId, beforeId) => {
-    const page = paginate(data.messages.filter(m => m.group_id === groupId), beforeId);
+  const getGroupHistory = async (groupId, beforeId) => {
+    const page = await getGroupMessages(groupId, beforeId, HISTORY_PAGE_SIZE);
     return { messages: page.messages.map(m => ({ ...m, type: 'group' })), hasMore: page.hasMore };
   };
 
   const destroyGroup = async (group) => {
     const notify = data.groupMembers.filter(m => m.group_id === group.id).map(m => m.username);
-    for (const m of data.messages) {
-      if (m.group_id === group.id && m.file?.url && m.file.url.startsWith('/uploads/')) {
-        try { fs.unlinkSync(path.join(__dirname, 'uploads', path.basename(m.file.url))); } catch {}
-      }
-    }
-    data.messages = data.messages.filter(m => m.group_id !== group.id);
+    const fileUrls = await getGroupFileUrls(group.id);
     data.groupMembers = data.groupMembers.filter(m => m.group_id !== group.id);
     data.groups = data.groups.filter(g => g.id !== group.id);
+    lastGroupMessages.delete(group.id);
     await deleteGroup(group.id);
+    fileUrls.forEach(deleteUploadedFile);
     for (const username of notify) emitToUsername(username, 'group-removed', { id: group.id, name: group.name, reason: 'deleted' });
   };
 
@@ -649,11 +682,89 @@ module.exports = (io, db) => {
 
   const cleanGroupName = (name) => String(name || '').trim().replace(/\s+/g, ' ').slice(0, GROUP_NAME_MAX);
 
+  // ===== Registro de errores (panel de administración) =====
+  const ERROR_LOG_PAGE_SIZE = 50;
+  let errorNoticeTimer = null;
+  if (errorLog) {
+    errorLog.onNewError(() => {
+      if (errorNoticeTimer) return;
+      errorNoticeTimer = setTimeout(() => {
+        errorNoticeTimer = null;
+        io.to(ADMIN_ROOM).emit('error-logged');
+      }, 5000);
+      errorNoticeTimer.unref();
+    });
+  }
+  // Errores del navegador: solo de usuarios con sesión y con límite, para que nadie llene el registro.
+  const CLIENT_ERROR_MAX_PER_MIN = 10;
+
+  // Quién puede ver (y reaccionar a) un mensaje.
+  const canSeeMessage = (msg, user) => {
+    if (msg.room_name) {
+      const room = data.rooms.find(r => r.name === msg.room_name);
+      return !!room && canViewRoom(room, user.department, user.role);
+    }
+    if (msg.group_id) return isGroupMember(msg.group_id, user.username);
+    if (msg.recipient) return user.username === msg.sender || user.username === msg.recipient;
+    return false;
+  };
+
+  // Cada usuario tiene a lo más una reacción por mensaje: la misma la quita, otra la reemplaza.
+  const toggleReaction = (msg, username, emoji) => {
+    if (!msg.reactions || typeof msg.reactions !== 'object') msg.reactions = {};
+    let prevEmoji = null;
+    for (const [e, list] of Object.entries(msg.reactions)) {
+      if (Array.isArray(list) && list.includes(username)) { prevEmoji = e; break; }
+    }
+    if (prevEmoji) {
+      msg.reactions[prevEmoji] = msg.reactions[prevEmoji].filter(u => u !== username);
+      if (msg.reactions[prevEmoji].length === 0) delete msg.reactions[prevEmoji];
+    }
+    if (prevEmoji !== emoji) msg.reactions[emoji] = [...(msg.reactions[emoji] || []), username];
+  };
+
+  const messageLocks = new Map(); // id de mensaje -> promesa de la última operación en curso
+  const withMessageLock = async (id, fn) => {
+    const prev = messageLocks.get(id) || Promise.resolve();
+    let release;
+    const turn = new Promise(r => { release = r; });
+    const chain = prev.then(() => turn);
+    messageLocks.set(id, chain);
+    await prev;
+    try {
+      return await fn();
+    } finally {
+      release();
+      if (messageLocks.get(id) === chain) messageLocks.delete(id);
+    }
+  };
+
   io.on('connection', (socket) => {
+    // Un error en un evento (p. ej. datos mal formados enviados a propósito) no debe botar el servidor:
+    // se registra en la consola y, si el navegador espera respuesta, se le responde con un error.
+    const on = socket.on.bind(socket);
+    socket.on = (event, handler) => on(event, (...args) => {
+      const ack = typeof args[args.length - 1] === 'function' ? args[args.length - 1] : null;
+      const fail = (err) => {
+        const username = users.get(socket.id)?.username || null;
+        if (errorLog) errorLog.report(err, { source: 'evento ' + event, username });
+        else console.error(`Error en el evento "${event}":`, err);
+        try { ack?.({ ok: false, error: 'Solicitud no válida' }); } catch {}
+      };
+      try {
+        const result = handler(...args);
+        if (result && typeof result.then === 'function') result.catch(fail);
+      } catch (err) {
+        fail(err);
+      }
+    });
+
     socket.on('register', async (data_, callback) => {
-      const { username, password, terms_version } = data_ || {};
-      const email = normalizeEmail(data_?.email);
-      if (!username || !username.trim()) {
+      const username = str(data_?.username);
+      const password = str(data_?.password);
+      const terms_version = data_?.terms_version;
+      const email = normalizeEmail(str(data_?.email));
+      if (!username.trim()) {
         return callback?.({ ok: false, error: 'Nombre de usuario requerido' });
       }
       if (!password || password.length < 3) {
@@ -676,6 +787,13 @@ module.exports = (io, db) => {
       if (!terms_version) {
         return callback?.({ ok: false, error: 'Debes aceptar los Términos y Condiciones' });
       }
+      const ip = socket.handshake.address;
+      if (recentRegistrations(ip).length >= REGISTER_MAX_PER_IP) {
+        return callback?.({ ok: false, error: 'Se alcanzó el límite de registros desde este equipo. Inténtalo más tarde.' });
+      }
+      if (data.users.filter(u => u.status === 'pending').length >= MAX_PENDING_REGISTRATIONS) {
+        return callback?.({ ok: false, error: 'Hay muchas solicitudes en revisión. Inténtalo más tarde.' });
+      }
 
       const newUser = {
         username: name,
@@ -697,6 +815,7 @@ module.exports = (io, db) => {
         data.users = data.users.filter(u => u !== newUser);
         return callback?.({ ok: false, error: 'Error al guardar en la base de datos' });
       }
+      recentRegistrations(ip).push(Date.now());
 
       io.to(ADMIN_ROOM).emit('registration-pending', { username: name, displayName: name, email, created_at: newUser.created_at });
 
@@ -717,14 +836,15 @@ module.exports = (io, db) => {
     });
 
     socket.on('login', async (data_, callback) => {
-      const { username, password } = data_ || {};
-      if (!username || !username.trim()) {
+      const username = str(data_?.username);
+      const password = str(data_?.password);
+      if (!username.trim()) {
         return callback?.({ ok: false, error: 'Nombre de usuario requerido' });
       }
       if (!password) {
         return callback?.({ ok: false, error: 'Contraseña requerida' });
       }
-      const name = String(username).trim().toLowerCase();
+      const name = username.trim().toLowerCase();
       const userKey = 'login-user:' + name;
       const ipKey = 'login-ip:' + socket.handshake.address;
       const lockedFor = Math.max(lockMinutesLeft(userKey), lockMinutesLeft(ipKey));
@@ -805,7 +925,7 @@ module.exports = (io, db) => {
       if (!userRecord) return callback?.({ ok: false, error: 'Usuario no encontrado' });
       if (userRecord.email) return callback?.({ ok: false, error: 'Tu cuenta ya tiene un correo registrado' });
 
-      const email = normalizeEmail(data_?.email);
+      const email = normalizeEmail(str(data_?.email));
       const setEmailError = emailError(email);
       if (setEmailError) return callback?.({ ok: false, error: setEmailError });
       if (emailInUse(email, userRecord.username)) return callback?.({ ok: false, error: 'Ese correo ya está registrado en otra cuenta' });
@@ -864,7 +984,7 @@ module.exports = (io, db) => {
         loginCodes.delete(userRecord.username);
         return callback?.({ ok: false, error: 'El código venció. Solicita uno nuevo.' });
       }
-      const code = String(data_?.code || '').trim();
+      const code = str(data_?.code).trim();
       const match = /^\d{6}$/.test(code) &&
         crypto.timingSafeEqual(Buffer.from(hashCode(code), 'hex'), Buffer.from(entry.hash, 'hex'));
       if (!match) {
@@ -1113,7 +1233,7 @@ module.exports = (io, db) => {
       }
       io.to(socket.id).emit('room-unread-update', { room: roomName, count: 0 });
 
-      const historyPage = getRoomHistory(roomName);
+      const historyPage = await getRoomHistory(roomName);
       callback?.({
         ok: true,
         history: historyPage.messages,
@@ -1126,18 +1246,19 @@ module.exports = (io, db) => {
       });
     });
 
-    socket.on('room-message', (data_, callback) => {
+    socket.on('room-message', async (data_, callback) => {
       const user = users.get(socket.id);
       if (!user?.currentRoom) return;
+      const roomName = user.currentRoom;
 
       const content = sanitizeContent(data_?.content);
       const file = sanitizeFile(data_?.file);
-      const reply = sanitizeReply(data_?.reply);
+      const reply = await buildReply(data_?.reply, m => m.room_name === roomName && !m.recipient);
       if (!content && !file) return;
 
       const msg = {
-        id: Date.now() + Math.random(),
-        room_name: user.currentRoom,
+        id: nextMessageId(),
+        room_name: roomName,
         sender: user.username,
         displayName: user.displayName || user.username,
         avatar: user.avatar || null,
@@ -1149,34 +1270,40 @@ module.exports = (io, db) => {
         type: 'room'
       };
 
-      data.messages.push(msg);
-      io.to(user.currentRoom).emit('room-message', msg);
-      saveMessage(msg).catch(err => console.error('saveMessage error:', err));
+      // Primero se guarda: si la base falla, nadie lo recibe y quien lo envió recibe el aviso.
+      try {
+        await saveMessage(msg);
+      } catch (err) {
+        console.error('saveMessage error:', err);
+        return callback?.({ ok: false, error: SEND_ERROR });
+      }
+      io.to(roomName).emit('room-message', msg);
 
       for (const [sid, u] of users) {
-        if (u.currentRoom !== user.currentRoom) {
+        if (u.currentRoom !== roomName) {
           if (!roomUnreads[u.username]) roomUnreads[u.username] = {};
-          const count = (roomUnreads[u.username][user.currentRoom] || 0) + 1;
-          roomUnreads[u.username][user.currentRoom] = count;
-          io.to(sid).emit('room-unread-update', { room: user.currentRoom, count });
+          const count = (roomUnreads[u.username][roomName] || 0) + 1;
+          roomUnreads[u.username][roomName] = count;
+          io.to(sid).emit('room-unread-update', { room: roomName, count });
         }
       }
 
       callback?.({ ok: true });
     });
 
-    socket.on('private-message', (data_, callback) => {
+    socket.on('private-message', async (data_, callback) => {
       const user = users.get(socket.id);
       if (!user) return;
 
       const recipient = data_?.recipient;
       const content = sanitizeContent(data_?.content);
       const file = sanitizeFile(data_?.file);
-      const reply = sanitizeReply(data_?.reply);
+      const reply = await buildReply(data_?.reply, m => !!m.recipient &&
+        ((m.sender === user.username && m.recipient === recipient) || (m.sender === recipient && m.recipient === user.username)));
       if (typeof recipient !== 'string' || !data.users.some(u => u.username === recipient) || (!content && !file)) return;
 
       const msg = {
-        id: Date.now() + Math.random(),
+        id: nextMessageId(),
         sender: user.username,
         displayName: user.displayName || user.username,
         avatar: user.avatar || null,
@@ -1189,9 +1316,12 @@ module.exports = (io, db) => {
         type: 'private'
       };
 
-      data.messages.push(msg);
-      saveMessage(msg).catch(err => console.error('saveMessage error:', err));
-
+      try {
+        await saveMessage(msg);
+      } catch (err) {
+        console.error('saveMessage error:', err);
+        return callback?.({ ok: false, error: SEND_ERROR });
+      }
       for (const [sid, u] of users) {
         if (u.username === recipient) {
           io.to(sid).emit('private-message', msg);
@@ -1203,73 +1333,28 @@ module.exports = (io, db) => {
       callback?.({ ok: true });
     });
 
-    socket.on('add-reaction', (data_, callback) => {
+    socket.on('add-reaction', async (data_, callback) => {
       const user = users.get(socket.id);
       if (!user) return callback?.({ ok: false });
 
       const { messageId, emoji } = data_ || {};
-      if (!messageId || !emoji) return;
+      if (!messageId || !REACTION_EMOJIS.has(emoji)) return callback?.({ ok: false, error: 'Reacción no válida' });
 
-      const msg = data.messages.find(m => m.id === messageId);
+      // Dos reacciones simultáneas al mismo mensaje no deben pisarse: cada una lee, cambia y guarda por turno.
+      const msg = await withMessageLock(messageId, async () => {
+        const m = await getMessage(messageId);
+        if (!m || !canSeeMessage(m, user)) return null;
+        toggleReaction(m, user.username, emoji);
+        await updateMessageReactions(m.id, m.reactions);
+        return m;
+      });
       if (!msg) return callback?.({ ok: false, error: 'Mensaje no encontrado' });
 
-      if (msg.room_name) {
-        const room = data.rooms.find(r => r.name === msg.room_name);
-        if (!room || !canViewRoom(room, user.department, user.role)) {
-          return callback?.({ ok: false, error: 'No tienes acceso a este mensaje' });
-        }
-      } else if (msg.group_id) {
-        if (!isGroupMember(msg.group_id, user.username)) {
-          return callback?.({ ok: false, error: 'No tienes acceso a este mensaje' });
-        }
-      } else if (msg.recipient) {
-        if (user.username !== msg.sender && user.username !== msg.recipient) {
-          return callback?.({ ok: false, error: 'No tienes acceso a este mensaje' });
-        }
-      }
-
-      if (!msg.reactions) msg.reactions = {};
-
-      let removed = false;
-      let prevEmoji = null;
-      // Check if user already has any reaction
-      for (const [e, usersList] of Object.entries(msg.reactions)) {
-        const idx = usersList.indexOf(user.username);
-        if (idx !== -1) {
-          prevEmoji = e;
-          if (e === emoji) {
-            // Same emoji → remove it
-            usersList.splice(idx, 1);
-            if (usersList.length === 0) delete msg.reactions[e];
-            removed = true;
-          }
-          break;
-        }
-      }
-
-      if (removed) {
-        // removed the reaction, nothing else to do
-      } else {
-        // Remove previous reaction if exists
-        if (prevEmoji && prevEmoji !== emoji) {
-          const usersList = msg.reactions[prevEmoji];
-          const idx = usersList.indexOf(user.username);
-          if (idx !== -1) {
-            usersList.splice(idx, 1);
-            if (usersList.length === 0) delete msg.reactions[prevEmoji];
-          }
-        }
-        // Add new reaction
-        if (!msg.reactions[emoji]) msg.reactions[emoji] = [];
-        msg.reactions[emoji].push(user.username);
-      }
-
-      updateMessageReactions(msg.id, msg.reactions).catch(err => console.error('updateMessageReactions error:', err));
-
-      // Broadcast the update to everyone who can see the message
+      // Se avisa a todos los que pueden ver el mensaje
       if (msg.room_name) {
         io.to(msg.room_name).emit('reaction-updated', msg);
       } else if (msg.group_id) {
+        if (lastGroupMessages.get(msg.group_id)?.id === msg.id) lastGroupMessages.set(msg.group_id, msg);
         for (const username of groupMemberUsernames(msg.group_id)) {
           emitToUsername(username, 'reaction-updated', msg);
         }
@@ -1288,7 +1373,7 @@ module.exports = (io, db) => {
       const user = users.get(socket.id);
       if (!user) return callback?.({ ok: false, error: 'No autenticado' });
 
-      const displayName = data_?.displayName?.trim();
+      const displayName = str(data_?.displayName).trim();
       if (!displayName) return callback?.({ ok: false, error: 'Nombre requerido' });
       if (displayName.length > 40) return callback?.({ ok: false, error: 'Maximo 40 caracteres' });
 
@@ -1340,7 +1425,8 @@ module.exports = (io, db) => {
       const user = users.get(socket.id);
       if (!user) return callback?.({ ok: false, error: 'No autenticado' });
 
-      const { currentPassword, newPassword } = data_ || {};
+      const currentPassword = str(data_?.currentPassword);
+      const newPassword = str(data_?.newPassword);
       if (!currentPassword) return callback?.({ ok: false, error: 'Contraseña actual requerida' });
       if (!newPassword || newPassword.length < 3) return callback?.({ ok: false, error: 'Mínimo 3 caracteres' });
 
@@ -1373,7 +1459,7 @@ module.exports = (io, db) => {
       const user = users.get(socket.id);
       if (!user) return;
 
-      const name = data_?.name?.trim()?.toLowerCase()?.replace(/\s+/g, '-');
+      const name = str(data_?.name).trim().toLowerCase().replace(/\s+/g, '-');
       if (!name) return callback?.({ ok: false, error: 'Nombre requerido' });
 
       if (!/^[a-z0-9-áéíóúüñ]+$/.test(name)) {
@@ -1384,7 +1470,7 @@ module.exports = (io, db) => {
         return callback?.({ ok: false, error: 'Esa sala ya existe' });
       }
 
-      const password = data_?.password?.trim() || null;
+      const password = str(data_?.password).trim() || null;
       const temporary = !!data_?.temporary;
 
       if (!temporary && user.role !== 'admin') {
@@ -1435,17 +1521,17 @@ module.exports = (io, db) => {
       callback?.(getAllRooms(user?.department, user?.role));
     });
 
-    socket.on('get-conversations', (callback) => {
+    socket.on('get-conversations', async (callback) => {
       const user = users.get(socket.id);
       if (!user) return;
-      callback?.(getConversations(user.username));
+      callback?.(await getConversations(user.username));
     });
 
     socket.on('search-users', (data_, callback) => {
       const user = users.get(socket.id);
       if (!user) return callback?.([]);
 
-      const query = (data_?.query || '').trim().toLowerCase();
+      const query = str(data_?.query).trim().toLowerCase();
       if (query.length < 2) return callback?.([]);
 
       const results = data.users
@@ -1678,7 +1764,11 @@ module.exports = (io, db) => {
         if (newEmail && emailInUse(newEmail, target.username)) return callback?.({ ok: false, error: 'Ese correo ya está registrado en otra cuenta' });
       }
 
-      if (displayName !== undefined) target.displayName = displayName;
+      if (displayName !== undefined) {
+        const cleanName = str(displayName).trim().slice(0, 40);
+        if (!cleanName) return callback?.({ ok: false, error: 'Nombre requerido' });
+        target.displayName = cleanName;
+      }
       if (role !== undefined && (role === 'admin' || role === 'user')) target.role = role;
       if (departments !== undefined) {
         const deptList = Array.isArray(departments) ? departments.filter(Boolean) : [];
@@ -1750,15 +1840,16 @@ module.exports = (io, db) => {
       if (roomName === 'general') return callback?.({ ok: false, error: 'No puedes eliminar la sala general' });
 
       const room = data.rooms[idx];
-      data.rooms.splice(idx, 1);
-      data.messages = data.messages.filter(m => m.room_name !== roomName);
       try {
+        const fileUrls = await getRoomFileUrls(roomName);
         await deleteRoom(roomName);
         await deleteMessagesByRoom(roomName);
+        fileUrls.forEach(deleteUploadedFile);
       } catch (err) {
         console.error('delete-room error:', err);
         return callback?.({ ok: false, error: 'Error al guardar en la base de datos' });
       }
+      data.rooms = data.rooms.filter(r => r !== room);
 
       emitToViewersOfRoom(room, 'room-deleted', { name: roomName });
       callback?.({ ok: true });
@@ -1775,7 +1866,7 @@ module.exports = (io, db) => {
       const room = data.rooms.find(r => r.name === name);
       if (!room) return callback?.({ ok: false, error: 'Sala no existe' });
 
-      room.password = password ? await hashPassword(String(password)) : null;
+      room.password = str(password) ? await hashPassword(str(password)) : null;
       try {
         await saveRoom(room);
       } catch (err) {
@@ -1787,7 +1878,7 @@ module.exports = (io, db) => {
       callback?.({ ok: true });
     });
 
-    socket.on('get-stats', (callback) => {
+    socket.on('get-stats', async (callback) => {
       const user = users.get(socket.id);
       if (!user || user.role !== 'admin') return;
       const byDepartment = data.departments.map(d => ({
@@ -1800,7 +1891,7 @@ module.exports = (io, db) => {
       callback({
         totalUsers: data.users.length,
         connectedUsers: users.size,
-        totalMessages: data.messages.length,
+        totalMessages: await countMessages(),
         totalRooms: data.rooms.length,
         departments: byDepartment
       });
@@ -1810,7 +1901,8 @@ module.exports = (io, db) => {
       const user = users.get(socket.id);
       if (!user || user.role !== 'admin') return callback?.({ ok: false, error: 'No autorizado' });
 
-      const { username, newPassword } = data_ || {};
+      const username = data_?.username;
+      const newPassword = str(data_?.newPassword);
       if (!username) return callback?.({ ok: false, error: 'Usuario requerido' });
       if (username === user.username) return callback?.({ ok: false, error: 'No puedes cambiar tu propia contraseña aquí' });
       if (!newPassword || newPassword.length < 3) return callback?.({ ok: false, error: 'Mínimo 3 caracteres' });
@@ -1931,8 +2023,8 @@ module.exports = (io, db) => {
       const user = users.get(socket.id);
       if (!user || user.role !== 'admin') return callback?.({ ok: false, error: 'No autorizado' });
 
-      const name = data_?.name?.trim()?.toLowerCase()?.replace(/\s+/g, '-');
-      const displayName = data_?.displayName?.trim() || name;
+      const name = str(data_?.name).trim().toLowerCase().replace(/\s+/g, '-');
+      const displayName = str(data_?.displayName).trim() || name;
       if (!name) return callback?.({ ok: false, error: 'Nombre requerido' });
       if (!/^[a-z0-9-áéíóúüñ]+$/.test(name)) {
         return callback?.({ ok: false, error: 'Solo letras, números y guiones' });
@@ -1995,21 +2087,19 @@ module.exports = (io, db) => {
       }
 
       const deptRooms = data.rooms.filter(r => r.department === name);
+      const deptFileUrls = [];
+      try {
+        for (const room of deptRooms) deptFileUrls.push(...await getRoomFileUrls(room.name));
+      } catch (err) {
+        console.error('admin-delete-department error:', err);
+        return callback?.({ ok: false, error: 'Error al consultar la base de datos' });
+      }
       for (const room of deptRooms) {
-        const roomMessages = data.messages.filter(m => m.room_name === room.name);
-        for (const m of roomMessages) {
-          if (m.file?.url && m.file.url.startsWith('/uploads/')) {
-            const filename = path.basename(m.file.url);
-            const filePath = path.join(__dirname, 'uploads', filename);
-            try { fs.unlinkSync(filePath); } catch {}
-          }
-        }
-        data.messages = data.messages.filter(m => m.room_name !== room.name);
         emitToViewersOfRoom(room, 'room-deleted', { name: room.name });
         roomUsers.delete(room.name);
       }
       data.rooms = data.rooms.filter(r => r.department !== name);
-      data.departments.splice(idx, 1);
+      data.departments = data.departments.filter(d => d.name !== name);
 
       try {
         for (const room of deptRooms) {
@@ -2017,6 +2107,7 @@ module.exports = (io, db) => {
           await deleteRoom(room.name);
         }
         await deleteDepartment(name);
+        deptFileUrls.forEach(deleteUploadedFile);
       } catch (err) {
         console.error('admin-delete-department error:', err);
         return callback?.({ ok: false, error: 'Error al guardar en la base de datos' });
@@ -2063,6 +2154,49 @@ module.exports = (io, db) => {
       sendPanicAlertEmail(payload).catch(err => console.error('sendPanicAlertEmail error:', err));
     });
 
+    socket.on('get-error-log', async (data_, callback) => {
+      const user = users.get(socket.id);
+      if (!user || user.role !== 'admin') return callback?.({ ok: false, errors: [], hasMore: false, pendingCount: 0 });
+      const offset = Math.max(0, Math.floor(Number(data_?.offset) || 0));
+      const rows = await getErrorLog(ERROR_LOG_PAGE_SIZE + 1, offset, !!data_?.onlyPending);
+      callback?.({
+        ok: true,
+        errors: rows.slice(0, ERROR_LOG_PAGE_SIZE),
+        hasMore: rows.length > ERROR_LOG_PAGE_SIZE,
+        pendingCount: await countPendingErrors()
+      });
+    });
+
+    socket.on('get-error-count', async (callback) => {
+      const user = users.get(socket.id);
+      if (!user || user.role !== 'admin') return callback?.({ pendingCount: 0 });
+      callback?.({ pendingCount: await countPendingErrors() });
+    });
+
+    socket.on('admin-resolve-error', async (data_, callback) => {
+      const user = users.get(socket.id);
+      if (!user || user.role !== 'admin') return callback?.({ ok: false, error: 'No autorizado' });
+      const id = Number(data_?.id);
+      if (!Number.isInteger(id)) return callback?.({ ok: false, error: 'Error no válido' });
+      await setErrorResolved(id, !!data_?.resolved, user.username);
+      callback?.({ ok: true, pendingCount: await countPendingErrors() });
+    });
+
+    socket.on('client-error', (data_) => {
+      const user = users.get(socket.id);
+      if (!user || !errorLog) return;
+      const now = Date.now();
+      socket.clientErrorTimes = (socket.clientErrorTimes || []).filter(t => now - t < 60000);
+      if (socket.clientErrorTimes.length >= CLIENT_ERROR_MAX_PER_MIN) return;
+      socket.clientErrorTimes.push(now);
+      const message = str(data_?.message).slice(0, 1000) || 'Error desconocido';
+      const where = str(data_?.where).slice(0, 300);
+      const err = new Error(message);
+      err.stack = [str(data_?.stack).slice(0, 4000), where && 'en ' + where, 'Navegador: ' + str(socket.handshake.headers?.['user-agent']).slice(0, 200)]
+        .filter(Boolean).join('\n');
+      errorLog.report(err, { source: 'navegador', username: user.username });
+    });
+
     socket.on('get-alert-history', async (data_, callback) => {
       const user = users.get(socket.id);
       if (!user || user.role !== 'admin') return callback?.({ alerts: [], hasMore: false });
@@ -2083,7 +2217,7 @@ module.exports = (io, db) => {
       const user = users.get(socket.id);
       if (!user) return;
 
-      const location = data_?.location?.trim() || '';
+      const location = str(data_?.location).trim();
       if (location.length > 100) {
         return callback?.({ ok: false, error: 'Máximo 100 caracteres' });
       }
@@ -2275,7 +2409,7 @@ module.exports = (io, db) => {
       callback?.({ ok: true });
     });
 
-    socket.on('group-message', (data_, callback) => {
+    socket.on('group-message', async (data_, callback) => {
       const user = users.get(socket.id);
       if (!user) return;
       const group = findGroup(data_?.groupId);
@@ -2283,11 +2417,11 @@ module.exports = (io, db) => {
 
       const content = sanitizeContent(data_?.content);
       const file = sanitizeFile(data_?.file);
-      const reply = sanitizeReply(data_?.reply);
+      const reply = await buildReply(data_?.reply, m => m.group_id === group.id);
       if (!content && !file) return;
 
       const msg = {
-        id: Date.now() + Math.random(),
+        id: nextMessageId(),
         group_id: group.id,
         sender: user.username,
         displayName: user.displayName || user.username,
@@ -2300,53 +2434,58 @@ module.exports = (io, db) => {
         type: 'group'
       };
 
-      data.messages.push(msg);
-      saveMessage(msg).catch(err => console.error('saveMessage error:', err));
+      try {
+        await saveMessage(msg);
+      } catch (err) {
+        console.error('saveMessage error:', err);
+        return callback?.({ ok: false, error: SEND_ERROR });
+      }
+      rememberGroupMessage(msg);
       for (const username of groupMemberUsernames(group.id)) {
         emitToUsername(username, 'group-message', msg);
       }
       callback?.({ ok: true });
     });
 
-    socket.on('get-group-history', (data_, callback) => {
+    socket.on('get-group-history', async (data_, callback) => {
       const user = users.get(socket.id);
       if (!user) return;
       const groupId = data_?.groupId;
       if (!isGroupMember(groupId, user.username)) return callback?.({ ok: false, error: 'No perteneces a este grupo' });
-      const page = getGroupHistory(groupId);
+      const page = await getGroupHistory(groupId);
       callback?.({ ok: true, history: page.messages, hasMoreHistory: page.hasMore });
     });
 
-    socket.on('get-private-history', (data_, callback) => {
+    socket.on('get-private-history', async (data_, callback) => {
       const user = users.get(socket.id);
       if (!user) return;
 
       const other = data_?.with;
       if (!other) return;
 
-      const page = getPrivateHistory(user.username, other);
+      const page = await getPrivateHistory(user.username, other);
       callback?.({ history: page.messages, hasMoreHistory: page.hasMore });
     });
 
-    socket.on('get-more-messages', (data_, callback) => {
+    socket.on('get-more-messages', async (data_, callback) => {
       const user = users.get(socket.id);
       if (!user) return callback?.({ messages: [], hasMore: false });
 
       const { room, with: withUser, group: groupId, beforeId } = data_ || {};
       if (groupId) {
         if (!isGroupMember(groupId, user.username)) return callback?.({ messages: [], hasMore: false });
-        const page = getGroupHistory(groupId, beforeId);
+        const page = await getGroupHistory(groupId, beforeId);
         return callback?.({ messages: page.messages, hasMore: page.hasMore });
       }
       if (room) {
         if (room !== user.currentRoom) {
           return callback?.({ messages: [], hasMore: false });
         }
-        const page = getRoomHistory(room, beforeId);
+        const page = await getRoomHistory(room, beforeId);
         return callback?.({ messages: page.messages, hasMore: page.hasMore });
       }
       if (withUser) {
-        const page = getPrivateHistory(user.username, withUser, beforeId);
+        const page = await getPrivateHistory(user.username, withUser, beforeId);
         return callback?.({ messages: page.messages, hasMore: page.hasMore });
       }
       callback?.({ messages: [], hasMore: false });
@@ -2379,6 +2518,8 @@ module.exports = (io, db) => {
       users.delete(socket.id);
       broadcastAllUsers();
       notifyFriendsOfStatusChange(user.username);
+
+      if (user.sessionHash && !user.sessionRemember) scheduleSessionClose(user.sessionHash);
 
       if (oldRoom) {
         cleanupTemporaryRoom(oldRoom).catch(err => console.error('cleanupTemporaryRoom error:', err));

@@ -209,7 +209,7 @@ Cada receptor ve un modal + sonido indicando quién solicita asistencia, su depa
 
 ## Panel de Administración
 
-Los usuarios con rol **admin** ven un ícono ⚙ adicional en la barra lateral. Al entrar, el panel ocupa toda el área principal del chat (no un sidebar angosto) y se organiza en sub-pestañas: **Resumen**, **Departamentos**, **Usuarios**, **Salas** y **Alertas**.
+Los usuarios con rol **admin** ven un ícono ⚙ adicional en la barra lateral. Al entrar, el panel ocupa toda el área principal del chat (no un sidebar angosto) y se organiza en sub-pestañas: **Resumen**, **Departamentos**, **Usuarios**, **Salas**, **Alertas** y **Errores**.
 
 ### Resumen
 
@@ -246,6 +246,23 @@ Las salas temporales se eliminan automáticamente al quedar vacías. Al crear un
 
 Historial completo de activaciones del botón de pánico, del más reciente al más antiguo: quién la activó, su departamento, su ubicación y la fecha/hora exacta. Carga de a 50 registros con un botón "Cargar más". El registro es permanente — queda ahí aunque después se elimine la cuenta del usuario.
 
+### Errores
+
+Registro de los errores del sistema, para que los administradores puedan avisar a los desarrolladores qué pasó. La sub-pestaña muestra un contador rojo con los errores pendientes, que se actualiza solo cuando aparece uno nuevo.
+
+**Qué se registra** (tabla `error_log`):
+- Errores del servidor: fallas de la base de datos o del correo, eventos que fallan (con el usuario que lo estaba usando), errores en la subida/descarga de archivos.
+- Errores en el navegador de los usuarios con sesión (con el usuario y el navegador que usaba). Máximo 10 por usuario por minuto.
+- Un error no previsto que termine el proceso del servidor también queda registrado antes de cerrarse.
+
+**Qué puede hacer el administrador** en cada error:
+- **Ver detalle** (▾): origen, mensaje, usuario, fechas, cuántas veces ocurrió y el detalle técnico para los desarrolladores.
+- **Copiar** (📋): copia ese resumen listo para pegar en un correo o mensaje.
+- **Marcar revisado** (✓): queda registrado quién lo revisó. Si el error vuelve a ocurrir, regresa a pendientes.
+- El filtro **"Solo pendientes"** (marcado por defecto) se puede quitar para ver también los revisados.
+
+**Para no llenar la base:** el mismo error repetido dentro de 10 minutos suma ocurrencias en una sola fila ("50 veces") en vez de crear filas nuevas, y los errores revisados se borran solos a los 90 días. Si la base de datos no responde, los errores se guardan en memoria y se reintentan cada minuto (siguen apareciendo también en la consola del servidor).
+
 ## Aprobación de cuentas nuevas
 
 Desde que se agregó este flujo, **crear una cuenta ya no da acceso inmediato al chat**:
@@ -256,6 +273,8 @@ Desde que se agregó este flujo, **crear una cuenta ya no da acceso inmediato al
 4. El administrador entra a **Admin → Usuarios**, **revisa el correo con que se registró** (se muestra en la solicitud) y acepta ✓ o rechaza ✗.
    - **Aceptada:** el usuario ya puede entrar al chat. En su primer ingreso activa el doble factor con un código enviado a ese correo. El admin le asigna su(s) departamento(s) desde el mismo panel (editar usuario → checkboxes de departamentos).
    - **Rechazada:** el usuario no puede entrar ("Tu solicitud de cuenta fue rechazada. Contacta a un administrador."). La cuenta queda marcada como rechazada (no se borra sola); el admin puede eliminarla del todo si quiere.
+
+**Límites para evitar solicitudes falsas:** máximo **5 registros por hora desde un mismo equipo** (IP) y como máximo **150 solicitudes pendientes** en total. Pasado cualquiera de los dos, el registro responde "Inténtalo más tarde" hasta que pase la hora o un administrador apruebe/rechace solicitudes.
 
 Las cuentas que ya existían antes de este cambio no se vieron afectadas — quedaron activas automáticamente.
 
@@ -301,7 +320,7 @@ Reglas:
 
 Después de ingresar (contraseña + código), el navegador recibe un **token de sesión**. Con él puede recargar la página sin volver a pedir contraseña ni código. **El navegador nunca guarda la contraseña.**
 
-- **Por defecto** la sesión dura mientras la pestaña esté abierta (máximo 12 horas). Al cerrar la pestaña o el navegador, hay que volver a ingresar.
+- **Por defecto** la sesión dura mientras la pestaña esté abierta (máximo 12 horas). Al cerrar la pestaña o el navegador, hay que volver a ingresar: si la conexión no se retoma en 60 segundos (lo que tarda de sobra una recarga), el servidor borra la sesión, aunque el navegador restaure la pestaña.
 - **"Recordar este equipo por 7 días"** (casilla en la pantalla del código): la sesión sobrevive a cerrar el navegador. No marcarla en computadores compartidos.
 - Al reanudar, entra directo al último departamento usado.
 - Si se reinicia el servidor o se corta la red, la página se recarga sola al volver la conexión y reingresa con la sesión.
@@ -347,6 +366,13 @@ Conversaciones privadas entre varias personas elegidas — a diferencia de las s
   - Los bloqueos viven en memoria: reiniciar el servidor los borra. El admin puede desbloquear antes a alguien poniéndole una contraseña nueva.
 - **Contenido de los mensajes:** el servidor solo acepta archivos subidos a este mismo servidor (`/uploads/...`) y valida respuestas, avatares y largo del texto. La interfaz escapa todo lo que escriben los usuarios (incluidas comillas) antes de mostrarlo.
 - **Archivos subidos:** se sirven aislados (`Content-Security-Policy: sandbox`, `nosniff`) para que un `.html` o `.svg` no pueda ejecutar código en el sitio. Solo imágenes, audio, video y PDF se abren en el navegador; el resto se descarga.
+  - **Solo con sesión:** al ingresar, el navegador canjea su autorización por una cookie (`HttpOnly`, solo para `/uploads`). Sin sesión, abrir el enlace de un archivo responde "Debes iniciar sesión". La autorización deja de valer al desconectarse, al ser bloqueado o eliminado. El navegador no guarda copia de los archivos (útil en equipos compartidos).
+  - **Subida:** la autorización va en la cabecera `X-Upload-Token` y se revisa **antes** de recibir el archivo, así nadie sin sesión puede escribir en el disco del servidor.
+  - Al eliminar una sala (temporal o fija), un grupo o un departamento, sus archivos también se borran del disco.
+- **Datos mal formados:** el servidor valida el tipo de cada dato que recibe, y un error dentro de cualquier evento se registra (ver [Errores](#errores)) sin botar el servidor ni desconectar a los demás.
+- **Reacciones:** solo se aceptan los emojis que ofrece el selector del chat.
+- **Citas (responder un mensaje):** el texto citado lo arma el servidor a partir del mensaje original, y solo si es de la misma conversación. Nadie puede atribuirle a otro un texto que no escribió.
+- **Mensajes:** se guardan primero en la base y solo después se envían a los demás. Si la base falla, nadie lo recibe y quien lo envió ve "No se pudo enviar el mensaje" (el texto vuelve al cuadro para no perderlo).
 
 ## Notificaciones no leídas
 
@@ -359,6 +385,8 @@ Conversaciones privadas entre varias personas elegidas — a diferencia de las s
 ## Historial de mensajes
 
 Al entrar a una sala, abrir un privado o abrir un grupo se cargan solo los últimos 50 mensajes (no la conversación completa). Al subir el scroll hasta el tope se piden automáticamente los 50 anteriores, manteniendo la posición sin saltar — igual que WhatsApp o Slack. Cuando llegas al principio real de la conversación aparece el aviso "Inicio de la conversación". Esto evita que una sala con mucho historial sea lenta de cargar.
+
+El servidor tampoco guarda el historial en memoria: cada página de 50 mensajes se pide a MySQL en el momento (con índices por sala, grupo y conversación privada), así el arranque y el uso de memoria no crecen con los años de mensajes. En memoria solo queda el último mensaje de cada grupo, para la lista de grupos. El orden de los mensajes lo da su `id` (marca de tiempo que siempre crece, aunque lleguen dos en el mismo milisegundo).
 
 ## Cumplimiento Legal (Chile)
 
@@ -404,7 +432,7 @@ Cada aceptación de TyC queda registrada en la base de datos con:
 
 ## Persistencia de datos
 
-- **MySQL**: base de datos (ver "Configuración de MySQL" arriba) con las tablas `users`, `rooms`, `messages`, `departments`, `friends`, `alerts`, `consent_log`, `chat_groups`, `group_members` y `sessions`. Las columnas y tablas nuevas (correo y doble factor en `users`, grupos) se agregan solas al iniciar el servidor, sin perder datos. Cada acción (mensaje, reacción, cambio de nombre, etc.) escribe solo la fila que cambió — no se reescribe la base completa en cada operación.
+- **MySQL**: base de datos (ver "Configuración de MySQL" arriba) con las tablas `users`, `rooms`, `messages`, `departments`, `friends`, `alerts`, `consent_log`, `chat_groups`, `group_members`, `sessions` y `error_log`. Las columnas, tablas e índices nuevos (correo y doble factor en `users`, grupos, registro de errores, índices del historial) se agregan solos al iniciar el servidor, sin perder datos. Cada acción (mensaje, reacción, cambio de nombre, etc.) escribe solo la fila que cambió — no se reescribe la base completa en cada operación.
 - Los archivos adjuntos se guardan en `uploads/`
 - El certificado SSL se guarda en `certs/` (se genera automáticamente al iniciar con la IP actual)
 - Si la base de datos está vacía, se crea automáticamente con los datos por defecto (usuario `admin` y sala `general`) al iniciar
@@ -418,6 +446,7 @@ chat-cormudesi/
 ├── passwords.js          # Hash y verificación de contraseñas (scrypt con sal)
 ├── socket-handler.js     # Eventos de Socket.IO (login + doble factor, salas, privados, grupos, admin)
 ├── mailer.js             # Envío de correo: códigos de acceso y botón de alerta (nodemailer)
+├── error-log.js          # Registro de errores del sistema en la base (panel Admin → Errores)
 ├── migrate-to-mysql.js   # Migración única desde una instalación anterior con SQLite
 ├── .env                  # Configuración de MySQL y correo (no se sube a git)
 ├── .env.example          # Plantilla de .env

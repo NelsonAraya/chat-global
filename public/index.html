@@ -413,6 +413,7 @@
               <button class="admin-subtab" data-admin-tab="usuarios"><i class="fas fa-users"></i> Usuarios</button>
               <button class="admin-subtab" data-admin-tab="salas"><i class="fas fa-hashtag"></i> Salas</button>
               <button class="admin-subtab" data-admin-tab="alertas"><i class="fas fa-triangle-exclamation"></i> Alertas</button>
+              <button class="admin-subtab" data-admin-tab="errores"><i class="fas fa-bug"></i> Errores <span id="admin-errors-badge" class="admin-count-badge hidden">0</span></button>
             </div>
           </div>
           <div id="admin-view-body">
@@ -472,6 +473,22 @@
                 </div>
               </div>
               <div id="admin-rooms-list" class="admin-table"></div>
+            </div>
+
+            <div id="admin-subtab-errores" class="admin-subtab-panel hidden">
+              <div class="admin-section-toolbar">
+                <label class="admin-errors-filter">
+                  <input type="checkbox" id="admin-errors-only-pending" checked /> Solo pendientes
+                </label>
+                <button id="admin-errors-refresh" class="btn-secondary"><i class="fas fa-rotate"></i> Actualizar</button>
+              </div>
+              <p class="admin-errors-hint">Errores del servidor y de los navegadores. Usa <strong>Copiar</strong> para enviar el detalle a los desarrolladores y <strong>Marcar revisado</strong> cuando ya esté informado.</p>
+              <div id="admin-errors-list" class="admin-table"></div>
+              <div style="text-align:center; margin-top:14px;">
+                <button id="admin-errors-load-more" class="btn-secondary hidden">
+                  <i class="fas fa-chevron-down"></i> Cargar más
+                </button>
+              </div>
             </div>
 
             <div id="admin-subtab-alertas" class="admin-subtab-panel hidden">

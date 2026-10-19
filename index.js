@@ -32,7 +32,15 @@ const upload = multer({
 
 let socketHandlers = null;
 
+// La autorización se revisa ANTES de recibir el archivo (va en la cabecera X-Upload-Token): así nadie sin
+// sesión puede escribir en el disco del servidor.
 app.post('/api/upload', (req, res, next) => {
+  const token = req.get('X-Upload-Token');
+  if (!token || !socketHandlers || !socketHandlers.isValidUploadToken(token)) {
+    return res.status(401).json({ error: 'No autorizado' });
+  }
+  next();
+}, (req, res, next) => {
   upload.single('file')(req, res, (err) => {
     if (err instanceof multer.MulterError && err.code === 'LIMIT_FILE_SIZE') {
       return res.status(413).json({ error: 'El archivo es demasiado grande (máximo 2 MB)' });
@@ -44,17 +52,42 @@ app.post('/api/upload', (req, res, next) => {
   if (!req.file) {
     return res.status(400).json({ error: 'No se recibió archivo' });
   }
-  const token = req.body?.token;
-  if (!token || !socketHandlers || !socketHandlers.isValidUploadToken(token)) {
-    try { fs.unlinkSync(req.file.path); } catch {}
-    return res.status(401).json({ error: 'No autorizado' });
-  }
   res.json({
     url: '/uploads/' + req.file.filename,
     name: req.file.originalname,
     size: req.file.size,
     type: req.file.mimetype
   });
+});
+
+// Los archivos subidos solo los ven usuarios con sesión abierta en el chat. Como <img>, <audio> y los
+// enlaces no pueden mandar el token, tras ingresar el navegador lo canjea por una cookie (HttpOnly, solo
+// para /uploads). El token deja de valer al desconectarse, al bloquear o al eliminar al usuario.
+const FILE_COOKIE = 'chat_files';
+const readCookie = (req, name) => {
+  for (const part of (req.headers.cookie || '').split(';')) {
+    const [k, ...v] = part.trim().split('=');
+    if (k === name) return decodeURIComponent(v.join('='));
+  }
+  return null;
+};
+
+app.post('/api/file-access', express.json({ limit: '1kb' }), (req, res) => {
+  const token = typeof req.body?.token === 'string' ? req.body.token : '';
+  if (!token || !socketHandlers || !socketHandlers.isValidUploadToken(token)) {
+    return res.status(401).json({ error: 'No autorizado' });
+  }
+  res.setHeader('Set-Cookie', `${FILE_COOKIE}=${encodeURIComponent(token)}; Path=/uploads; HttpOnly; Secure; SameSite=Strict`);
+  res.json({ ok: true });
+});
+
+app.use('/uploads', (req, res, next) => {
+  const token = readCookie(req, FILE_COOKIE);
+  if (!token || !socketHandlers || !socketHandlers.isValidUploadToken(token)) {
+    return res.status(401).send('Debes iniciar sesión en el chat para ver este archivo.');
+  }
+  res.setHeader('Cache-Control', 'private, no-store');
+  next();
 });
 
 // Los archivos subidos nunca deben ejecutar código en el sitio (p. ej. un .html o .svg con scripts):
@@ -102,6 +135,15 @@ const getLocalIP = () => {
 
 const start = async () => {
   const db = await dbPromise;
+  // Desde aquí, todo error del sistema queda guardado en la base y se ve en el panel de administración.
+  const errorLog = require('./error-log')(db);
+
+  // Errores en las rutas web (subida de archivos, descargas, etc.): se registran y se responde un error genérico.
+  app.use((err, req, res, next) => {
+    errorLog.report(err, { source: 'web ' + req.method + ' ' + req.path });
+    if (res.headersSent) return next(err);
+    res.status(500).json({ error: 'Error interno del servidor' });
+  });
 
   const CERTS_DIR = path.join(__dirname, 'certs');
   const KEY_PATH = path.join(CERTS_DIR, 'key.pem');
@@ -174,7 +216,7 @@ const start = async () => {
   const io = new Server();
   io.attach(httpsServer);
 
-  socketHandlers = require('./socket-handler')(io, db);
+  socketHandlers = require('./socket-handler')(io, db, errorLog);
 
   // Servidor HTTP: solo redirige a HTTPS
   const httpServer = http.createServer((req, res) => {

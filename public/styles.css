@@ -3099,3 +3099,88 @@ a.cert-btn:hover {
     max-width: none;
   }
 }
+
+/* ===== Panel de administración: registro de errores ===== */
+.admin-count-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 6px;
+  border-radius: 9px;
+  background: var(--color-danger);
+  color: white;
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.admin-errors-filter {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  color: var(--text-primary);
+  cursor: pointer;
+}
+
+.admin-errors-hint {
+  font-size: 12px;
+  color: var(--text-muted);
+  margin: -6px 0 12px;
+}
+
+.admin-error-item {
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--border-color);
+}
+
+.admin-error-item:last-child {
+  border-bottom: none;
+}
+
+.admin-error-item.resolved {
+  opacity: 0.6;
+}
+
+.admin-error-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+}
+
+.admin-error-message {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-primary);
+  word-break: break-word;
+  margin-bottom: 4px;
+}
+
+.admin-error-status {
+  display: inline-block;
+  margin-top: 4px;
+  font-size: 11px;
+  color: var(--color-success);
+}
+
+.admin-error-actions {
+  display: flex;
+  gap: 4px;
+  flex-shrink: 0;
+}
+
+.admin-error-stack {
+  margin: 10px 0 0;
+  padding: 10px 12px;
+  max-height: 260px;
+  overflow: auto;
+  background: var(--bg-input);
+  border-radius: 6px;
+  font-family: Consolas, 'Courier New', monospace;
+  font-size: 11px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--text-primary);
+}
