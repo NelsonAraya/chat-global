@@ -23,6 +23,9 @@ const WEB_MODE = process.env.MODO_WEB === 'true';
 const DOMAIN = (process.env.DOMINIO || '').trim().toLowerCase();
 const WEB_HOST = process.env.WEB_HOST || '127.0.0.1';
 const WEB_PORT = Number(process.env.WEB_PORT) || 3000;
+// Conexiones que esperan ser atendidas. Si se reinicia el servidor, los ~2000 navegadores vuelven casi a la vez
+// (hasta 6 conexiones cada uno): con la cola por defecto (511) parte de ellas se rechazaba ("No se puede acceder").
+const LISTEN_BACKLOG = 4096;
 
 // ¿La conexión viene del propio sitio? Los navegadores mandan la cabecera Origin; los programas que no son
 // navegador no la mandan y se aceptan (igual deben iniciar sesión). En la web se compara con DOMINIO; si no,
@@ -41,7 +44,7 @@ const isAllowedOrigin = (req) => {
 const app = express();
 app.disable('x-powered-by');
 
-// Comprime las respuestas (app.js, estilos, HTML): con 2000 equipos entrando a la vez se envía ~4 veces menos.
+// Comprime las respuestas (scripts, estilos, HTML): con 2000 equipos entrando a la vez se envía ~4 veces menos.
 app.use(compression());
 
 // Cabeceras de seguridad de la página. Los archivos subidos (/uploads) llevan su propia política, más estricta.
@@ -67,9 +70,22 @@ app.use((req, res, next) => {
   next();
 });
 
-// Los navegadores siempre preguntan si hay una versión nueva (ETag): una recarga trae solo lo que cambió.
-app.use(express.static(path.join(__dirname, 'public'), {
-  setHeaders: (res) => res.setHeader('Cache-Control', 'no-cache')
+// La página (index.html) siempre se revisa con el servidor. Los scripts, estilos e imágenes que nombra llevan su
+// versión en la dirección (?v=<huella del contenido>) y el navegador los guarda un año sin volver a preguntar: al
+// cambiar un archivo cambia su huella y se baja el nuevo. Así una recarga pide 1 o 2 archivos en vez de ~27, lo que
+// importa cuando los ~2000 navegadores recargan a la vez tras reiniciar el servidor.
+// Las huellas se calculan al arrancar: si se modifica algo en public/, hay que reiniciar el chat.
+const PUBLIC_DIR = path.join(__dirname, 'public');
+const fileVersion = (file) => crypto.createHash('sha256').update(fs.readFileSync(path.join(PUBLIC_DIR, file))).digest('hex').slice(0, 12);
+const INDEX_HTML = fs.readFileSync(path.join(PUBLIC_DIR, 'index.html'), 'utf8')
+  .replace(/(src|href)="((?:js|img)\/[\w.-]+|[\w.-]+\.css)"/g, (m, attr, file) => `${attr}="${file}?v=${fileVersion(file)}"`);
+app.get(['/', '/index.html'], (req, res) => {
+  res.setHeader('Cache-Control', 'no-cache');
+  res.type('html').send(INDEX_HTML);
+});
+app.use(express.static(PUBLIC_DIR, {
+  index: false,
+  setHeaders: (res) => res.setHeader('Cache-Control', res.req.query.v ? 'public, max-age=31536000, immutable' : 'no-cache')
 }));
 
 const UPLOADS_DIR = path.join(__dirname, 'uploads');
@@ -104,6 +120,9 @@ app.post('/api/upload', (req, res, next) => {
   if (!token || !socketHandlers || !socketHandlers.isValidUploadToken(token)) {
     return res.status(401).json({ error: 'No autorizado' });
   }
+  if (!socketHandlers.canUpload(token)) {
+    return res.status(429).json({ error: socketHandlers.UPLOAD_LIMIT_ERROR });
+  }
   next();
 }, (req, res, next) => {
   upload.single('file')(req, res, (err) => {
@@ -123,7 +142,7 @@ app.post('/api/upload', (req, res, next) => {
     size: req.file.size,
     type: req.file.mimetype
   };
-  // Queda registrado a nombre de quien lo subió: solo esa persona puede adjuntarlo (ver socket-handler.js).
+  // Queda registrado a nombre de quien lo subió: solo esa persona puede adjuntarlo (ver socket/uploads.js).
   if (!socketHandlers.registerUpload(req.get('X-Upload-Token'), fileInfo)) {
     fs.promises.unlink(req.file.path).catch(() => {});
     return res.status(401).json({ error: 'No autorizado' });
@@ -229,7 +248,7 @@ const start = async () => {
     const webServer = http.createServer(app);
     io.attach(webServer);
     socketHandlers = require('./socket-handler')(io, db, errorLog);
-    webServer.listen(WEB_PORT, WEB_HOST, () => {
+    webServer.listen(WEB_PORT, WEB_HOST, LISTEN_BACKLOG, () => {
       console.log(`[WEB] Chat escuchando en http://${WEB_HOST}:${WEB_PORT}` + (DOMAIN ? ` (publicado por Nginx en https://${DOMAIN})` : ''));
       if (!DOMAIN) console.warn('[WEB] Falta DOMINIO en .env: se aceptan conexiones del mismo sitio por el que se entra.');
     });
@@ -315,7 +334,7 @@ const start = async () => {
     res.end();
   });
 
-  httpServer.listen(HTTP_PORT, '0.0.0.0', () => {
+  httpServer.listen(HTTP_PORT, '0.0.0.0', LISTEN_BACKLOG, () => {
     const ip = getLocalIP();
     console.log('');
     console.log('╔══════════════════════════════════════════════════╗');
@@ -331,7 +350,7 @@ const start = async () => {
     console.log('');
   });
 
-  httpsServer.listen(HTTPS_PORT, '0.0.0.0', () => {
+  httpsServer.listen(HTTPS_PORT, '0.0.0.0', LISTEN_BACKLOG, () => {
     const ip = getLocalIP();
     console.log(`[HTTPS] Seguro: https://${ip}:${HTTPS_PORT}`);
   });

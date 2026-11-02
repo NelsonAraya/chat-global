@@ -255,7 +255,8 @@ MODO_WEB=true
 DOMINIO=aurora.cormudesi.cl            # igual al server_name de Nginx
 WEB_PORT=3000
 
-# Cuenta admin (solo se usa al crearla, la primera vez)
+# Cuenta admin (obligatorias). La contraseña se usa al crearla, o si la base trae admin/admin.
+# El correo es donde admin recibe su código de acceso (se asigna si admin aún no tiene correo).
 ADMIN_PASSWORD_INICIAL=<contraseña larga, 8 caracteres o más>
 ADMIN_EMAIL_INICIAL=<correo del administrador>
 
@@ -299,8 +300,9 @@ Errores habituales al arrancar:
 | `Access denied for user` | Usuario o contraseña de MySQL mal en `.env` | Revisar `DB_USER` / `DB_PASSWORD` |
 | `CREATE command denied` / `Access denied ... to database` | El usuario no tiene permiso sobre la base | `GRANT ALL PRIVILEGES ON chat_cormudesi.* TO 'chat'@'localhost';` |
 | `ECONNREFUSED` | No encuentra MySQL | `DB_HOST=localhost`, `DB_PORT=3306` |
-| `define ADMIN_PASSWORD_INICIAL` | Falta la contraseña inicial de admin | Agregarla en `.env` (8 caracteres o más). Las tablas sí alcanzan a crearse |
-| `la cuenta admin todavía tiene la contraseña "admin"` | La base viene de una instalación en red local | Cambiar la contraseña de admin (desde el chat en red local) antes de usar el modo web |
+| `define en .env: ADMIN_PASSWORD_INICIAL` | Falta la contraseña inicial de admin | Agregarla en `.env` (8 caracteres o más). Las tablas sí alcanzan a crearse |
+| `define en .env: ... ADMIN_EMAIL_INICIAL` | La cuenta admin no tiene correo para el código de acceso | Agregar `ADMIN_EMAIL_INICIAL=<correo del administrador>` en `.env` |
+| `la cuenta admin todavía tiene la contraseña "admin"` | La base viene de una instalación anterior con admin/admin | Definir `ADMIN_PASSWORD_INICIAL` en `.env` (8 caracteres o más) y volver a iniciar: se usa como la nueva contraseña de admin |
 | `EADDRINUSE ... 3000` | Otro programa usa el puerto 3000 | Cambiar `WEB_PORT` y los `proxy_pass` de Nginx |
 
 Si la página carga pero el chat **no conecta**, revisar que `DOMINIO` en `.env` sea igual al `server_name` de Nginx.
@@ -386,6 +388,7 @@ pm2 restart chat
 - [ ] `pm2 status` muestra `chat` en `online`, y `pm2 logs chat` la línea `[WEB] ...` sin errores.
 - [ ] `https://aurora.cormudesi.cl` carga con candado, **sin** el aviso "Descargar certificado".
 - [ ] Ingresar como `admin`: llega el código al correo de `ADMIN_EMAIL_INICIAL`. Cambiar la contraseña inicial.
+- [ ] Crear una cuenta de prueba: pide contraseña de 8 caracteres o más y queda pendiente hasta aprobarla en Admin → Usuarios.
 - [ ] Desde fuera del servidor, el puerto 3000 y el 3306 **no** responden.
 - [ ] Enviar un mensaje y un archivo; activar la alerta y ver que llega el correo con la hora correcta.
 - [ ] Los otros sistemas siguen funcionando igual que antes.

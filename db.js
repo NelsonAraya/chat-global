@@ -205,20 +205,35 @@ module.exports = (async () => {
   // si se indica, ADMIN_EMAIL_INICIAL (el código de doble factor llega ahí y nadie más puede elegir el correo).
   // En la web no se acepta la contraseña "admin": sería lo primero que alguien probaría.
   const webMode = process.env.MODO_WEB === 'true';
-  const [[adminRow]] = await pool.query("SELECT password FROM users WHERE username = 'admin'");
+  // En la web también es obligatorio ADMIN_EMAIL_INICIAL: una cuenta sin correo elige el suyo al ingresar, así
+  // que quien adivinara la contraseña de admin pondría su propio correo y recibiría el código.
+  const [[adminRow]] = await pool.query("SELECT password, email FROM users WHERE username = 'admin'");
+  const initialEmail = (process.env.ADMIN_EMAIL_INICIAL || '').trim().toLowerCase() || null;
+  const missing = [];
+  if (webMode && !adminRow && (process.env.ADMIN_PASSWORD_INICIAL || '').length < 8) missing.push('ADMIN_PASSWORD_INICIAL (contraseña de admin, 8 caracteres o más)');
+  if (webMode && !initialEmail && (!adminRow || !adminRow.email)) missing.push('ADMIN_EMAIL_INICIAL (el correo donde admin recibe su código de acceso)');
+  if (missing.length) throw new Error('en modo web, define en .env: ' + missing.join(' y '));
+  if (adminRow && !adminRow.email && initialEmail) {
+    await pool.query("UPDATE users SET email = ? WHERE username = 'admin' AND (email IS NULL OR email = '')", [initialEmail]);
+  }
   if (!adminRow) {
     const initialPassword = process.env.ADMIN_PASSWORD_INICIAL || '';
     if (webMode && initialPassword.length < 8) {
       throw new Error('en modo web, define ADMIN_PASSWORD_INICIAL en .env (8 caracteres o más) para crear la cuenta admin');
     }
-    const initialEmail = (process.env.ADMIN_EMAIL_INICIAL || '').trim().toLowerCase() || null;
     await pool.query(
       'INSERT IGNORE INTO users (username, password, display_name, role, email, created_at) VALUES (?, ?, ?, ?, ?, ?)',
       ['admin', await hashPassword(initialPassword || 'admin'), 'admin', 'admin', initialEmail, now]
     );
   } else if (await verifyPassword('admin', adminRow.password)) {
-    if (webMode) {
-      throw new Error('la cuenta admin todavía tiene la contraseña "admin". Cámbiala (en modo red local, desde el chat) antes de publicarlo en internet');
+    // Base que viene con admin/admin (p. ej. de una instalación anterior): en la web se reemplaza por
+    // ADMIN_PASSWORD_INICIAL al arrancar; sin ella no arranca.
+    const initialPassword = process.env.ADMIN_PASSWORD_INICIAL || '';
+    if (webMode && initialPassword.length >= 8 && initialPassword !== 'admin') {
+      await pool.query("UPDATE users SET password = ? WHERE username = 'admin'", [await hashPassword(initialPassword)]);
+      console.log('[Seguridad] La contraseña "admin" de la cuenta admin se reemplazó por ADMIN_PASSWORD_INICIAL.');
+    } else if (webMode) {
+      throw new Error('la cuenta admin todavía tiene la contraseña "admin". Define ADMIN_PASSWORD_INICIAL en .env (8 caracteres o más) y vuelve a iniciar: se usará como su nueva contraseña');
     }
     console.warn('[Seguridad] La cuenta admin todavía tiene la contraseña "admin". Cámbiala antes de publicar el chat en internet.');
   }

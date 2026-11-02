@@ -2,79 +2,60 @@
 
 Sistema de chat interno. Basado en Node.js + Express + Socket.IO con almacenamiento en MySQL.
 
-Funciona de dos formas, según el `.env`:
+Se publica en internet con un dominio (ej. `https://aurora.cormudesi.cl`):
 
-| | **Red local** (por defecto) | **Web** (`MODO_WEB=true`) |
-|---|---|---|
-| Para qué | Pruebas o uso dentro de la red | Publicarlo en internet con un dominio |
-| Certificado | Propio del chat (cada PC lo instala) | Real (Let's Encrypt), lo maneja Nginx |
-| Puertos del chat | 3000 (redirige) y 3443, en toda la red | Solo 3000 **dentro** del servidor; afuera solo Nginx en 80/443 |
-| Ver | [Acceder desde la LAN](#acceder-desde-la-lan) | [INSTALACION-WEB.md](INSTALACION-WEB.md) |
+```
+Internet ──80/443──▶ Nginx (certificado Let's Encrypt) ──▶ chat en 127.0.0.1:3000 (MODO_WEB=true)
+```
+
+- El chat escucha **solo dentro del servidor** (`127.0.0.1:3000`); hacia internet solo quedan abiertos el 80 y el 443 de Nginx.
+- El certificado es el real de Nginx: los usuarios no instalan nada, solo abren la dirección en el navegador.
+
+**El paso a paso completo de instalación** (MySQL, Nginx, certificado, PM2, firewall, respaldos y problemas frecuentes) está en **[INSTALACION-WEB.md](INSTALACION-WEB.md)**. Este README explica la configuración y cómo funciona el chat.
 
 ## Requisitos
 
-- Node.js v18 o superior
-- npm (incluido con Node.js)
-- **MySQL** (o MariaDB) corriendo y accesible desde el servidor
-- Red local: puertos **3000** y **3443** abiertos en el firewall del servidor
-- Web: un dominio, **Nginx** y los puertos **80** y **443** abiertos (ver [INSTALACION-WEB.md](INSTALACION-WEB.md))
+- Servidor Linux con un dominio que apunte a él
+- Node.js v18 o superior y npm
+- **MySQL** (o MariaDB)
+- **Nginx** y los puertos **80** y **443** abiertos
+- Una cuenta de correo (SMTP) para enviar los códigos de acceso
+- **PM2** para que el chat arranque solo y se reinicie si se cae
 
-## Instalación
+## Configuración (`.env`)
 
-```bash
-# 1. Clonar el repositorio en el servidor
-git clone https://github.com/NelsonAraya/chat-global.git
-cd chat-global
-
-# 2. Instalar dependencias
-npm install
-
-# 3. Configurar la conexión a MySQL (variables de entorno, ver abajo)
-
-# 4. Iniciar el servidor
-npm start
-```
-
-## Configuración de MySQL
-
-El servidor crea automáticamente la base de datos y las tablas la primera vez que arranca (el usuario de MySQL que uses necesita permiso para crear bases de datos). La configuración va en un archivo **`.env`** en la raíz del proyecto (no se sube a git, cada servidor tiene el suyo):
+Al arrancar, el chat crea solo la base de datos y las tablas (el usuario de MySQL necesita permiso para crear bases de datos). La configuración va en un archivo **`.env`** en la raíz del proyecto (no se sube a git, cada servidor tiene el suyo):
 
 ```bash
-# 1. Copia la plantilla
 cp .env.example .env
-
-# 2. Edita .env con los datos de tu MySQL
+nano .env
 ```
-
-Variables disponibles (si no se define alguna, usa el valor por defecto):
 
 | Variable | Default | Descripción |
 |---|---|---|
 | `DB_HOST` | `localhost` | Host del servidor MySQL |
 | `DB_PORT` | `3306` | Puerto de MySQL |
-| `DB_USER` | `root` | Usuario de MySQL |
+| `DB_USER` | `root` | Usuario de MySQL (en el servidor, uno propio del chat: ver INSTALACION-WEB.md) |
 | `DB_PASSWORD` | *(vacío)* | Contraseña de MySQL |
 | `DB_NAME` | `chat_cormudesi` | Nombre de la base de datos |
 | `DB_POOL_SIZE` | `30` | Conexiones simultáneas a MySQL (opcional) |
+| `MODO_WEB` | *(apagado)* | **`true`** (obligatorio en el servidor) |
+| `DOMINIO` | *(vacío)* | Dominio del chat, ej. `aurora.cormudesi.cl`. Solo se aceptan conexiones desde ahí. Igual al `server_name` de Nginx |
+| `WEB_HOST` | `127.0.0.1` | Dirección donde escucha el chat. No cambiarla: así nadie entra sin pasar por Nginx |
+| `WEB_PORT` | `3000` | Puerto interno al que Nginx envía las conexiones |
+| `PROXY_IPS` | *(vacío)* | IP de Nginx **solo si está en otro equipo** (para conocer la IP real de cada usuario) |
+| `ADMIN_PASSWORD_INICIAL` | — | **Obligatoria** (8 caracteres o más). Contraseña de la cuenta `admin` al crearla. Si la base ya trae `admin` con la contraseña "admin", se reemplaza por esta al arrancar |
+| `ADMIN_EMAIL_INICIAL` | — | **Obligatorio** mientras `admin` no tenga correo. Ahí llega su código de acceso. Si `admin` ya existe sin correo, se le asigna este al arrancar |
 | `ALLOWED_EMAIL_DOMAINS` | `cormudesi.cl,gmail.com` | Dominios de correo aceptados al registrarse (separados por comas) |
-| `HTTP_PORT` | `3000` | Red local: puerto HTTP, redirige a HTTPS (opcional) |
-| `HTTPS_PORT` | `3443` | Red local: puerto HTTPS (opcional) |
-| `MODO_WEB` | *(apagado)* | `true` para publicarlo en internet detrás de Nginx (ver [INSTALACION-WEB.md](INSTALACION-WEB.md)) |
-| `DOMINIO` | *(vacío)* | Web: dominio del chat, ej. `aurora.cormudesi.cl`. Solo se aceptan conexiones desde ahí |
-| `WEB_HOST` | `127.0.0.1` | Web: dirección donde escucha el chat. No cambiarla: así nadie entra sin pasar por Nginx |
-| `WEB_PORT` | `3000` | Web: puerto interno al que Nginx envía las conexiones |
-| `PROXY_IPS` | *(vacío)* | Web: IP de Nginx **solo si está en otro equipo** (para conocer la IP real de cada usuario) |
-| `ADMIN_PASSWORD_INICIAL` | `admin` | Contraseña de la cuenta `admin` al crearla en una instalación nueva. **En modo web es obligatoria** (8 caracteres o más) |
-| `ADMIN_EMAIL_INICIAL` | *(vacío)* | Correo del doble factor de `admin` desde el primer ingreso (recomendado en la web) |
 | `ZONA_HORARIA` | `America/Santiago` | Zona horaria de la fecha en los correos de alerta |
 
-Con `.env` configurado, `npm start` ya levanta el servidor conectado a esa base — no hace falta pasar nada por línea de comandos.
+Si falta algo obligatorio, el chat no arranca y explica en la consola qué agregar (ver la tabla de errores en INSTALACION-WEB.md).
 
 ## Correo (códigos de acceso y Botón de Alerta)
 
 El correo se usa para dos cosas:
 
-- **Código de acceso del doble factor** (ver [Doble factor](#doble-factor-código-por-correo)). **Es necesario configurarlo** para que los usuarios reciban su código al iniciar sesión. En la red local, si el SMTP no está configurado, el código se muestra en la consola del servidor para que un administrador se lo entregue al usuario. **En modo web eso no se hace** (el código nunca queda en la consola): el usuario ve "No se pudo enviar el código" y el error queda en Admin → Errores.
+- **Código de acceso del doble factor** (ver [Doble factor](#doble-factor-código-por-correo)). **Es obligatorio**: sin correo nadie recibe su código y nadie puede entrar. El código nunca se muestra en la consola; si no se puede enviar, el usuario ve "No se pudo enviar el código" y el error queda en Admin → Errores.
 - **Botón de alerta:** además de la notificación en pantalla, se manda un correo. Si no se configura `ALERT_EMAIL_TO`, el botón sigue funcionando igual, solo que sin correo.
 
 Se configura en el mismo archivo `.env`:
@@ -98,104 +79,28 @@ npm run migrate
 
 Lee `chat.db`, crea la base de datos y las tablas en MySQL, y copia usuarios, salas, mensajes, departamentos y el registro de consentimiento (TyC). `chat.db` no se modifica ni se borra — queda como respaldo. Se puede ejecutar más de una vez sin duplicar datos.
 
-## Acceder desde la LAN
-
-No necesitas configurar nada. La IP se detecta automáticamente.
-
-1. En el servidor corre `npm start`. Verás algo como:
-
-   ```
-   ║  →  http://192.168.1.51:3000
-   ```
-
-2. Desde **cualquier PC de la red** abre el navegador y ve a esa dirección:
-
-   ```
-   http://<IP-DEL-SERVIDOR>:3000
-   ```
-
-   Ejemplo: `http://192.168.1.51:3000`
-
-3. El servidor **redirige automáticamente a HTTPS** para que la grabación de audio funcione.
-
-## Instalar certificado de seguridad
-
-Para eliminar la advertencia **"No es seguro"** del navegador (Chrome/Edge) y que aparezca un candado verde:
-
-1. Abre `https://<IP-DEL-SERVIDOR>:3443` en el navegador.
-   - Ejemplo: `https://192.168.1.51:3443`
-   - La primera vez verás **"Su conexión no es privada"**
-   - Haz clic en: **Avanzado → Ir a `<IP>` (sitio no seguro)**
-
-2. En la pantalla de login verás un banner verde con **"Descargar certificado"**.
-
-3. Haz clic en **Descargar certificado** → se descarga `Chat-CORMUDESI-cert.cer`.
-
-4. Abre el archivo descargado y haz clic en **"Instalar certificado"**.
-
-5. Sigue estos pasos:
-   - **Máquina local** → **Siguiente**
-   - **Colocar todos los certificados en el siguiente almacén** → **Examinar**
-   - Selecciona **"Entidades de certificación raíz de confianza"** → **Aceptar**
-   - **Siguiente** → **Finalizar**
-   - Haz clic en **"Sí"** en el mensaje de seguridad
-
-6. Vuelve a cargar la página `https://<IP-DEL-SERVIDOR>:3443`.
-   - La advertencia ya no aparecerá.
-   - El candado se mostrará como seguro.
-
-> **Nota:** Si el servidor cambia de IP (ej: se conecta en otra red), el certificado se regenera automáticamente. Deberás descargar e instalar el nuevo certificado en cada PC cliente.
-
 ## Grabación de audio
 
-La grabación de audio (micrófono) funciona solo en **HTTPS**. El servidor redirige automáticamente:
-
-```
-http://<IP-DEL-SERVIDOR>:3000  →  https://<IP-DEL-SERVIDOR>:3443
-```
-
-Solo presiona el botón 🎤 en el área de mensajes para grabar.
+La grabación de audio (micrófono) funciona porque el sitio va por **HTTPS** (Nginx). Solo presiona el botón 🎤 en el área de mensajes para grabar.
 
 ## Primer uso
 
-Al iniciar el servidor por primera vez se crea automáticamente:
+En el primer arranque se crea la cuenta **`admin`** (administrador general) con la contraseña de `ADMIN_PASSWORD_INICIAL` y el correo de `ADMIN_EMAIL_INICIAL`.
 
-- **Usuario:** `admin`
-- **Contraseña:** `admin`
-- **Rol:** Administrador
+1. Abre `https://<tu dominio>` e ingresa como `admin`.
+2. Te llega el código de acceso a `ADMIN_EMAIL_INICIAL`.
+3. **Cambia la contraseña inicial** desde tu perfil.
+4. Usa el panel Admin (ícono ⚙ en la barra lateral) para crear departamentos, aprobar usuarios nuevos y gestionar salas.
 
-**Cambia la contraseña del admin inmediatamente después del primer ingreso.** En ese primer ingreso se te pedirá un correo y te llegará un código para activar el doble factor (ver [Doble factor](#doble-factor-código-por-correo)). Usa el panel Admin (ícono ⚙ en la barra lateral) para crear departamentos, aprobar usuarios nuevos y gestionar salas.
+> **Importante:** cualquier persona puede crear una cuenta desde "Crear cuenta" (pide usuario, correo y contraseña de 8 caracteres o más), pero **no puede entrar al chat hasta que un administrador la apruebe** desde el panel Admin → Usuarios. Ver [Aprobación de cuentas nuevas](#aprobación-de-cuentas-nuevas).
 
-> **Importante:** cualquier persona puede crear una cuenta desde "Crear cuenta" (pide usuario, correo y contraseña), pero **no puede entrar al chat hasta que un administrador la apruebe** desde el panel Admin → Usuarios. Ver [Aprobación de cuentas nuevas](#aprobación-de-cuentas-nuevas).
-
-## Puertos personalizados
-
-Si los puertos default (3000 y 3443) están ocupados, puedes cambiarlos:
-
-```bash
-HTTP_PORT=3001 HTTPS_PORT=3444 npm start
-```
-
-## Firewall (red local)
-
-Asegúrate de tener abiertos los puertos 3000 y 3443 en el firewall de Windows:
-
-```
-Windows + R → "wf.msc" → Reglas de entrada → Nueva regla → Puerto
-→ TCP → puertos: 3000,3443 → Permitir → ...
-```
-
-## Publicar en internet (Nginx)
-
-El paso a paso completo para instalarlo en un servidor con dominio (Nginx, certificado de Let's Encrypt, MySQL, PM2, firewall, respaldos y problemas frecuentes) está en **[INSTALACION-WEB.md](INSTALACION-WEB.md)**.
-
-En resumen: el chat corre con `MODO_WEB=true` escuchando solo en `127.0.0.1:3000`, y Nginx lo publica en el puerto 443 con el certificado real. Hacia internet solo quedan abiertos el 80 y el 443.
+> **Cuentas de administrador:** deben tener un correo registrado. Un administrador nunca elige su correo al ingresar (quien adivinara su contraseña pondría el suyo): se lo registra el administrador general desde el panel, y a `admin`, `ADMIN_EMAIL_INICIAL`.
 
 ## Comandos
 
 | Comando | Descripción |
 |---|---|
-| `npm start` | Inicia el servidor |
+| `npm start` | Inicia el servidor en la consola (solo para probar; en el servidor se usa PM2, ver INSTALACION-WEB.md) |
 | `npm run dev` | Inicia con reinicio automático al editar código |
 | `npm run migrate` | Migra datos de una instalación anterior con SQLite hacia MySQL (una sola vez) |
 | `Ctrl + C` | Detiene el servidor |
@@ -359,7 +264,7 @@ Además de la contraseña, para entrar se pide un **código temporal de 6 dígit
 
 Reglas:
 
-- **Primer ingreso = activación:** la primera vez, el mismo paso verifica el correo y deja el doble factor activo. Las cuentas antiguas que no tienen correo deben indicar uno en ese momento.
+- **Primer ingreso = activación:** la primera vez, el mismo paso verifica el correo y deja el doble factor activo. Las cuentas antiguas que no tienen correo deben indicar uno en ese momento (las de administrador no: su correo lo registra el administrador general).
 - El código **vence a los 5 minutos** y se anula tras **5 intentos incorrectos**.
 - Botón **"Reenviar código"**, con 30 segundos de espera entre envíos y un máximo de **5 códigos cada 15 minutos** por usuario.
 - Si el usuario recarga la página o repite el login mientras su código sigue vigente, **se reutiliza el mismo código** (no llega un correo nuevo).
@@ -406,6 +311,7 @@ Conversaciones privadas entre varias personas elegidas — a diferencia de las s
 ## Seguridad
 
 - **Contraseñas** guardadas con **scrypt con sal** (archivo `passwords.js`). Las contraseñas del formato anterior (SHA-256 sin sal) siguen funcionando y se convierten solas al formato nuevo la próxima vez que esa persona inicia sesión (lo mismo para las salas con contraseña).
+- **Contraseñas nuevas** (registro, cambio y restablecimiento por un admin): **8 caracteres o más**. Las contraseñas anteriores más cortas siguen funcionando.
 - **Límite de intentos:**
   - 5 contraseñas incorrectas seguidas bloquean esa cuenta por 15 minutos.
   - 10 contraseñas de sala incorrectas bloquean a ese usuario 15 minutos para entrar a salas con contraseña.
@@ -419,6 +325,7 @@ Conversaciones privadas entre varias personas elegidas — a diferencia de las s
   - **Subida:** la autorización va en la cabecera `X-Upload-Token` y se revisa **antes** de recibir el archivo, así nadie sin sesión puede escribir en el disco del servidor.
   - **Cada archivo es de quien lo subió:** solo esa persona puede adjuntarlo, y a un solo mensaje (o como foto de perfil, si es una imagen). Así nadie puede adjuntar el archivo de otro en una sala propia y hacer que se borre al cerrarla. El nombre, el tamaño y el tipo que se muestran son los que registró el servidor al recibirlo.
   - Lo que se sube y no se envía en 1 hora se borra del disco.
+  - **Tope por persona:** 60 archivos por hora y 10 subidos sin usar a la vez (se revisa antes de recibir el archivo). Evita que alguien llene el disco del servidor; una persona normal no lo alcanza.
   - Al eliminar una sala (temporal o fija), un grupo o un departamento, sus archivos también se borran del disco.
 - **Límite de velocidad por persona:** hasta 8 mensajes seguidos y luego 1 por segundo; las reacciones y el resto de las acciones tienen su propio límite. Pasado el límite, el chat responde "Vas muy rápido" (el texto vuelve al cuadro). Una persona escribiendo normal no lo alcanza; evita que un script inunde el chat. El botón de alerta nunca se frena por este límite.
 - **Detrás de un proxy** (p. ej. Nginx en el mismo servidor): la IP real de cada persona se toma de la cabecera `X-Forwarded-For`, solo si la conexión viene del propio equipo (`127.0.0.1`). Se usa para el registro de consentimiento y de sesiones.
@@ -489,17 +396,34 @@ Cada aceptación de TyC queda registrada en la base de datos con:
 
 - **MySQL**: base de datos (ver "Configuración de MySQL" arriba) con las tablas `users`, `rooms`, `messages`, `conversations`, `departments`, `friends`, `alerts`, `consent_log`, `chat_groups`, `group_members`, `sessions` y `error_log`. Las columnas, tablas e índices nuevos (correo, doble factor y departamentos de administración en `users`, lista de conversaciones privadas, grupos, registro de errores, índices del historial) se agregan solos al iniciar el servidor, sin perder datos. Cada acción (mensaje, reacción, cambio de nombre, etc.) escribe solo la fila que cambió — no se reescribe la base completa en cada operación.
 - Los archivos adjuntos se guardan en `uploads/`
-- El certificado SSL se guarda en `certs/` (se genera automáticamente al iniciar con la IP actual)
 - Si la base de datos está vacía, se crea automáticamente con los datos por defecto (usuario `admin` y sala `general`) al iniciar
 
 ## Estructura del proyecto
 
 ```
 chat-cormudesi/
-├── index.js              # Servidor (HTTP redirige a HTTPS)
+├── index.js              # Servidor web (Express + Socket.IO, detrás de Nginx)
 ├── db.js                 # Persistencia MySQL (mysql2)
 ├── passwords.js          # Hash y verificación de contraseñas (scrypt con sal)
-├── socket-handler.js     # Eventos de Socket.IO (login + doble factor, salas, privados, grupos, admin)
+├── socket-handler.js     # Arranca los eventos de Socket.IO: carga los archivos de socket/ en orden
+├── socket/               # Eventos en tiempo real, un archivo por tema (cada uno usa lo de los anteriores)
+│   ├── validation.js     # Validación de textos, archivos y correos; IP real detrás de Nginx
+│   ├── permissions.js    # Quién ve o administra qué (admin general, admin de departamento)
+│   ├── state.js          # Conectados en memoria e índices de cuentas, salas y amistades
+│   ├── uploads.js        # Archivos subidos: de quién es cada uno y borrado del disco
+│   ├── sessions.js       # Sesiones guardadas del navegador (token)
+│   ├── limits.js         # Bloqueo por intentos fallidos y límite de velocidad
+│   ├── presence.js       # "Conectados": avisos de entrada/salida y expulsión
+│   ├── messages.js       # Piezas comunes de los mensajes (ids, citas, historial, reacciones)
+│   ├── friends.js        # Amigos y búsqueda de usuarios
+│   ├── groups.js         # Grupos
+│   ├── rooms.js          # Salas, salas temporales y no leídos
+│   ├── private.js        # Mensajes privados, reacciones e historial anterior
+│   ├── auth.js           # Registro, login + doble factor, reanudar sesión, desconexión
+│   ├── profile.js        # Nombre, foto, contraseña y ubicación propios
+│   ├── admin.js          # Panel de administración
+│   ├── alerts.js         # Botón de alerta e historial
+│   └── errors.js         # Registro de errores (panel y errores del navegador)
 ├── mailer.js             # Envío de correo: códigos de acceso y botón de alerta (nodemailer)
 ├── error-log.js          # Registro de errores del sistema en la base (panel Admin → Errores)
 ├── migrate-to-mysql.js   # Migración única desde una instalación anterior con SQLite
@@ -507,14 +431,27 @@ chat-cormudesi/
 ├── .env.example          # Plantilla de .env
 ├── INSTALACION-WEB.md    # Paso a paso para publicarlo en internet (Nginx, certificado, PM2, firewall)
 ├── package.json
-├── certs/                # Certificado SSL (se genera al iniciar con la IP actual)
 ├── uploads/              # Archivos adjuntos (se crea al iniciar)
 ├── public/
 │   ├── sounds/
 │   │   └── alerta.mp3    # Sonido del botón de alerta
 │   ├── index.html        # Interfaz de usuario + modal de Términos y Condiciones
 │   ├── styles.css        # Estilos
-│   ├── app.js            # Lógica del cliente
+│   ├── js/               # Lógica del cliente, cargada en este orden desde index.html
+│   │   ├── state.js      # Estado de la sesión y elementos de la página (lo usan todos)
+│   │   ├── utils.js      # Utilidades: formatos, avatares, avisos, selector de departamento
+│   │   ├── composer.js   # Caja de mensaje: emojis, adjuntos, audio, ver imágenes
+│   │   ├── login.js      # Ingreso, sesión guardada, doble factor, registro y Términos
+│   │   ├── profile.js    # Perfil propio, salir y botón de alerta
+│   │   ├── layout.js     # Menús del celular, notificaciones, pestañas, lista de salas
+│   │   ├── admin.js      # Panel de administración
+│   │   ├── rooms.js      # Entrar y crear salas
+│   │   ├── contacts.js   # Conversaciones privadas y amigos
+│   │   ├── messages.js   # Mensajes, historial, reacciones, respuestas y privados
+│   │   ├── users.js      # Listas de conectados y presencia
+│   │   ├── notices.js    # Avisos del servidor (mensajes nuevos, salas, alertas…)
+│   │   ├── groups.js     # Grupos
+│   │   └── startup.js    # Arranque y conexión al servidor (siempre el último)
 │   ├── privacidad.html   # Política de Privacidad (Ley 21.719 y 21.663)
 │   └── img/
 │       ├── logo.png      # Logo de CORMUDESI
@@ -526,7 +463,7 @@ chat-cormudesi/
 │       ├── cert-06-trusted-root.png
 │       ├── cert-07-finish.png
 │       ├── cert-08-security.png
-│       └── cert-09-done.png  # Pasos para instalar certificado
+│       └── cert-09-done.png  # Pasos para instalar el certificado propio (no se usan en la web)
 ```
 
 ## Licencia

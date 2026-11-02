@@ -129,7 +129,7 @@
           <div class="cert-step-num">1</div>
           <div class="cert-step-content">
             <p>Haz clic en <strong>"Descargar certificado"</strong> (botón verde en el banner de arriba).</p>
-            <img src="img/cert-01-download.png" alt="Paso 1: Descargar certificado" class="cert-step-img" />
+            <img src="img/cert-01-download.png" alt="Paso 1: Descargar certificado" class="cert-step-img" loading="lazy" />
           </div>
         </div>
 
@@ -137,7 +137,7 @@
           <div class="cert-step-num">2</div>
           <div class="cert-step-content">
             <p>Abre el archivo descargado <strong>Chat-CORMUDESI-cert.cer</strong>.</p>
-            <img src="img/cert-02-open.png" alt="Paso 2: Abrir archivo" class="cert-step-img" />
+            <img src="img/cert-02-open.png" alt="Paso 2: Abrir archivo" class="cert-step-img" loading="lazy" />
           </div>
         </div>
 
@@ -145,7 +145,7 @@
           <div class="cert-step-num">3</div>
           <div class="cert-step-content">
             <p>Haz clic en <strong>"Instalar certificado"</strong>.</p>
-            <img src="img/cert-03-install.png" alt="Paso 3: Instalar certificado" class="cert-step-img" />
+            <img src="img/cert-03-install.png" alt="Paso 3: Instalar certificado" class="cert-step-img" loading="lazy" />
           </div>
         </div>
 
@@ -153,7 +153,7 @@
           <div class="cert-step-num">4</div>
           <div class="cert-step-content">
             <p>Selecciona <strong>"Máquina local"</strong> y haz clic en <strong>"Siguiente"</strong>.</p>
-            <img src="img/cert-04-local-machine.png" alt="Paso 4: Máquina local" class="cert-step-img" />
+            <img src="img/cert-04-local-machine.png" alt="Paso 4: Máquina local" class="cert-step-img" loading="lazy" />
           </div>
         </div>
 
@@ -161,7 +161,7 @@
           <div class="cert-step-num">5</div>
           <div class="cert-step-content">
             <p>Selecciona <strong>"Colocar todos los certificados en el siguiente almacén"</strong> y haz clic en <strong>"Examinar"</strong>.</p>
-            <img src="img/cert-05-browse.png" alt="Paso 5: Examinar almacén" class="cert-step-img" />
+            <img src="img/cert-05-browse.png" alt="Paso 5: Examinar almacén" class="cert-step-img" loading="lazy" />
           </div>
         </div>
 
@@ -169,7 +169,7 @@
           <div class="cert-step-num">6</div>
           <div class="cert-step-content">
             <p>Selecciona <strong>"Entidades de certificación raíz de confianza"</strong> y haz clic en <strong>"Aceptar"</strong>.</p>
-            <img src="img/cert-06-trusted-root.png" alt="Paso 6: Entidades raíz de confianza" class="cert-step-img" />
+            <img src="img/cert-06-trusted-root.png" alt="Paso 6: Entidades raíz de confianza" class="cert-step-img" loading="lazy" />
           </div>
         </div>
 
@@ -177,7 +177,7 @@
           <div class="cert-step-num">7</div>
           <div class="cert-step-content">
             <p>Haz clic en <strong>"Siguiente"</strong>.</p>
-            <img src="img/cert-07-finish.png" alt="Paso 7: Siguiente" class="cert-step-img" />
+            <img src="img/cert-07-finish.png" alt="Paso 7: Siguiente" class="cert-step-img" loading="lazy" />
           </div>
         </div>
 
@@ -185,7 +185,7 @@
           <div class="cert-step-num">8</div>
           <div class="cert-step-content">
             <p>Finalización del Asistente para importar certificado: haga clic en <strong>"Finalizar"</strong>.</p>
-            <img src="img/cert-08-security.png" alt="Paso 8: Finalizar importación" class="cert-step-img" />
+            <img src="img/cert-08-security.png" alt="Paso 8: Finalizar importación" class="cert-step-img" loading="lazy" />
           </div>
         </div>
 
@@ -193,7 +193,7 @@
           <div class="cert-step-num">9</div>
           <div class="cert-step-content">
             <p>Verás el mensaje <strong>"La importación se realizó correctamente"</strong>.</p>
-            <img src="img/cert-09-done.png" alt="Paso 9: Importación correcta" class="cert-step-img" />
+            <img src="img/cert-09-done.png" alt="Paso 9: Importación correcta" class="cert-step-img" loading="lazy" />
           </div>
         </div>
 
@@ -952,6 +952,20 @@
   <div id="toast-container"></div>
 
   <script src="/socket.io/socket.io.min.js"></script>
-  <script src="app.js"></script>
+  <!-- El orden importa: cada archivo usa lo que definen los anteriores (state.js primero, startup.js al final). -->
+  <script src="js/state.js"></script>
+  <script src="js/utils.js"></script>
+  <script src="js/composer.js"></script>
+  <script src="js/login.js"></script>
+  <script src="js/profile.js"></script>
+  <script src="js/layout.js"></script>
+  <script src="js/admin.js"></script>
+  <script src="js/rooms.js"></script>
+  <script src="js/contacts.js"></script>
+  <script src="js/messages.js"></script>
+  <script src="js/users.js"></script>
+  <script src="js/notices.js"></script>
+  <script src="js/groups.js"></script>
+  <script src="js/startup.js"></script>
 </body>
 </html>
