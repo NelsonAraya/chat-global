@@ -79,6 +79,21 @@ npm run migrate
 
 Lee `chat.db`, crea la base de datos y las tablas en MySQL, y copia usuarios, salas, mensajes, departamentos y el registro de consentimiento (TyC). `chat.db` no se modifica ni se borra — queda como respaldo. Se puede ejecutar más de una vez sin duplicar datos.
 
+## Archivos adjuntos
+
+Con el clip 📎 se adjunta un archivo a un mensaje de sala, privado o de grupo (máximo **2 MB**). Solo se aceptan tipos seguros:
+
+| Tipo | Extensiones |
+|---|---|
+| Imágenes | `jpg`, `jpeg`, `png`, `gif`, `webp` |
+| Documentos | `pdf`, `docx`, `xlsx`, `pptx`, `odt`, `ods`, `odp`, `txt`, `csv` |
+| Audio | `webm` (mensajes de voz del chat), `ogg`, `mp3`, `m4a`, `wav` |
+
+- Cualquier otro tipo se rechaza con el aviso "Ese tipo de archivo no está permitido". Los `.doc` y `.xls` antiguos no se aceptan (pueden traer macros): hay que guardarlos como `.docx` / `.xlsx` o como PDF.
+- Un archivo cuyo contenido no corresponde a su extensión (p. ej. un programa renombrado a `.pdf`) se rechaza con "El contenido del archivo no corresponde a su extensión".
+- La validación la hace el **servidor** y no se puede saltar desde el navegador; el selector de archivos solo muestra los tipos permitidos por comodidad. Detalles en [Seguridad](#seguridad).
+- Tope por persona: 60 archivos por hora y 10 subidos sin enviar a la vez.
+
 ## Grabación de audio
 
 La grabación de audio (micrófono) funciona porque el sitio va por **HTTPS** (Nginx). Solo presiona el botón 🎤 en el área de mensajes para grabar.
@@ -322,6 +337,7 @@ Conversaciones privadas entre varias personas elegidas — a diferencia de las s
 - **Contenido de los mensajes:** el servidor solo acepta archivos subidos a este mismo servidor (`/uploads/...`) y valida respuestas, avatares y largo del texto. La interfaz escapa todo lo que escriben los usuarios (incluidas comillas) antes de mostrarlo.
 - **Archivos subidos:** se sirven aislados (`Content-Security-Policy: sandbox`, `nosniff`) para que un `.html` o `.svg` no pueda ejecutar código en el sitio. Solo imágenes, audio, video y PDF se abren en el navegador; el resto se descarga.
   - **Solo con sesión:** al ingresar, el navegador canjea su autorización por una cookie (`HttpOnly`, solo para `/uploads`). Sin sesión, abrir el enlace de un archivo responde "Debes iniciar sesión". La autorización deja de valer al desconectarse, al ser bloqueado o eliminado. El navegador no guarda copia de los archivos (útil en equipos compartidos).
+  - **Solo tipos seguros:** imágenes (`jpg`, `jpeg`, `png`, `gif`, `webp`), `pdf`, documentos sin macros (`docx`, `xlsx`, `pptx`, `odt`, `ods`, `odp`), `txt`, `csv` y audio (`webm`, `ogg`, `mp3`, `m4a`, `wav`; los mensajes de voz del chat son `webm`). Todo lo demás se rechaza antes de escribirlo en el disco: programas y scripts (`exe`, `bat`, `js`...), Office con macros (`docm`, `xlsm`) y los formatos antiguos (`doc`, `xls`), comprimidos (`zip`, `rar`) y `svg`/`html`. Además se revisan los primeros bytes del archivo: un programa renombrado a `.pdf` o `.txt` se rechaza ("El contenido del archivo no corresponde a su extensión"). El tipo que se guarda lo fija el servidor según la extensión, no el navegador. La lista está en `UPLOAD_TYPES` (`index.js`) y la misma en el `accept` del selector de archivos (`public/index.html`).
   - **Subida:** la autorización va en la cabecera `X-Upload-Token` y se revisa **antes** de recibir el archivo, así nadie sin sesión puede escribir en el disco del servidor.
   - **Cada archivo es de quien lo subió:** solo esa persona puede adjuntarlo, y a un solo mensaje (o como foto de perfil, si es una imagen). Así nadie puede adjuntar el archivo de otro en una sala propia y hacer que se borre al cerrarla. El nombre, el tamaño y el tipo que se muestran son los que registró el servidor al recibirlo.
   - Lo que se sube y no se envía en 1 hora se borra del disco.

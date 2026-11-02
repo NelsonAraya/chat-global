@@ -562,7 +562,8 @@
             <button id="emoji-btn" class="input-action-btn" title="Emojis"><i class="far fa-smile"></i></button>
             <button id="attach-btn" class="input-action-btn" title="Adjuntar archivo (máximo 2 MB)"><i class="fas fa-paperclip"></i></button>
             <button id="mic-btn" class="input-action-btn" title="Grabar audio"><i class="fas fa-microphone"></i></button>
-            <input type="file" id="file-input" class="hidden" />
+            <!-- Mismos tipos que acepta el servidor (UPLOAD_TYPES en index.js) -->
+            <input type="file" id="file-input" class="hidden" accept=".jpg,.jpeg,.png,.gif,.webp,.pdf,.docx,.xlsx,.pptx,.odt,.ods,.odp,.txt,.csv,.webm,.ogg,.mp3,.m4a,.wav" />
             <input type="text" id="message-input" placeholder="Escribe un mensaje..." maxlength="1000" autofocus />
             <button id="send-btn" class="btn-primary send-btn">
               <i class="fas fa-paper-plane"></i>

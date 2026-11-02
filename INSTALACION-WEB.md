@@ -391,5 +391,6 @@ pm2 restart chat
 - [ ] Crear una cuenta de prueba: pide contraseña de 8 caracteres o más y queda pendiente hasta aprobarla en Admin → Usuarios.
 - [ ] Desde fuera del servidor, el puerto 3000 y el 3306 **no** responden.
 - [ ] Enviar un mensaje y un archivo; activar la alerta y ver que llega el correo con la hora correcta.
+- [ ] Adjuntar un `.exe` (o un archivo renombrado a `.pdf`): el chat debe rechazarlo con el aviso de tipos permitidos. Un PDF o una foto sí se envían.
 - [ ] Los otros sistemas siguen funcionando igual que antes.
 - [ ] Revisar con la unidad legal los Términos y la Política de Privacidad (dónde se alojan los datos).

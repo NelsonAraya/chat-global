@@ -89,18 +89,78 @@ app.use(express.static(PUBLIC_DIR, {
 }));
 
 const UPLOADS_DIR = path.join(__dirname, 'uploads');
+
+// ===== Tipos de archivo permitidos =====
+// Solo imágenes, PDF, documentos de Office/LibreOffice sin macros, texto y audio. Todo lo demás se rechaza:
+// programas y scripts (exe, bat, js...) son la vía de los virus; Office con macros (docm, xlsm) y los formatos
+// antiguos (doc, xls) pueden traer macros; los comprimidos (zip, rar) pueden esconder un .exe; svg y html
+// pueden llevar código. El tipo (MIME) lo fija el servidor según la extensión, no lo que diga el navegador.
+const UPLOAD_TYPES = {
+  jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', gif: 'image/gif', webp: 'image/webp',
+  pdf: 'application/pdf',
+  docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  pptx: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+  odt: 'application/vnd.oasis.opendocument.text',
+  ods: 'application/vnd.oasis.opendocument.spreadsheet',
+  odp: 'application/vnd.oasis.opendocument.presentation',
+  txt: 'text/plain', csv: 'text/csv',
+  webm: 'audio/webm', ogg: 'audio/ogg', mp3: 'audio/mpeg', m4a: 'audio/mp4', wav: 'audio/wav'
+};
+const UPLOAD_TYPE_ERROR = 'Ese tipo de archivo no está permitido. Solo imágenes (JPG, PNG, GIF, WEBP), PDF, ' +
+  'documentos de Office o LibreOffice (DOCX, XLSX, PPTX, ODT, ODS, ODP), TXT, CSV y audio.';
+// Solo letras y números en la extensión: la URL resultante debe ser segura de mostrar en el chat.
+const uploadExt = (name) => path.extname(name).replace(/[^A-Za-z0-9]/g, '').toLowerCase();
+
+// El contenido debe corresponder a la extensión (así nadie sube un .exe renombrado a .pdf). Se revisan los
+// primeros bytes, que identifican cada formato.
+const startsWith = (buf, bytes, offset = 0) => bytes.every((b, i) => buf[offset + i] === b);
+const ascii = (text) => [...text].map(c => c.charCodeAt(0));
+const ZIP = [0x50, 0x4B, 0x03, 0x04]; // docx, xlsx, pptx, odt, ods y odp son archivos zip por dentro
+const MP4 = (buf) => startsWith(buf, ascii('ftyp'), 4);
+const CONTENT_CHECKS = {
+  jpg: (b) => startsWith(b, [0xFF, 0xD8, 0xFF]),
+  png: (b) => startsWith(b, [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]),
+  gif: (b) => startsWith(b, ascii('GIF87a')) || startsWith(b, ascii('GIF89a')),
+  webp: (b) => startsWith(b, ascii('RIFF')) && startsWith(b, ascii('WEBP'), 8),
+  pdf: (b) => startsWith(b, ascii('%PDF-')),
+  docx: (b) => startsWith(b, ZIP),
+  // Safari graba en MP4 aunque el chat nombre el audio .webm.
+  webm: (b) => startsWith(b, [0x1A, 0x45, 0xDF, 0xA3]) || MP4(b),
+  ogg: (b) => startsWith(b, ascii('OggS')),
+  mp3: (b) => startsWith(b, ascii('ID3')) || (b[0] === 0xFF && (b[1] & 0xE0) === 0xE0),
+  m4a: MP4,
+  wav: (b) => startsWith(b, ascii('RIFF')) && startsWith(b, ascii('WAVE'), 8),
+  txt: (b) => !b.includes(0) // texto: sin bytes nulos (un programa sí los tiene)
+};
+CONTENT_CHECKS.jpeg = CONTENT_CHECKS.jpg;
+for (const ext of ['xlsx', 'pptx', 'odt', 'ods', 'odp']) CONTENT_CHECKS[ext] = CONTENT_CHECKS.docx;
+CONTENT_CHECKS.csv = CONTENT_CHECKS.txt;
+const contentMatchesExt = async (filePath, ext) => {
+  const fh = await fs.promises.open(filePath, 'r');
+  try {
+    const buf = Buffer.alloc(8192);
+    const { bytesRead } = await fh.read(buf, 0, buf.length, 0);
+    return bytesRead > 0 && CONTENT_CHECKS[ext](buf.subarray(0, bytesRead));
+  } finally {
+    await fh.close();
+  }
+};
+
 const storage = multer.diskStorage({
   destination: UPLOADS_DIR,
-  filename: (req, file, cb) => {
-    // Solo letras y números en la extensión: la URL resultante debe ser segura de mostrar en el chat.
-    const ext = path.extname(file.originalname).replace(/[^A-Za-z0-9]/g, '').slice(0, 10);
-    const name = crypto.randomUUID() + (ext ? '.' + ext.toLowerCase() : '');
-    cb(null, name);
-  }
+  filename: (req, file, cb) => cb(null, crypto.randomUUID() + '.' + uploadExt(file.originalname))
 });
 const upload = multer({
   storage,
-  limits: { fileSize: 2 * 1024 * 1024 }
+  limits: { fileSize: 2 * 1024 * 1024 },
+  // La extensión se revisa antes de escribir nada en el disco.
+  fileFilter: (req, file, cb) => {
+    if (UPLOAD_TYPES[uploadExt(file.originalname)]) return cb(null, true);
+    const err = new Error(UPLOAD_TYPE_ERROR);
+    err.code = 'UPLOAD_TYPE';
+    cb(err);
+  }
 });
 
 // El navegador envía el nombre del archivo en UTF-8, pero multer lo lee como latin1: "informe año.pdf" llegaba
@@ -129,18 +189,24 @@ app.post('/api/upload', (req, res, next) => {
     if (err instanceof multer.MulterError && err.code === 'LIMIT_FILE_SIZE') {
       return res.status(413).json({ error: 'El archivo es demasiado grande (máximo 2 MB)' });
     }
+    if (err?.code === 'UPLOAD_TYPE') return res.status(415).json({ error: UPLOAD_TYPE_ERROR });
     if (err) return res.status(400).json({ error: 'Error al subir el archivo' });
     next();
   });
-}, (req, res) => {
+}, async (req, res) => {
   if (!req.file) {
     return res.status(400).json({ error: 'No se recibió archivo' });
+  }
+  const ext = uploadExt(req.file.filename);
+  if (!(await contentMatchesExt(req.file.path, ext).catch(() => false))) {
+    fs.promises.unlink(req.file.path).catch(() => {});
+    return res.status(415).json({ error: 'El contenido del archivo no corresponde a su extensión (.' + ext + ').' });
   }
   const fileInfo = {
     url: '/uploads/' + req.file.filename,
     name: fixUploadName(req.file.originalname),
     size: req.file.size,
-    type: req.file.mimetype
+    type: UPLOAD_TYPES[ext]
   };
   // Queda registrado a nombre de quien lo subió: solo esa persona puede adjuntarlo (ver socket/uploads.js).
   if (!socketHandlers.registerUpload(req.get('X-Upload-Token'), fileInfo)) {
