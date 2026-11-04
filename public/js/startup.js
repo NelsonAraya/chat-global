@@ -103,7 +103,7 @@ document.addEventListener('DOMContentLoaded', function() {
   showCertBannerIfNeeded();
   loadDepartments();
   loadEmailDomains();
-  if (!tryAutoLogin()) {
+  if (!tryAutoLogin() && !tryRestoreTwoFactor()) {
     loginUsername.focus();
   }
   if (privacyBanner) {

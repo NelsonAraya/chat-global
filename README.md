@@ -283,6 +283,7 @@ Reglas:
 - El código **vence a los 5 minutos** y se anula tras **5 intentos incorrectos**.
 - Botón **"Reenviar código"**, con 30 segundos de espera entre envíos y un máximo de **5 códigos cada 15 minutos** por usuario.
 - Si el usuario recarga la página o repite el login mientras su código sigue vigente, **se reutiliza el mismo código** (no llega un correo nuevo).
+- **Celulares:** al ir a la app de correo, el navegador del celular corta la conexión o recarga la página. Para que eso no haga perder el paso, al aceptar la contraseña el servidor entrega un **pase temporal** (15 minutos, se guarda en `sessionStorage`) que el navegador envía con el reenvío y la verificación. El pase solo recuerda que la contraseña ya se comprobó: igual se exige el código, y deja de servir al ingresar o al cancelar.
 - Los códigos se guardan cifrados y solo en la memoria del servidor (no en la base de datos). Si se reinicia el servidor, hay que pedir uno nuevo.
 
 ## Sesiones

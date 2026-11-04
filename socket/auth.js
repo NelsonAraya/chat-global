@@ -43,9 +43,51 @@ module.exports = (ctx) => {
     const now = Date.now();
     for (const [k, e] of loginCodes) if (e.expiresAt <= now) loginCodes.delete(k);
     for (const [k, list] of codeSends) if (!list.some(t => now - t < OTP_SENDS_WINDOW_MS)) codeSends.delete(k);
+    for (const [k, t] of twoFactorTickets) if (t.expiresAt <= now) twoFactorTickets.delete(k);
   }, 10 * 60 * 1000).unref();
 
   const hashCode = (code) => crypto.createHash('sha256').update(code).digest('hex');
+
+  // ===== Pase del paso del código =====
+  // El paso "contraseña correcta, falta el código" no puede vivir solo en la conexión: en el celular, al ir a
+  // la app de correo el navegador corta la conexión y al volver entra con una nueva (o incluso recarga la
+  // página), y el servidor ya no sabía que ese usuario estaba esperando un código. Por eso, al aceptar la
+  // contraseña se entrega un pase aleatorio que el navegador manda junto con el reenvío y la verificación.
+  // El pase no reemplaza al código: solo recuerda que la contraseña ya se comprobó.
+  const TWO_FACTOR_TICKET_TTL_MS = 15 * 60 * 1000;
+  const TWO_FACTOR_EXPIRED_ERROR = 'Pasó demasiado tiempo. Ingresa de nuevo tu usuario y contraseña.';
+  const twoFactorTickets = new Map(); // username -> { hash, pending, expiresAt }
+
+  const startTwoFactor = (socket, pending) => {
+    const ticket = crypto.randomBytes(32).toString('base64url');
+    twoFactorTickets.set(pending.username, { hash: hashCode(ticket), pending, expiresAt: Date.now() + TWO_FACTOR_TICKET_TTL_MS });
+    socket.twoFactor = pending;
+    return ticket;
+  };
+
+  const endTwoFactor = (socket) => {
+    const pending = socket.twoFactor;
+    if (pending && twoFactorTickets.get(pending.username)?.pending === pending) twoFactorTickets.delete(pending.username);
+    socket.twoFactor = null;
+  };
+
+  // Paso pendiente de esta conexión o, si la conexión es nueva, el que indica el pase del navegador.
+  const pendingTwoFactor = (socket, data_) => {
+    if (socket.twoFactor) return socket.twoFactor;
+    const name = str(data_?.username).trim().toLowerCase();
+    const ticket = str(data_?.ticket);
+    if (!name || !ticket) return null;
+    const entry = twoFactorTickets.get(name);
+    if (!entry) return null;
+    if (entry.expiresAt <= Date.now()) {
+      twoFactorTickets.delete(name);
+      return null;
+    }
+    if (!crypto.timingSafeEqual(Buffer.from(hashCode(ticket), 'hex'), Buffer.from(entry.hash, 'hex'))) return null;
+    entry.expiresAt = Date.now() + TWO_FACTOR_TICKET_TTL_MS;
+    socket.twoFactor = entry.pending;
+    return entry.pending;
+  };
 
   const issueLoginCode = async (userRecord, email) => {
     const code = crypto.randomInt(0, 1000000).toString().padStart(6, '0');
@@ -284,35 +326,51 @@ module.exports = (ctx) => {
       const setup = !userRecord.twoFactorEnabled;
       if (!userRecord.email) {
         // Cuentas antiguas sin correo: el usuario debe indicar uno antes de recibir el código.
-        socket.twoFactor = { username: name, email: null, setup: true };
-        return callback?.({ ok: true, requireTwoFactor: true, setup: true, needEmail: true });
+        const ticket = startTwoFactor(socket, { username: name, email: null, setup: true });
+        return callback?.({ ok: true, requireTwoFactor: true, setup: true, needEmail: true, twoFactorTicket: ticket });
       }
 
-      socket.twoFactor = { username: name, email: userRecord.email, setup };
+      const pending = { username: name, email: userRecord.email, setup };
       // Si ya hay un código vigente (p. ej. recargó la página), se reutiliza en vez de enviar otro:
       // así repetir el login no da intentos nuevos para adivinar ni manda más correos.
       const existing = loginCodes.get(name);
       if (existing && existing.email === userRecord.email && existing.expiresAt > Date.now()) {
-        return callback?.({ ok: true, requireTwoFactor: true, setup, maskedEmail: maskEmail(userRecord.email), expiresInSeconds: codeSecondsLeft(existing), reused: true });
+        const ticket = startTwoFactor(socket, pending);
+        return callback?.({ ok: true, requireTwoFactor: true, setup, maskedEmail: maskEmail(userRecord.email), expiresInSeconds: codeSecondsLeft(existing), reused: true, twoFactorTicket: ticket });
       }
       const wait = codeSendWaitMinutes(name);
       if (wait > 0) {
-        socket.twoFactor = null;
         return callback?.({ ok: false, error: tooManyCodesError(wait) });
       }
       try {
         await issueLoginCode(userRecord, userRecord.email);
       } catch (err) {
         console.error('issueLoginCode error:', err);
-        socket.twoFactor = null;
         return callback?.({ ok: false, error: 'No se pudo enviar el código a tu correo. Intenta de nuevo o contacta a un administrador.' });
       }
-      callback?.({ ok: true, requireTwoFactor: true, setup, maskedEmail: maskEmail(userRecord.email), expiresInSeconds: OTP_TTL_MINUTES * 60 });
+      const ticket = startTwoFactor(socket, pending);
+      callback?.({ ok: true, requireTwoFactor: true, setup, maskedEmail: maskEmail(userRecord.email), expiresInSeconds: OTP_TTL_MINUTES * 60, twoFactorTicket: ticket });
+    });
+
+    // El navegador recargó la página (o el celular la cerró en segundo plano) en el paso del código:
+    // con el pase vuelve a mostrar ese paso sin pedir de nuevo la contraseña.
+    socket.on('two-factor-restore', (data_, callback) => {
+      const pending = pendingTwoFactor(socket, data_);
+      if (!pending) return callback?.({ ok: false });
+      const userRecord = findUser(pending.username);
+      if (!userRecord || userRecord.status !== 'active') {
+        endTwoFactor(socket);
+        return callback?.({ ok: false });
+      }
+      if (!pending.email) return callback?.({ ok: true, setup: pending.setup, needEmail: true });
+      const entry = loginCodes.get(pending.username);
+      const valid = entry && entry.email === pending.email && entry.expiresAt > Date.now();
+      callback?.({ ok: true, setup: pending.setup, maskedEmail: maskEmail(pending.email), expiresInSeconds: valid ? codeSecondsLeft(entry) : 0, reused: true });
     });
 
     socket.on('two-factor-set-email', async (data_, callback) => {
-      const pending = socket.twoFactor;
-      if (!pending || !pending.setup) return callback?.({ ok: false, error: 'No hay una sesión pendiente' });
+      const pending = pendingTwoFactor(socket, data_);
+      if (!pending || !pending.setup) return callback?.({ ok: false, error: TWO_FACTOR_EXPIRED_ERROR, restart: true });
       const userRecord = findUser(pending.username);
       if (!userRecord) return callback?.({ ok: false, error: 'Usuario no encontrado' });
       if (userRecord.email) return callback?.({ ok: false, error: 'Tu cuenta ya tiene un correo registrado' });
@@ -343,9 +401,10 @@ module.exports = (ctx) => {
       callback?.({ ok: true, maskedEmail: maskEmail(email), expiresInSeconds: OTP_TTL_MINUTES * 60 });
     });
 
-    socket.on('two-factor-resend', async (callback) => {
-      const pending = socket.twoFactor;
-      if (!pending || !pending.email) return callback?.({ ok: false, error: 'No hay una sesión pendiente' });
+    socket.on('two-factor-resend', async (data_, callback) => {
+      if (typeof data_ === 'function') { callback = data_; data_ = null; } // páginas abiertas antes de este cambio
+      const pending = pendingTwoFactor(socket, data_);
+      if (!pending || !pending.email) return callback?.({ ok: false, error: TWO_FACTOR_EXPIRED_ERROR, restart: true });
       const userRecord = findUser(pending.username);
       if (!userRecord) return callback?.({ ok: false, error: 'Usuario no encontrado' });
 
@@ -365,11 +424,11 @@ module.exports = (ctx) => {
     });
 
     socket.on('two-factor-verify', async (data_, callback) => {
-      const pending = socket.twoFactor;
-      if (!pending || !pending.email) return callback?.({ ok: false, error: 'No hay una sesión pendiente' });
+      const pending = pendingTwoFactor(socket, data_);
+      if (!pending || !pending.email) return callback?.({ ok: false, error: TWO_FACTOR_EXPIRED_ERROR, restart: true });
       const userRecord = findUser(pending.username);
       if (!userRecord || userRecord.status !== 'active') {
-        socket.twoFactor = null;
+        endTwoFactor(socket);
         return callback?.({ ok: false, error: 'Tu cuenta no está habilitada', restart: true });
       }
 
@@ -397,7 +456,7 @@ module.exports = (ctx) => {
 
       if (pending.setup) {
         if (!userRecord.email && emailInUse(pending.email, userRecord.username)) {
-          socket.twoFactor = null;
+          endTwoFactor(socket);
           return callback?.({ ok: false, error: 'Ese correo ya está registrado en otra cuenta', restart: true });
         }
         const prevEmail = userRecord.email;
@@ -413,7 +472,7 @@ module.exports = (ctx) => {
           return callback?.({ ok: false, error: 'Error al guardar en la base de datos' });
         }
       }
-      socket.twoFactor = null;
+      endTwoFactor(socket);
 
       if (isOnline(userRecord.username)) {
         return callback?.({ ok: false, error: 'Ese usuario ya está conectado', restart: true });

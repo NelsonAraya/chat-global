@@ -190,8 +190,53 @@ const twofactorVerifyBtn = $('twofactor-verify-btn');
 const twofactorResendBtn = $('twofactor-resend-btn');
 const twofactorCancelBtn = $('twofactor-cancel-btn');
 
-let twoFactorState = null; // { username, opts, callback, setup }
+let twoFactorState = null; // { username, opts, callback, setup, ticket }
 let twoFactorInterval = null;
+
+// Pase del paso del código: en el celular, al ir a la app de correo el navegador corta la conexión (y a veces
+// recarga la página al volver). El pase se manda en cada paso para que el servidor recuerde que la contraseña
+// ya se comprobó, y se guarda en sessionStorage para retomar el paso si la página se recargó.
+var TWO_FACTOR_KEY = 'chat_2fa';
+
+function storeTwoFactorTicket(username, ticket) {
+  try { sessionStorage.setItem(TWO_FACTOR_KEY, JSON.stringify({ username: username, ticket: ticket })); } catch (e) {}
+}
+
+function getStoredTwoFactorTicket() {
+  try {
+    var saved = JSON.parse(sessionStorage.getItem(TWO_FACTOR_KEY) || 'null');
+    return saved && saved.username && saved.ticket ? saved : null;
+  } catch (e) {
+    return null;
+  }
+}
+
+function clearStoredTwoFactorTicket() {
+  try { sessionStorage.removeItem(TWO_FACTOR_KEY); } catch (e) {}
+}
+
+function twoFactorAuth(extra) {
+  var auth = twoFactorState ? { username: twoFactorState.username, ticket: twoFactorState.ticket } : {};
+  return Object.assign(auth, extra || {});
+}
+
+// Al cargar la página: si quedó a medio ingresar el código, vuelve a ese paso sin pedir la contraseña.
+function tryRestoreTwoFactor() {
+  var saved = getStoredTwoFactorTicket();
+  if (!saved) return false;
+  socket.emit('two-factor-restore', { username: saved.username, ticket: saved.ticket }, function(res) {
+    if (!res || !res.ok) {
+      clearStoredTwoFactorTicket();
+      loginUsername.focus();
+      return;
+    }
+    res.twoFactorTicket = saved.ticket;
+    openTwoFactor(saved.username, res, {}, function(r) {
+      if (!r.ok) loginError.textContent = r.error;
+    });
+  });
+  return true;
+}
 
 function showLoginBox(formId) {
   document.querySelectorAll('.login-form-box').forEach(f => f.classList.add('hidden'));
@@ -200,7 +245,8 @@ function showLoginBox(formId) {
 }
 
 function openTwoFactor(username, res, opts, callback) {
-  twoFactorState = { username: username, opts: opts, callback: callback, setup: !!res.setup };
+  twoFactorState = { username: username, opts: opts, callback: callback, setup: !!res.setup, ticket: res.twoFactorTicket || null };
+  if (res.twoFactorTicket) storeTwoFactorTicket(username, res.twoFactorTicket);
   loginError.textContent = '';
   showLoginBox('twofactor-form');
   if (res.needEmail) {
@@ -224,7 +270,7 @@ function showTwoFactorCodeStep(res) {
   twofactorCodeStep.classList.remove('hidden');
   twofactorCode.value = '';
   twofactorCode.focus();
-  startTwoFactorTimer((res.expiresInSeconds || 300) * 1000);
+  startTwoFactorTimer((typeof res.expiresInSeconds === 'number' ? res.expiresInSeconds : 300) * 1000);
 }
 
 function startTwoFactorTimer(ms) {
@@ -248,6 +294,7 @@ function startTwoFactorTimer(ms) {
 function closeTwoFactor() {
   clearInterval(twoFactorInterval);
   twoFactorState = null;
+  clearStoredTwoFactorTicket();
   twofactorVerifyBtn.disabled = false;
   twofactorVerifyBtn.innerHTML = '<i class="fas fa-check"></i> Verificar';
   document.querySelectorAll('.login-tab').forEach(t => t.classList.toggle('active', t.dataset.form === 'login'));
@@ -259,9 +306,13 @@ twofactorEmailBtn.addEventListener('click', function() {
   var twoFactorEmailError = emailError(email);
   if (twoFactorEmailError) { loginError.textContent = twoFactorEmailError; return; }
   twofactorEmailBtn.disabled = true;
-  socket.emit('two-factor-set-email', { email: email }, function(res) {
+  socket.emit('two-factor-set-email', twoFactorAuth({ email: email }), function(res) {
     twofactorEmailBtn.disabled = false;
-    if (!res.ok) { loginError.textContent = res.error; return; }
+    if (!res.ok) {
+      if (res.restart) closeTwoFactor();
+      loginError.textContent = res.error;
+      return;
+    }
     loginError.textContent = '';
     showTwoFactorCodeStep(res);
   });
@@ -277,7 +328,7 @@ twofactorVerifyBtn.addEventListener('click', function() {
   if (!/^\d{6}$/.test(code)) { loginError.textContent = 'El código tiene 6 dígitos'; return; }
   twofactorVerifyBtn.disabled = true;
   twofactorVerifyBtn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Verificando...';
-  socket.emit('two-factor-verify', { code: code, remember: $('twofactor-remember').checked }, function(res) {
+  socket.emit('two-factor-verify', twoFactorAuth({ code: code, remember: $('twofactor-remember').checked }), function(res) {
     twofactorVerifyBtn.disabled = false;
     twofactorVerifyBtn.innerHTML = '<i class="fas fa-check"></i> Verificar';
     if (!res.ok) {
@@ -298,9 +349,13 @@ twofactorCode.addEventListener('keydown', function(e) {
 
 twofactorResendBtn.addEventListener('click', function() {
   twofactorResendBtn.disabled = true;
-  socket.emit('two-factor-resend', function(res) {
+  socket.emit('two-factor-resend', twoFactorAuth(), function(res) {
     twofactorResendBtn.disabled = false;
-    if (!res.ok) { loginError.textContent = res.error; return; }
+    if (!res.ok) {
+      if (res.restart) closeTwoFactor();
+      loginError.textContent = res.error;
+      return;
+    }
     loginError.textContent = '';
     showTwoFactorCodeStep(res);
     showToast('Código reenviado');
