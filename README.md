@@ -291,6 +291,7 @@ Reglas:
 Después de ingresar (contraseña + código), el navegador recibe un **token de sesión**. Con él puede recargar la página sin volver a pedir contraseña ni código. **El navegador nunca guarda la contraseña.**
 
 - **Por defecto** la sesión dura mientras la pestaña esté abierta (máximo 12 horas). Al cerrar la pestaña o el navegador, hay que volver a ingresar: si la conexión no se retoma en 60 segundos (lo que tarda de sobra una recarga), el servidor borra la sesión, aunque el navegador restaure la pestaña.
+- **En el celular** ese margen es de **30 minutos**: el navegador del celular corta la conexión cada vez que el chat queda en segundo plano (contestar WhatsApp, apagar la pantalla) y con 60 segundos la sesión se cerraba a cada rato. El celular se reconoce por el navegador (user-agent). El máximo de 12 horas es el mismo. Al volver, el chat se actualiza en menos de un segundo, en vez de esperar al azar hasta 10 segundos como tras un reinicio del servidor.
 - **"Recordar este equipo por 7 días"** (casilla en la pantalla del código): la sesión sobrevive a cerrar el navegador. No marcarla en computadores compartidos.
 - Al reanudar, entra directo al último departamento usado.
 - Si se reinicia el servidor o se corta la red, la página se recarga sola al volver la conexión y reingresa con la sesión.

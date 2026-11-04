@@ -363,6 +363,7 @@ twofactorResendBtn.addEventListener('click', function() {
 });
 
 twofactorCancelBtn.addEventListener('click', function() {
+  socket.emit('two-factor-cancel', twoFactorAuth());
   closeTwoFactor();
   loginError.textContent = '';
 });

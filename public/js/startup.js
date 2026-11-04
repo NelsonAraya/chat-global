@@ -30,8 +30,26 @@ socket.on('force-disconnect', function(data) {
 var RELOAD_SPREAD_MS = 10000;
 var hasConnectedOnce = false;
 var reloadScheduled = false;
+// En el celular la conexión se corta cada vez que el chat queda en segundo plano. Ese corte no es un reinicio
+// del servidor (no vuelven todos a la vez), así que al volver se recarga casi enseguida en vez de esperar al azar.
+// Cuenta como "volver del segundo plano" solo si el corte se detectó con la página oculta o en los primeros
+// segundos tras volver a verla (en segundo plano el navegador congela la página y el aviso llega al volver).
+// No basta con "estuvo oculta alguna vez": en un PC eso pasa al cambiar de pestaña, y tras un reinicio del
+// servidor cientos de PC recargarían en el mismo medio segundo.
+var BACKGROUND_RETURN_MS = 5000;
+var visibleSince = 0; // 0 = la página no ha vuelto del segundo plano desde que se abrió
+var cutInBackground = false;
+document.addEventListener('visibilitychange', function() {
+  if (document.visibilityState === 'visible') visibleSince = Date.now();
+});
+socket.on('disconnect', function() {
+  cutInBackground = document.visibilityState === 'hidden' ||
+    (visibleSince > 0 && Date.now() - visibleSince < BACKGROUND_RETURN_MS);
+});
 function reloadWhenServerReady(firstTry) {
-  var wait = firstTry ? Math.random() * RELOAD_SPREAD_MS : 2000 + Math.random() * RELOAD_SPREAD_MS;
+  // Además debe estar a la vista: un PC con la ventana minimizada durante un reinicio sigue esperando al azar.
+  var spread = cutInBackground && document.visibilityState === 'visible' ? 500 : RELOAD_SPREAD_MS;
+  var wait = firstTry ? Math.random() * spread : 2000 + Math.random() * spread;
   setTimeout(function() {
     fetch('/', { method: 'HEAD', cache: 'no-store', credentials: 'same-origin' })
       .then(function(res) {

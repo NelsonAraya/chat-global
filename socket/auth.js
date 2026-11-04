@@ -10,7 +10,7 @@ module.exports = (ctx) => {
     getAllRooms, departmentOptions, findUser, emailInUse, io, ADMIN_ROOM, lockMinutesLeft, lockedError,
     registerFailure, LOGIN_MAX_FAILS_PER_USER, MIN_PASSWORD_LENGTH, PASSWORD_LENGTH_ERROR, clearFailures, SESSION_TOKEN_RE, onlineSid, kickUser, presenceRooms,
     movePresence, getAllUsers, leaveRoomIfNoAccess, roomUsers, isGlobalRoom, announceOffline, scheduleSessionClose,
-    cleanupTemporaryRoom } = ctx;
+    cleanupTemporaryRoom, isMobileSocket } = ctx;
   const { updateSessionDepartment, saveSession, hashPassword, saveUser, saveConsent, verifyPassword, isLegacyHash,
     saveUserFields, getSession, deleteSession } = ctx.db;
 
@@ -368,6 +368,11 @@ module.exports = (ctx) => {
       callback?.({ ok: true, setup: pending.setup, maskedEmail: maskEmail(pending.email), expiresInSeconds: valid ? codeSecondsLeft(entry) : 0, reused: true });
     });
 
+    // "Cancelar" en la pantalla del código: el pase deja de servir también en el servidor.
+    socket.on('two-factor-cancel', (data_) => {
+      if (pendingTwoFactor(socket, data_)) endTwoFactor(socket);
+    });
+
     socket.on('two-factor-set-email', async (data_, callback) => {
       const pending = pendingTwoFactor(socket, data_);
       if (!pending || !pending.setup) return callback?.({ ok: false, error: TWO_FACTOR_EXPIRED_ERROR, restart: true });
@@ -639,7 +644,7 @@ module.exports = (ctx) => {
       announceOffline(user);
       notifyFriendsOfStatusChange(user.username);
 
-      if (user.sessionHash && !user.sessionRemember) scheduleSessionClose(user.sessionHash);
+      if (user.sessionHash && !user.sessionRemember) scheduleSessionClose(user.sessionHash, isMobileSocket(socket));
 
       if (oldRoom) {
         cleanupTemporaryRoom(oldRoom).catch(err => console.error('cleanupTemporaryRoom error:', err));
